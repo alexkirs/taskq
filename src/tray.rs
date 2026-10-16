@@ -542,6 +542,51 @@ fn summary(ps: &[Value], (start, end): (i64, i64)) -> Summary {
     Summary { counts: [t["doing"] + t["review"], t["ask"], t["ready"], t["failed"]], known, run: ps.iter().any(|p| p["focus"].as_array().is_some_and(|f| !f.is_empty())), bins, since }
 }
 
+struct FocusAction {
+    action: String,
+    root: PathBuf,
+    label: Option<String>,
+    context: Option<coreq::telemetry::capture::TraceContext>,
+    dispatch: tracing::Dispatch,
+}
+struct FocusQueue {
+    sender: std::sync::mpsc::SyncSender<FocusAction>,
+    worker: std::thread::JoinHandle<()>,
+}
+impl FocusQueue {
+    fn start(install: PathBuf, report: impl Fn(PathBuf, crate::Res<()>) + Send + 'static) -> crate::Res<Self> {
+        let (sender, receiver)=std::sync::mpsc::sync_channel::<FocusAction>(16);
+        let worker=std::thread::Builder::new().name("taskq-focus-actions".into()).spawn(move || {
+            while let Ok(job)=receiver.recv() {
+                let result=tracing::dispatcher::with_default(&job.dispatch,|| {
+                    let _context=job.context.as_ref().map(|c|c.span().entered());
+                    coreq::telemetry::capture::operation("tray.focus.execute",||std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        if !roots(&install).iter().any(|r|Path::new(r)==job.root) {
+                            return Err("Project is no longer registered; command not applied".into());
+                        }
+                        act(&job.action,&job.root,job.label.as_deref())
+                    })).unwrap_or_else(|_|Err("Command panicked; result unknown; check service status before retry".into())),|_|"command-failed")
+                });
+                report(job.root,result);
+            }
+        }).map_err(|e|format!("Cannot start focus command worker: {e}"))?;
+        Ok(Self{sender,worker})
+    }
+    fn submit(&self, action: &str, root: &Path, label: Option<&str>) -> crate::Res<()> {
+        let name=match action {"pause"=>"tray.pause.dispatch","resume"=>"tray.resume.dispatch","focus"=>"tray.focus.dispatch",_=>"tray.invalid.dispatch"};
+        coreq::telemetry::capture::operation(name,|| {
+            if !matches!(action,"focus"|"pause"|"resume") {return Err(("invalid-command","Unsupported focus command"));}
+            if self.worker.is_finished() {return Err(("worker-unavailable","Command worker unavailable; action not submitted"));}
+            self.sender.try_send(FocusAction {action:action.into(),root:root.into(),label:label.map(String::from),
+                context:coreq::telemetry::capture::TraceContext::current(),dispatch:tracing::dispatcher::get_default(Clone::clone)})
+                .map_err(|error|match error {
+                    std::sync::mpsc::TrySendError::Full(_)=>("queue-full","Command queue full; action not submitted"),
+                    std::sync::mpsc::TrySendError::Disconnected(_)=>("worker-unavailable","Command worker unavailable; action not submitted"),
+                })
+        },|(code,_)|*code).map_err(|(_,message)|message.into())
+    }
+}
+
 pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> Result<(), String> {
     if snapshot.is_none() && !alone(&install) {
         return Err("taskq tray already runs on this host".into());
@@ -572,6 +617,10 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
         }
     });
     let proxy = event_loop.create_proxy();
+    let replies=proxy.clone();
+    let focus_actions=FocusQueue::start(install.clone(),move |root,result| {
+        if let Err(error)=result {let _=replies.send_event(Ev::Answer(json!({"action_error":{"root":root,"text":error}})));}
+    })?;
     let mut settings = Settings::load(&install);
     let mut ui: Option<(Window, WebView)> = None;
     let mut tray: Option<TrayIcon> = None;
@@ -867,7 +916,10 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
                         // only a registered project (§ 4): the page never names a path of its own
                         let root = m["root"].as_str().unwrap_or("");
                         if roots(&install).iter().any(|r| r == root) {
-                            if let Err(error) = act(a, Path::new(root), m["label"].as_str()) {
+                            let result=if matches!(a,"pause"|"resume"|"focus") {
+                                focus_actions.submit(a,Path::new(root),m["label"].as_str())
+                            } else {act(a,Path::new(root),m["label"].as_str())};
+                            if let Err(error) = result {
                                 push(&ui, &json!({"action_error":{"root":root,"text":error}}));
                             }
                         }
@@ -1190,7 +1242,7 @@ fn work_area(m: &tao::monitor::MonitorHandle) -> (i32, i32, i32, i32) {
 fn act(action: &str, root: &Path, label: Option<&str>) -> crate::Res<()> {
     let d = crate::dot(root);
     match action {
-        "pause" => { crate::pause(root)?; }
+        "pause" => { crate::pause(root,false)?; }
         "resume" => {
             crate::resume(root)?;
         }
@@ -1537,20 +1589,72 @@ fn capture(wv: &WebView, path: PathBuf, done: impl Fn() + 'static) {
 mod tests {
     use super::*;
 
+    // Chain: bounded UI submission -> owned worker -> same-trace receipt -> stale registration refusal.
+    #[test]
+    fn queued_focus_actions_keep_context_and_refuse_overflow_without_blocking() {
+        crate::with_test_capture(|store,dir| {
+            let root=dir.join("project");let install=dir.join("install");
+            fs::create_dir_all(crate::dot(&root)).unwrap();fs::create_dir_all(&install).unwrap();
+            fs::write(install.join("projects"),format!("{}\n",root.display())).unwrap();
+            fs::write(crate::dot(&root).join("focus"),"area-maps").unwrap();
+            let (result_tx,result_rx)=std::sync::mpsc::channel();
+            let (release_tx,release_rx)=std::sync::mpsc::channel();
+            let queue=FocusQueue::start(install.clone(),move |root,result| {
+                result_tx.send((root,result)).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            }).unwrap();
+            let _click=tracing::info_span!("fixture.click").entered();
+            queue.submit("pause",&root,None).unwrap();
+            let (reported,result)=result_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            assert_eq!(reported,root);result.unwrap();
+            for _ in 0..16 {queue.submit("resume",&root,None).unwrap();}
+            assert!(queue.submit("resume",&root,None).unwrap_err().contains("queue full"));
+            assert!(crate::data::focus(&root).unwrap().is_empty());
+            // Queued intent cannot act on a project removed after submission.
+            fs::write(install.join("projects"),"").unwrap();
+            for _ in 0..16 {
+                release_tx.send(()).unwrap();
+                let (reported,result)=result_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+                assert_eq!(reported,root);assert!(result.unwrap_err().contains("no longer registered"));
+            }
+            release_tx.send(()).unwrap();
+            let FocusQueue{sender,worker}=queue;drop(sender);worker.join().unwrap();
+            assert!(crate::data::focus(&root).unwrap().is_empty());
+            let page=store.export(0,0,1024).unwrap();
+            let rows:Vec<_>=page["events"].as_array().unwrap().iter().map(|r|&r["observation"]).collect();
+            let receipts:Vec<_>=rows.iter().copied().filter(|r|r["source"]=="command").collect();
+            assert_eq!(receipts.len(),2,"refused queued actions mutated the project");
+            let click=rows.iter().find(|r|r["operation"]=="taskq.fixture.click").unwrap();
+            assert_eq!(receipts[0]["trace"],click["trace"]);assert_eq!(receipts[1]["trace"],click["trace"]);
+            assert_eq!(receipts[1]["kind"],"command.applied");
+        });
+    }
+
     // Chain: native Resume -> shared command -> failure receipt; retries keep the selected focus.
     #[test]
     fn action_failures_reach_the_tray_caller() {
-        let root=std::env::temp_dir().join(format!("taskq-action-receipt-{}",std::process::id()));
-        fs::create_dir_all(crate::dot(&root)).unwrap();
-        fs::write(crate::dot(&root).join("focus"),"off").unwrap();
-        assert!(act("resume",&root,None).unwrap_err().contains("no saved focus"));
-        assert_eq!(fs::read_to_string(crate::dot(&root).join("focus")).unwrap(),"off");
-        fs::write(crate::dot(&root).join("focus.paused"),"telemetry-fixture").unwrap();
-        act("resume",&root,None).unwrap();
-        assert_eq!(fs::read_to_string(crate::dot(&root).join("focus")).unwrap(),"telemetry-fixture");
-        assert!(act("focus",&root,Some("stale-label")).is_err());
-        fs::remove_dir_all(&root).unwrap();
-        assert!(act("pause",&root,None).is_err());
+        crate::with_test_capture(|store, _| {
+            let root=std::env::temp_dir().join(format!("taskq-action-receipt-{}",std::process::id()));
+            fs::create_dir_all(crate::dot(&root)).unwrap();
+            fs::write(crate::dot(&root).join("focus"),"off").unwrap();
+            assert!(act("resume",&root,None).unwrap_err().contains("no saved focus"));
+            assert_eq!(fs::read_to_string(crate::dot(&root).join("focus")).unwrap(),"off");
+            fs::write(crate::dot(&root).join("focus.paused"),"telemetry-fixture").unwrap();
+            act("resume",&root,None).unwrap();
+            assert_eq!(fs::read_to_string(crate::dot(&root).join("focus")).unwrap(),"telemetry-fixture");
+            assert!(act("focus",&root,Some("stale-label")).is_err());
+            fs::remove_dir_all(&root).unwrap();
+            assert!(act("pause",&root,None).is_err());
+            let page=store.export(0,0,1024).unwrap();
+            let receipts:Vec<_>=page["events"].as_array().unwrap().iter().map(|r|&r["observation"])
+                .filter(|r|r["source"]=="command").collect();
+            assert_eq!(receipts.len(),6,"native dispatch bypassed the shared receipt boundary");
+            assert_eq!(receipts.iter().map(|r|r["kind"].as_str().unwrap()).collect::<Vec<_>>(),
+                ["command.received","command.failed","command.received","command.applied","command.received","command.failed"]);
+            assert_ne!(receipts[0]["span"],receipts[2]["span"],"separate clicks reused an identity");
+            for pair in receipts.chunks_exact(2) { assert_eq!(pair[0]["span"],pair[1]["span"]); }
+
+        });
     }
 
     // Chain: R12 tray evidence -> `tray --snapshot --route`. Risk: a filtered run captures the full matrix or drops a route.

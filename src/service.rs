@@ -1496,56 +1496,58 @@ mod tests {
     // Risk: a poke received during work becomes the sleep baseline, delaying Resume by another poll.
     #[test]
     fn resume_during_pass_wakes_the_next_admission_check() {
-        let dir = std::env::temp_dir().join(format!("qr-wake-{}", std::process::id()));
-        std::fs::create_dir_all(dir.join(".taskq")).unwrap();
-        let mut c = cfg("fixture");
-        (c.root, c.install) = (dir.clone(), dir.join("i"));
-        std::fs::create_dir_all(&c.install).unwrap();
-        let b = Fake::default();
-        let n = b.create("Wake fixture", "", &["taskq".into()]).unwrap();
-        let e: Exits = Default::default();
-        let mut s = service(&b, &c, e.clone());
-        std::fs::write(c.install.join("hold"), "owner-held fixture").unwrap();
-        for held in [true, false] {
-            std::fs::write(dir.join(".taskq/focus"), "all").unwrap();
-            crate::pause(&dir).unwrap();
-            std::fs::remove_file(dir.join(".taskq/poke")).unwrap();
+        crate::with_test_capture(|_, _| {
+            let dir = std::env::temp_dir().join(format!("qr-wake-{}", std::process::id()));
+            std::fs::create_dir_all(dir.join(".taskq")).unwrap();
+            let mut c = cfg("fixture");
+            (c.root, c.install) = (dir.clone(), dir.join("i"));
+            std::fs::create_dir_all(&c.install).unwrap();
+            let b = Fake::default();
+            let n = b.create("Wake fixture", "", &["taskq".into()]).unwrap();
+            let e: Exits = Default::default();
+            let mut s = service(&b, &c, e.clone());
+            std::fs::write(c.install.join("hold"), "owner-held fixture").unwrap();
+            for held in [true, false] {
+                std::fs::write(dir.join(".taskq/focus"), "all").unwrap();
+                crate::pause(&dir,false).unwrap();
+                std::fs::remove_file(dir.join(".taskq/poke")).unwrap();
+                let pokes = [dir.join(".taskq/poke"), c.install.join("poke")];
+                let poke_start = crate::poke_times(&pokes);
+                s.focus = crate::data::focus(&dir).unwrap();
+                s.pass().unwrap();
+                assert_eq!(task(&b, n).state, State::Ready);
+                crate::resume(&dir).unwrap();
+                let mut ticks = 0;
+                crate::sleep_until_poke(&pokes, poke_start, 1, &mut || ticks += 1);
+                assert_eq!(ticks, 0, "Resume during the pass must skip the next poll wait");
+                s.focus = crate::data::focus(&dir).unwrap();
+                s.pass().unwrap();
+                if held {
+                    assert_eq!(task(&b, n).state, State::Ready);
+                    assert!(e.borrow().is_empty());
+                    assert_eq!(s.capacity_json()["reasons"][0]["code"], "hold");
+                    assert_eq!(std::fs::read_to_string(c.install.join("hold")).unwrap(), "owner-held fixture");
+                    std::fs::remove_file(c.install.join("hold")).unwrap();
+                } else {
+                    assert_eq!(task(&b, n).state, State::Doing);
+                    assert_eq!(e.borrow().len(), 1);
+                }
+            }
             let pokes = [dir.join(".taskq/poke"), c.install.join("poke")];
             let poke_start = crate::poke_times(&pokes);
-            s.focus = crate::data::focus(&dir).unwrap();
-            s.pass().unwrap();
-            assert_eq!(task(&b, n).state, State::Ready);
-            crate::resume(&dir).unwrap();
+            crate::touch(&pokes[1]);
+            crate::sleep_until_poke(&pokes, poke_start, 1, &mut || panic!("host poke during a pass was lost"));
+            // A poke during sleep is observed after the current tick, without waiting another second.
+            let poke_start = crate::poke_times(&pokes);
             let mut ticks = 0;
-            crate::sleep_until_poke(&pokes, poke_start, 1, &mut || ticks += 1);
-            assert_eq!(ticks, 0, "Resume during the pass must skip the next poll wait");
-            s.focus = crate::data::focus(&dir).unwrap();
-            s.pass().unwrap();
-            if held {
-                assert_eq!(task(&b, n).state, State::Ready);
-                assert!(e.borrow().is_empty());
-                assert_eq!(s.capacity_json()["reasons"][0]["code"], "hold");
-                assert_eq!(std::fs::read_to_string(c.install.join("hold")).unwrap(), "owner-held fixture");
-                std::fs::remove_file(c.install.join("hold")).unwrap();
-            } else {
-                assert_eq!(task(&b, n).state, State::Doing);
-                assert_eq!(e.borrow().len(), 1);
-            }
-        }
-        let pokes = [dir.join(".taskq/poke"), c.install.join("poke")];
-        let poke_start = crate::poke_times(&pokes);
-        crate::touch(&pokes[1]);
-        crate::sleep_until_poke(&pokes, poke_start, 1, &mut || panic!("host poke during a pass was lost"));
-        // A poke during sleep is observed after the current tick, without waiting another second.
-        let poke_start = crate::poke_times(&pokes);
-        let mut ticks = 0;
-        crate::sleep_until_poke(&pokes, poke_start, 2, &mut || {
-            ticks += 1;
-            std::fs::remove_file(&pokes[1]).unwrap();
+            crate::sleep_until_poke(&pokes, poke_start, 2, &mut || {
+                ticks += 1;
+                std::fs::remove_file(&pokes[1]).unwrap();
+            });
+            assert_eq!(ticks, 1);
+            drop(s);
+            std::fs::remove_dir_all(dir).unwrap();
         });
-        assert_eq!(ticks, 1);
-        drop(s);
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     // Chain A2: project-thread unwind -> rebuilt board cache -> quarantine with live lease, beside healthy admission.

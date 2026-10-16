@@ -292,18 +292,38 @@ fn wake_context(path: &Path, seen: &mut Option<String>) -> Res<Option<coreq::tel
     wake_read(path, seen, || Ok(())).map(|(link, ())| link)
 }
 
-fn change_focus<T>(root: &Path, change: impl FnOnce(&Path) -> Res<T>) -> Res<T> {
-    fs::metadata(dot(root)).map_err(|e| format!("focus unchanged: state directory unavailable: {e}"))?;
-    let locked = wake_lock(root)?;
-    // A failed mutation must never leave its new state attributed to the preceding signal.
-    locked.file().set_len(0).map_err(|e| format!("focus unchanged: cannot invalidate previous signal: {e}"))?;
-    let result = change(&dot(root));
-    let notified = poke_locked(&locked);
-    match (result, notified) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Err(error), Ok(())) => Err(format!("{error}; focus may be partially saved; check service status")),
-        (Ok(_), Err(error)) => Err(error),
-        (Err(error), Err(wake)) => Err(format!("{error}; {wake}")),
+fn change_focus<T>(root: &Path, restrictive: bool, initialize: bool, change: impl FnOnce(&Path) -> Res<T>) -> Res<T> {
+    let receipt = coreq::telemetry::capture::CommandReceipt::current();
+    let received = receipt.as_ref().map_err(Clone::clone).and_then(|r| r.checkpoint("received"));
+    if !restrictive { if let Err(error) = &received { return Err(format!("command not applied: receipt unavailable ({error}); check service status")); } }
+    // Retain the settings lock through terminal commit, including partial failures.
+    let mut locked = None;
+    let result = (|| {
+        if initialize { fs::create_dir_all(dot(root)).map_err(|e| e.to_string())?; }
+        fs::metadata(dot(root)).map_err(|e| format!("focus unchanged: state directory unavailable: {e}"))?;
+        locked = Some(wake_lock(root)?);
+        let lock = locked.as_ref().unwrap();
+        // A failed mutation must never leave its new state attributed to the preceding signal.
+        lock.file().set_len(0).map_err(|e| format!("focus unchanged: cannot invalidate previous signal: {e}"))?;
+        let result = change(&dot(root));
+        let notified = poke_locked(lock);
+        match (result, notified) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), Ok(())) => Err(format!("{error}; focus may be partially saved; check service status")),
+            (Ok(_), Err(error)) => Err(error),
+            (Err(error), Err(wake)) => Err(format!("{error}; {wake}")),
+        }
+    })();
+    let terminal = receipt.and_then(|r| r.checkpoint(if result.is_ok() { "applied" } else { "failed" }));
+    let uncertain = received.err().or_else(|| terminal.as_ref().err().cloned());
+    match (result, uncertain) {
+        (Ok(value), None) => {
+            println!("Command applied locally; service observation pending; receipt {}", terminal.unwrap());
+            Ok(value)
+        }
+        (Ok(_), Some(error)) => Err(format!("command applied locally; durable receipt unknown ({error}); check service status before retry")),
+        (Err(error), None) => Err(format!("{error}; failure receipt {}", terminal.unwrap())),
+        (Err(error), Some(receipt)) => Err(format!("{error}; durable receipt unknown ({receipt}); check service status before retry")),
     }
 }
 
@@ -1388,8 +1408,7 @@ fn status_labels(root: &Path) -> Vec<String> {
 /// Focus (§ 4): `f` admits; `request` keeps the owner's words, none removes them.
 #[tracing::instrument(name="set_focus",skip_all)]
 fn set_focus(root: &Path, f: &str, request: Option<&str>) -> Res<()> {
-    fs::create_dir_all(dot(root)).map_err(|e| e.to_string())?;
-    change_focus(root, |d| {
+    change_focus(root, f.trim() == "off", true, |d| {
         platform::write_atomic(&d.join("focus"), f)?;
         match request {
             Some(r) => platform::write_atomic(&d.join("focus.request"), r)?,
@@ -1413,8 +1432,8 @@ fn install_focus(root: &Path) -> Res<bool> {
 
 /// Pause (§ 4): keep the focus in `focus.paused`, admit nothing.
 #[tracing::instrument(name="pause",skip_all)]
-fn pause(root: &Path) -> Res<()> {
-    change_focus(root, |d| {
+fn pause(root: &Path, initialize: bool) -> Res<()> {
+    change_focus(root, true, initialize, |d| {
         let f = data::focus(root)?.join(" ");
         if !f.is_empty() { platform::write_atomic(&d.join("focus.paused"), &f)?; }
         platform::write_atomic(&d.join("focus"), "off")
@@ -1424,7 +1443,7 @@ fn pause(root: &Path) -> Res<()> {
 /// Resume (§ 4): restore the saved focus; never `all` by default.
 #[tracing::instrument(name="resume",skip_all)]
 fn resume(root: &Path) -> Res<String> {
-    change_focus(root, |d| {
+    change_focus(root, false, false, |d| {
         let f = fs::read_to_string(d.join("focus.paused")).or_else(|e| if e.kind()==std::io::ErrorKind::NotFound {Ok(String::new())} else {Err(e)})
             .map_err(|e| format!("saved focus unreadable: {e}"))?;
         if matches!(f.trim(), "" | "off") {
@@ -1567,23 +1586,6 @@ fn service_fields(root: &Path) -> String {
     out.join("\n")
 }
 
-fn command_receipt<T>(restrictive: bool, action: impl FnOnce() -> Res<T>) -> Res<T> {
-    let received = coreq::telemetry::capture::checkpoint("received");
-    if !restrictive { if let Err(error) = &received { return Err(format!("command not applied: receipt unavailable ({error}); check service status")); } }
-    let result = action();
-    let terminal = coreq::telemetry::capture::checkpoint(if result.is_ok() { "applied" } else { "failed" });
-    let uncertain = received.err().or_else(|| terminal.as_ref().err().cloned());
-    match (result, uncertain) {
-        (Ok(value), None) => {
-            println!("Command applied locally; service observation pending; receipt {}", terminal.unwrap());
-            Ok(value)
-        }
-        (Ok(_), Some(error)) => Err(format!("command applied locally; durable receipt unknown ({error}); check service status before retry")),
-        (Err(error), None) => Err(format!("{error}; failure receipt {}", terminal.unwrap())),
-        (Err(error), Some(receipt)) => Err(format!("{error}; durable receipt unknown ({receipt}); check service status before retry")),
-    }
-}
-
 #[tracing::instrument(name="service.command",skip_all,fields(coreq_operation=match args.pos.get(1).map(String::as_str).unwrap_or("") {
     sub @ ("install"|"run"|"focus"|"pause"|"resume"|"capacity"|"permissions"|"resources"|"hold"|"release"|"recover"|"status"|"restart"|"stop"|"uninstall"|"list")=>sub,
     _=>"invalid",
@@ -1623,20 +1625,17 @@ fn service(args: &Args) -> Res<()> {
                 for (l, k) in n { println!("Label: {l} ({k})"); }
                 return Ok(());
             }
-            command_receipt(f.trim() == "off", || set_focus(&root, &f, args.one("request")))?;
+            set_focus(&root, &f, args.one("request"))?;
             println!("{}", service_fields(&root));
             Ok(())
         }
         "pause" => {
-            command_receipt(true, || {
-                fs::create_dir_all(&d).map_err(|e| e.to_string())?;
-                pause(&root)
-            })?;
+            pause(&root,true)?;
             println!("Paused {}", project_name(&root));
             Ok(())
         }
         "resume" => {
-            command_receipt(false, || resume(&root))?;
+            resume(&root)?;
             println!("{}", service_fields(&root));
             Ok(())
         }
@@ -2441,6 +2440,21 @@ fn application() {
         }
         platform::die(&e);
     }
+}
+
+#[cfg(test)]
+fn with_test_capture<T>(run: impl FnOnce(&coreq::telemetry::Store, &Path) -> T) -> T {
+    use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+    use tracing_subscriber::prelude::*;
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let dir=std::env::temp_dir().join(format!("taskq-command-test-{}-{}",std::process::id(),NEXT.fetch_add(1,Ordering::Relaxed)));
+    fs::create_dir_all(&dir).unwrap();
+    let store=Arc::new(coreq::telemetry::Store::open(&dir.join("db")).unwrap());
+    let capture=coreq::telemetry::capture::Capture::new(store.clone(),"taskq","fixture").unwrap();
+    let result=tracing::subscriber::with_default(tracing_subscriber::registry().with(capture.clone()),||run(&store, &dir));
+    capture.flush().unwrap();
+    drop(capture);drop(store);fs::remove_dir_all(dir).unwrap();
+    result
 }
 
 #[cfg(test)]
@@ -3308,7 +3322,7 @@ mod tests {
         assert!(kids_file(&root).is_empty() && !kids.exists(), "another process's file: its attempts go gone");
         // a corrupt focus pauses nothing away and names its reason
         fs::write(dot(&root).join("focus"), b"\xff").unwrap();
-        assert!(pause(&root).unwrap_err().contains("not UTF-8"));
+        assert!(pause(&root,false).unwrap_err().contains("not UTF-8"));
         assert_eq!(fs::read(dot(&root).join("focus")).unwrap(), b"\xff");
         assert!(service_fields(&root).contains("Focus: unknown (focus: not UTF-8 text; file kept)"));
         fs::write(&st, "{").unwrap();
@@ -3330,69 +3344,156 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    // Chain: direct shared commands -> receipt refusal -> preserved focus, with safe Pause fallback.
+    #[test]
+    fn direct_focus_commands_cannot_bypass_required_receipts() {
+        let root=std::env::temp_dir().join(format!("taskq-direct-receipt-{}",std::process::id()));
+        fs::create_dir_all(dot(&root)).unwrap();
+        fs::write(dot(&root).join("focus"),"off").unwrap();
+        fs::write(dot(&root).join("focus.paused"),"area-maps").unwrap();
+        assert!(resume(&root).unwrap_err().contains("receipt unavailable"));
+        assert_eq!(data::focus(&root).unwrap(),Vec::<String>::new());
+        assert!(set_focus(&root,"all",None).unwrap_err().contains("receipt unavailable"));
+        assert_eq!(data::focus(&root).unwrap(),Vec::<String>::new());
+        fs::write(dot(&root).join("focus"),"area-maps").unwrap();
+        assert!(pause(&root,false).unwrap_err().contains("applied locally; durable receipt unknown"));
+        assert_eq!(data::focus(&root).unwrap(),Vec::<String>::new());
+        assert_eq!(fs::read_to_string(dot(&root).join("focus.paused")).unwrap(),"area-maps");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // Chain: initialization refusal -> original error and durable command failure, before any setting write.
+    #[test]
+    fn focus_initialization_failures_keep_required_receipts() {
+        crate::with_test_capture(|store,dir| {
+            let root=dir.join("project");fs::create_dir(&root).unwrap();
+            fs::write(dot(&root),"preserve this obstacle").unwrap();
+            assert!(set_focus(&root,"all",None).unwrap_err().contains("failure receipt"));
+            assert!(pause(&root,true).unwrap_err().contains("failure receipt"));
+            assert_eq!(fs::read_to_string(dot(&root)).unwrap(),"preserve this obstacle");
+            let page=store.export(0,0,1024).unwrap();
+            let receipts:Vec<_>=page["events"].as_array().unwrap().iter().map(|r|&r["observation"])
+                .filter(|r|r["source"]=="command").collect();
+            assert_eq!(receipts.iter().map(|r|r["kind"].as_str().unwrap()).collect::<Vec<_>>(),
+                ["command.received","command.failed","command.received","command.failed"]);
+            assert_ne!(receipts[0]["span"],receipts[2]["span"]);
+        });
+    }
+
+    // Chain: settings change -> blocked terminal commit -> competing reader/writer refused -> committed readback.
+    #[test]
+    fn focus_lock_outlives_terminal_receipt_commit() {
+        crate::with_test_capture(|store, dir| {
+            let root=dir.join("project");fs::create_dir_all(dot(&root)).unwrap();
+            fs::write(dot(&root).join("focus"),"off").unwrap();
+            let (start_tx,start_rx)=std::sync::mpsc::channel();
+            let (ready_tx,ready_rx)=std::sync::mpsc::channel();
+            std::thread::scope(|scope| {
+                let root=&root;
+                let blocker=scope.spawn(move || {
+                    let db=rusqlite::Connection::open(dir.join("db")).unwrap();
+                    db.busy_timeout(Duration::from_secs(3)).unwrap();
+                    start_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+                    db.execute_batch("BEGIN IMMEDIATE").unwrap();
+                    ready_tx.send(()).unwrap();
+                    let until=Instant::now()+Duration::from_secs(3);
+                    while !fs::read_to_string(dot(root).join("poke")).is_ok_and(|s|s.len()>1) {
+                        assert!(Instant::now()<until,"command never completed notification");
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    // Hold the database past notification, while the terminal receipt waits for its commit.
+                    std::thread::sleep(Duration::from_millis(100));
+                    let file=fs::OpenOptions::new().read(true).write(true).open(dot(root).join("poke")).unwrap();
+                    assert!(coreq::file_lock::try_lock_shared_file(file).is_err(),"service read settings before terminal receipt commit");
+                    assert!(wake_lock(root).is_err(),"next command overtook terminal receipt commit");
+                    db.execute_batch("ROLLBACK").unwrap();
+                });
+                let _action=tracing::info_span!("fixture.focus").entered();
+                change_focus(root,false,false,|d| {
+                    start_tx.send(()).unwrap();ready_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+                    platform::write_atomic(&d.join("focus"),"all")
+                }).unwrap();
+                blocker.join().unwrap();
+            });
+            let _released=wake_lock(&root).unwrap();
+            let page=store.export(0,0,1024).unwrap();
+            let receipts:Vec<_>=page["events"].as_array().unwrap().iter().map(|r|&r["observation"])
+                .filter(|r|r["source"]=="command").collect();
+            assert_eq!(receipts.len(),2);assert_eq!(receipts[1]["kind"],"command.applied");
+            assert_eq!(receipts[0]["span"],receipts[1]["span"]);
+            assert_eq!(data::focus(&root).unwrap(),["all"]);
+        });
+    }
+
     // Chain: § 4 pause and resume focus. Risk: resume widens focus to all.
     #[test]
     fn focus_commands_do_not_mutate_while_another_command_or_reader_owns_the_signal() {
-        let root=std::env::temp_dir().join(format!("taskq-focus-lock-{}",std::process::id()));
-        fs::create_dir_all(dot(&root)).unwrap();
-        let d=dot(&root);
-        fs::write(d.join("focus"),"off").unwrap();
-        fs::write(d.join("focus.paused"),"area-maps").unwrap();
-        fs::write(d.join("focus.request"),"owner intent").unwrap();
-        fs::write(d.join("poke"),".").unwrap();
-        for shared in [false,true] {
-            let file=fs::OpenOptions::new().read(true).write(true).open(d.join("poke")).unwrap();
-            let _owner=if shared {coreq::file_lock::try_lock_shared_file(file)} else {coreq::file_lock::try_lock_file(file)}.unwrap();
-            assert!(resume(&root).is_err());
-            assert_eq!(fs::read_to_string(d.join("focus")).unwrap(),"off","Resume changed state before owning its command boundary");
-            assert!(set_focus(&root,"all",Some("new intent")).is_err());
-            assert_eq!(fs::read_to_string(d.join("focus.request")).unwrap(),"owner intent");
-            assert_eq!(fs::read_to_string(d.join("focus")).unwrap(),"off");
-            assert!(pause(&root).is_err());
-            assert_eq!(fs::read_to_string(d.join("focus.paused")).unwrap(),"area-maps");
-            assert!(install_focus(&root).is_err());
-        }
-        assert_eq!(resume(&root).unwrap(),"area-maps");
-        pause(&root).unwrap();
-        assert_eq!(resume(&root).unwrap(),"area-maps");
-        let context=format!("1 {}.1 {}.2","a".repeat(32),"a".repeat(32));
-        fs::write(d.join("poke"),&context).unwrap();
-        let mut seen=None;
-        let (link,focus)=wake_read(&d.join("poke"),&mut seen,|| {
-            assert!(pause(&root).is_err(),"writer entered a reader's snapshot");
-            data::focus(&root)
-        }).unwrap();
-        assert_eq!(link.unwrap().encode(),context);assert_eq!(focus,["area-maps"]);
-        seen=None;
-        fs::write(d.join("focus"),b"\xff").unwrap();
-        assert!(wake_read(&d.join("poke"),&mut seen,||data::focus(&root)).is_err());
-        assert!(seen.is_none(),"failed state read consumed the command identity");
-        fs::write(d.join("focus"),"area-maps").unwrap();
-        assert!(wake_read(&d.join("poke"),&mut seen,||data::focus(&root)).unwrap().0.is_some());
-        fs::remove_file(d.join("focus.request")).unwrap();fs::create_dir(d.join("focus.request")).unwrap();
-        assert!(set_focus(&root,"area-other",None).unwrap_err().contains("partially saved"));
-        assert_eq!(data::focus(&root).unwrap(),["area-other"]);
-        assert_eq!(fs::read_to_string(d.join("poke")).unwrap(),".","partial state retained the previous command's link");
-        fs::remove_dir_all(root).unwrap();
+        crate::with_test_capture(|_, _| {
+            let root=std::env::temp_dir().join(format!("taskq-focus-lock-{}",std::process::id()));
+            fs::create_dir_all(dot(&root)).unwrap();
+            let d=dot(&root);
+            fs::write(d.join("focus"),"off").unwrap();
+            fs::write(d.join("focus.paused"),"area-maps").unwrap();
+            fs::write(d.join("focus.request"),"owner intent").unwrap();
+            fs::write(d.join("poke"),".").unwrap();
+            for shared in [false,true] {
+                let file=fs::OpenOptions::new().read(true).write(true).open(d.join("poke")).unwrap();
+                let _owner=if shared {coreq::file_lock::try_lock_shared_file(file)} else {coreq::file_lock::try_lock_file(file)}.unwrap();
+                assert!(resume(&root).is_err());
+                assert_eq!(fs::read_to_string(d.join("focus")).unwrap(),"off","Resume changed state before owning its command boundary");
+                assert!(set_focus(&root,"all",Some("new intent")).is_err());
+                assert_eq!(fs::read_to_string(d.join("focus.request")).unwrap(),"owner intent");
+                assert_eq!(fs::read_to_string(d.join("focus")).unwrap(),"off");
+                assert!(pause(&root,false).is_err());
+                assert_eq!(fs::read_to_string(d.join("focus.paused")).unwrap(),"area-maps");
+                assert!(install_focus(&root).is_err());
+            }
+            assert_eq!(resume(&root).unwrap(),"area-maps");
+            pause(&root,false).unwrap();
+            assert_eq!(resume(&root).unwrap(),"area-maps");
+            let context=format!("1 {}.1 {}.2","a".repeat(32),"a".repeat(32));
+            fs::write(d.join("poke"),&context).unwrap();
+            let mut seen=None;
+            let (link,focus)=wake_read(&d.join("poke"),&mut seen,|| {
+                assert!(pause(&root,false).is_err(),"writer entered a reader's snapshot");
+                data::focus(&root)
+            }).unwrap();
+            assert_eq!(link.unwrap().encode(),context);assert_eq!(focus,["area-maps"]);
+            seen=None;
+            fs::write(d.join("focus"),b"\xff").unwrap();
+            assert!(wake_read(&d.join("poke"),&mut seen,||data::focus(&root)).is_err());
+            assert!(seen.is_none(),"failed state read consumed the command identity");
+            fs::write(d.join("focus"),"area-maps").unwrap();
+            assert!(wake_read(&d.join("poke"),&mut seen,||data::focus(&root)).unwrap().0.is_some());
+            fs::remove_file(d.join("focus.request")).unwrap();fs::create_dir(d.join("focus.request")).unwrap();
+            assert!(set_focus(&root,"area-other",None).unwrap_err().contains("partially saved"));
+            assert_eq!(data::focus(&root).unwrap(),["area-other"]);
+            let signal=fs::read_to_string(d.join("poke")).unwrap();
+            assert_ne!(signal,context,"partial state retained the previous command's link");
+            assert!(coreq::telemetry::capture::TraceContext::decode(&signal).is_ok());
+            fs::remove_dir_all(root).unwrap();
+        });
     }
 
     // Chain: repeated Pause -> Resume preserves the owner's saved scope.
     #[test]
     fn resume_restores_the_saved_focus_and_never_defaults_to_all() {
-        let root = std::env::temp_dir().join(format!("taskq-resume-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(dot(&root)).unwrap();
-        fs::write(dot(&root).join("status.json"), r#"{"tasks": [{"n": 1, "labels": ["taskq", "q-ready", "area-maps"]}]}"#).unwrap();
-        fs::write(dot(&root).join("focus"), "off").unwrap();
-        let e = resume(&root).unwrap_err();
-        assert!(e.contains("labels of open tasks: area-maps"), "{e}");
-        assert_eq!(fs::read_to_string(dot(&root).join("focus")).unwrap(), "off");
-        fs::write(dot(&root).join("focus"), "area-maps").unwrap();
-        pause(&root).unwrap();
-        pause(&root).unwrap();
-        assert_eq!(fs::read_to_string(dot(&root).join("focus")).unwrap(), "off");
-        assert_eq!(resume(&root).unwrap(), "area-maps", "a second pause keeps the saved focus");
-        let _ = fs::remove_dir_all(&root);
+        crate::with_test_capture(|_, _| {
+            let root = std::env::temp_dir().join(format!("taskq-resume-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(dot(&root)).unwrap();
+            fs::write(dot(&root).join("status.json"), r#"{"tasks": [{"n": 1, "labels": ["taskq", "q-ready", "area-maps"]}]}"#).unwrap();
+            fs::write(dot(&root).join("focus"), "off").unwrap();
+            let e = resume(&root).unwrap_err();
+            assert!(e.contains("labels of open tasks: area-maps"), "{e}");
+            assert_eq!(fs::read_to_string(dot(&root).join("focus")).unwrap(), "off");
+            fs::write(dot(&root).join("focus"), "area-maps").unwrap();
+            pause(&root,false).unwrap();
+            pause(&root,false).unwrap();
+            assert_eq!(fs::read_to_string(dot(&root).join("focus")).unwrap(), "off");
+            assert_eq!(resume(&root).unwrap(), "area-maps", "a second pause keeps the saved focus");
+            let _ = fs::remove_dir_all(&root);
+        });
     }
 
     // Chain: R6 human report. Risk: report breaks the R6 format.
@@ -3646,7 +3747,7 @@ mod tests {
         assert!(s.contains("Counts: unknown"));
         assert!(s.contains("Freshness: unknown"));
         assert!(!s.contains("Ready 0"));
-        assert!(pause(&root).is_err(), "missing state folder cannot acknowledge pause");
+        assert!(pause(&root,false).is_err(), "missing state folder cannot acknowledge pause");
         fs::create_dir_all(dot(&root)).unwrap();
         fs::write(dot(&root).join("focus"), "one two").unwrap();
         let mut status = json!({"error": null, "at": SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs(), "tasks_age_seconds": 0, "tasks": [{"state":"doing"},{"state":"review"},{"state":"ask"},{"state":"ready"}]});

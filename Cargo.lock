@@ -2209,6 +2209,7 @@ dependencies = [
  "serde_json",
  "tao",
  "tracing",
+ "tracing-subscriber",
  "tray-icon",
  "webview2-com",
  "windows",

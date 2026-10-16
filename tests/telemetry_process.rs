@@ -37,7 +37,7 @@ fn focus_cli_requires_receipts_without_blocking_safe_pause() {
     assert!(page["events"].as_array().unwrap().iter().any(|row|row["id"]==printed&&row["observation"]["kind"]=="command.applied"));
     let receipts:Vec<_>=page["events"].as_array().unwrap().iter().map(|r|&r["observation"]).filter(|r|r["source"]=="command").collect();
     assert_eq!(receipts.len(),2);assert_eq!(receipts[0]["kind"],"command.received");assert_eq!(receipts[1]["kind"],"command.applied");
-    assert_eq!(receipts[0]["span"],receipts[1]["span"]);assert_eq!(receipts[0]["operation"],"taskq.service.command.resume");
+    assert_eq!(receipts[0]["span"],receipts[1]["span"]);assert_eq!(receipts[0]["operation"],"taskq.resume");
     drop(reader);fs::remove_dir_all(root).unwrap();
 }
 

@@ -622,7 +622,7 @@ fn apply(install: &Path, exe: &Path, ops: &[Value], id: &str, rev: u64) -> (bool
                 if focus(&r) == f { Ok(format!("focus {f}")) } else { Err(format!("focus reads {}", focus(&r))) }
             }
             Op::Pause(r) => {
-                crate::pause(&r)?;
+                crate::pause(&r,false)?;
                 if focus(&r) == "off" { Ok("paused".into()) } else { Err(format!("focus reads {}", focus(&r))) }
             }
             Op::Resume(r) => {
@@ -815,45 +815,53 @@ mod tests {
     // Chain: § 4 proposal apply. Risk: a proposal applies twice or without readback.
     #[test]
     fn a_proposal_applies_once_at_its_rev_with_readback() {
-        let (install, root) = (temp("install"), temp("root"));
-        fs::write(install.join("projects"), format!("{}\n", root.display())).unwrap();
-        fs::create_dir_all(dir(&root)).unwrap();
-        fs::write(crate::dot(&root).join("focus"), "area-x").unwrap();
-        let name = crate::project_name(&root);
-        fs::write(dir(&root).join("5.json"), r#"{"text": "pause it"}"#).unwrap();
-        answer(&root, "5", json!({"state": "running"}));
-        answer(&root, "5", json!({"state": "proposal", "text": "Pause", "ops": [{"op": "pause", "project": name}]}));
-        let a = || read(&answer_path(&root, "5"));
-        let focus = || fs::read_to_string(crate::dot(&root).join("focus")).unwrap();
-        let confirm = |rev: &str| {
-            fs::write(dir(&root).join("5.confirm"), rev).unwrap();
+        crate::with_test_capture(|store, _| {
+            let (install, root) = (temp("install"), temp("root"));
+            fs::write(install.join("projects"), format!("{}\n", root.display())).unwrap();
+            fs::create_dir_all(dir(&root)).unwrap();
+            fs::write(crate::dot(&root).join("focus"), "area-x").unwrap();
+            let name = crate::project_name(&root);
+            fs::write(dir(&root).join("5.json"), r#"{"text": "pause it"}"#).unwrap();
+            answer(&root, "5", json!({"state": "running"}));
+            answer(&root, "5", json!({"state": "proposal", "text": "Pause", "ops": [{"op": "pause", "project": name}]}));
+            let a = || read(&answer_path(&root, "5"));
+            let focus = || fs::read_to_string(crate::dot(&root).join("focus")).unwrap();
+            let confirm = |rev: &str| {
+                fs::write(dir(&root).join("5.confirm"), rev).unwrap();
+                step(&root, &install, Path::new("/nonexistent"), None);
+            };
+            assert_eq!(a()["rev"], 2);
+            confirm("1");
+            assert_eq!((a()["state"].as_str(), focus().as_str()), (Some("proposal"), "area-x"), "a stale rev does nothing");
+            confirm("2");
+            assert_eq!((a()["state"].as_str(), focus().as_str()), (Some("applied"), "off"), "{}", a());
+            assert!(a()["readback"][0].as_str().unwrap().ends_with("pause ok: paused"));
+            let rev = a()["rev"].clone();
+            fs::write(crate::dot(&root).join("focus"), "area-y").unwrap();
+            confirm("2");
+            confirm(&rev.to_string());
+            assert_eq!((a()["rev"].clone(), focus().as_str()), (rev, "area-y"), "a repeated confirm applies nothing");
+            // a request without a runtime fails as an AI failure, not a task; a restart ends a running one
+            fs::write(dir(&root).join("6.json"), r#"{"text": "x"}"#).unwrap();
             step(&root, &install, Path::new("/nonexistent"), None);
-        };
-        assert_eq!(a()["rev"], 2);
-        confirm("1");
-        assert_eq!((a()["state"].as_str(), focus().as_str()), (Some("proposal"), "area-x"), "a stale rev does nothing");
-        confirm("2");
-        assert_eq!((a()["state"].as_str(), focus().as_str()), (Some("applied"), "off"), "{}", a());
-        assert!(a()["readback"][0].as_str().unwrap().ends_with("pause ok: paused"));
-        let rev = a()["rev"].clone();
-        fs::write(crate::dot(&root).join("focus"), "area-y").unwrap();
-        confirm("2");
-        confirm(&rev.to_string());
-        assert_eq!((a()["rev"].clone(), focus().as_str()), (rev, "area-y"), "a repeated confirm applies nothing");
-        // a request without a runtime fails as an AI failure, not a task; a restart ends a running one
-        fs::write(dir(&root).join("6.json"), r#"{"text": "x"}"#).unwrap();
-        step(&root, &install, Path::new("/nonexistent"), None);
-        assert_eq!(read(&answer_path(&root, "6"))["state"], "failed");
-        answer(&root, "6", json!({"state": "running"}));
-        recover(&root);
-        assert_eq!(read(&answer_path(&root, "6"))["state"], "failed");
-        for i in 10..40 {
-            fs::write(dir(&root).join(format!("{i}.json")), "{}").unwrap();
-        }
-        step(&root, &install, Path::new("/nonexistent"), None);
-        assert_eq!(ids(&root).len(), KEEP);
-        assert_eq!(ids(&root).first().map(String::as_str), Some("20"), "the newest 20 stay");
-        let _ = (fs::remove_dir_all(&install), fs::remove_dir_all(&root));
+            assert_eq!(read(&answer_path(&root, "6"))["state"], "failed");
+            answer(&root, "6", json!({"state": "running"}));
+            recover(&root);
+            assert_eq!(read(&answer_path(&root, "6"))["state"], "failed");
+            for i in 10..40 {
+                fs::write(dir(&root).join(format!("{i}.json")), "{}").unwrap();
+            }
+            step(&root, &install, Path::new("/nonexistent"), None);
+            assert_eq!(ids(&root).len(), KEEP);
+            assert_eq!(ids(&root).first().map(String::as_str), Some("20"), "the newest 20 stay");
+            let page=store.export(0,0,1024).unwrap();
+            let receipts:Vec<_>=page["events"].as_array().unwrap().iter().map(|r|&r["observation"])
+                .filter(|r|r["source"]=="command").collect();
+            assert_eq!(receipts.len(),2,"proposal confirmation either bypassed receipts or reapplied a repeated operation");
+            assert_eq!(receipts[0]["kind"],"command.received");assert_eq!(receipts[1]["kind"],"command.applied");
+            assert_eq!(receipts[0]["span"],receipts[1]["span"]);assert_eq!(receipts[0]["operation"],"taskq.pause");
+            let _ = (fs::remove_dir_all(&install), fs::remove_dir_all(&root));
+        });
     }
     // Chain: R3/R9 operator request -> native tools -> verified result -> same-session continuation.
     // Paid/client-dependent qualification: deliberately excluded from the normal CI gate.

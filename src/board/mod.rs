@@ -749,10 +749,13 @@ mod tests {
             write!(socket, "HTTP/1.1 503 Unavailable\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).unwrap();
         });
         let dir = std::path::PathBuf::from(std::env::var_os("TASKQ_NATIVE_HTTP_TEST_ROOT").unwrap());
+        let began = Instant::now();
         let _runtime = coreq::telemetry::capture::Runtime::install(&dir.join("db"), "fixtureq", "1").unwrap();
+        let installed = began.elapsed();
         crate::profile::take_report();
         let result = Api::new(base.clone(), base, "private-token").call("POST", "/request", Some(body));
-        server.join().unwrap();
+        let joined = server.join();
+        assert!(joined.is_ok(), "HTTP fixture failed; runtime install={installed:?}, through request={:?}, client error={:?}", began.elapsed(), result.as_ref().err());
         assert!(result.err().unwrap().contains("HTTP 503"));
         assert!(crate::profile::take_report().contains("http5xx:1"));
         let health = coreq::telemetry::capture::qualify().unwrap();

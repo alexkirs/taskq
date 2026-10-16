@@ -98,7 +98,7 @@ This is the development entrypoint for the accepted menu. Use the existing numbe
 | Status, all-state counters, projects and task rows | Canonical snapshot with board/project/issue identity, source/freshness/completeness, runtime/host/session capability; filtered and aggregate counts from one projection | 1, 11; K-A1–A7, M/D checks |
 | Ask cards and numbered replies | Authenticated actor and exact task/attempt/card revision; one accepted answer, stale rejection, durable board readback and uncertain-outcome reconciliation | 2, 9; UC-09, RM-A4 |
 | Scope, pause and reviewed changes | Formal rule or explicit task set, exact selected hosts/projects, expected policy revision, partial receipts, preserved untouched fields | 2, 5; UC-04/05/12 |
-| Auto/Fixed and optional limits | Host-wide reservation authority, runtime enablement, fresh telemetry, intersecting caps and explicit admission reasons | 5; G3, RM-A7 |
+| Host admission and optional limits | Host-wide reservation authority, runtime enablement, fresh telemetry, intersecting caps and explicit admission reasons | 5; G3, RM-A7 |
 | Held plans and editable recipes | Safe creation before eligibility, task mapping/dependencies, explicit start, revision-bound gates and repeat-safe partial creation | 3–4; UC-03/06/07 |
 | Access and Delivery | Separate host grant and project publication policies; requested/saved/applied values; exact candidate approval and supported isolation | 6–7; P checks, G1/G4 |
 | AI conversations, files and separate windows | Project-bound conversation/request IDs, one active request, retained drafts/history, owner-window routing, attachment validation/storage/delivery receipts | 9, 11; C-A1–A10, G6/G7 |

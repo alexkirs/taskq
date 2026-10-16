@@ -36,6 +36,26 @@ const conflict=fx.cases.find(c=>/conflict/.test(c.name)).groups,over=fx.cases.fi
       await page.evaluate(x=>taskq.receive({capmsg:x}),{root,id:m.id,text:'Saved: claude 4 → 3'});
       await page.waitForFunction(()=>document.querySelector('.rsc').dataset.rscState==='saved');
       assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
+      const host=structuredClone(over),h=host.targets[0],p=host.targets[1];
+      for(const t of host.targets)t.supported=[{policy_schema:'taskq.host-capacity/1',modes:[],fields:[],scopes:[]}];
+      h.current_policy={maximum:null,load_gate:saved.load_gate};h.effective_policy=h.current_policy;
+      h.runtime_usage=[{runtime_id:'codex',used:2,limit:3,limit_kind:'ceiling'}];h.sample=p.sample;h.blockers=[];
+      p.current_policy={limits:{codex:1}};p.effective_policy=p.current_policy;
+      // A new authoritative projection must retire the old editor and its stale local receipt.
+      await page.evaluate(s=>taskq.receive(s),state(host));
+      const summary=page.locator('summary',{hasText:'Capacity'});
+      if(!await page.locator('details').filter({has:summary}).evaluate(e=>e.open))await summary.click();
+      const card=page.locator('.rsc');
+      assert.match(await card.innerText(),/Host limits · no maximum/);
+      assert.match(await card.innerText(),/2\/3/);
+      assert.match(await card.innerText(),/Project ceilings: Codex 1/);
+      assert.match(await card.innerText(),/Editing unavailable here/);
+      assert.equal(await card.locator('button').count(),0,'no legacy editor or stale retry for a host policy');
+      assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
+      if(process.env.TASKQ_TEST_ARTIFACTS&&font===20&&width===360){
+        fs.mkdirSync(process.env.TASKQ_TEST_ARTIFACTS,{recursive:true});
+        await page.screenshot({path:require('node:path').join(process.env.TASKQ_TEST_ARTIFACTS,'host-capacity-'+theme+'.png'),fullPage:true});
+      }
       assert.deepEqual(errors,[]);
       console.log('PASS tray resource controls over-capacity, draft/focus on tick, conflict rebase, review, capacity IPC, saved;',theme,font+'px',width+'px');
       await page.close();

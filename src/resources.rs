@@ -111,11 +111,9 @@ fn save(install: &Path, s: &State) -> Res<()> {
 }
 
 /// The host lock, held until the file drops: resource writes and changes of the DashQ connection take turns under it.
-fn lock(install: &Path) -> Res<fs::File> {
+fn lock(install: &Path) -> Res<coreq::file_lock::Lock> {
     fs::create_dir_all(dir(install)).map_err(|e| format!("resources: {e}"))?;
-    let lock = fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir(install).join("lock")).map_err(|e| format!("resources lock: {e}"))?;
-    lock.lock().map_err(|e| format!("resources lock: {e}"))?;
-    Ok(lock)
+    coreq::file_lock::lock(&dir(install).join("lock")).map_err(|e|format!("resources lock: {e}"))
 }
 
 /// `f` changes the DashQ connection under the host lock (`taskq disconnect`), so it never lands between an
@@ -130,7 +128,7 @@ pub fn locked<T>(install: &Path, f: impl FnOnce() -> Res<T>) -> Res<T> {
 pub struct Fenced<W> {
     wire: W,
     install: PathBuf,
-    held: Option<fs::File>,
+    held: Option<coreq::file_lock::Lock>,
 }
 
 impl<W: Wire> Fenced<W> {
@@ -379,6 +377,11 @@ fn decide(install: &Path, s: &mut State, v: &Value, conn: Conn, clock: bool, now
     if v["expected_revision"] != p.revision.as_str() {
         return Ok(record(s, "rejected", Some("conflict")));
     }
+    // These wire profiles own legacy project policy, never fallback authority for host.json.
+    if ["host.json","host.json.pending"].iter().any(|name|match fs::symlink_metadata(install.join(name)) {
+        Err(e) if e.kind()==std::io::ErrorKind::NotFound=>false,
+        _=>true,
+    }) {return Ok(record(s,"rejected",Some("unsupported")));}
     let root = PathBuf::from(&p.root);
     let Ok((cfg, cv)) = crate::load(&root) else { return Ok(record(s, "rejected", Some("unsupported"))) };
     let Ok(cur) = crate::service::capacity(&cv, &cfg.me) else { return Ok(record(s, "rejected", Some("unsupported"))) };
@@ -588,22 +591,6 @@ impl Exchanger {
     }
 }
 
-/// `service capacity` wrote `root`: a new revision even when the values are equal (edit-and-revert).
-pub fn revised(install: &Path, root: &Path, now: u64) -> Res<()> {
-    let root = root.display().to_string();
-    if !dir(install).join(FILE).exists() {
-        return Ok(());
-    }
-    with(install, |s| {
-        sync(s, install, now);
-        if let Some(p) = s.projects.values_mut().find(|p| p.root == root) {
-            p.revision = token("r");
-            p.since = now;
-        }
-        Ok(())
-    })
-}
-
 /// The scope a host grant names: `project` entries are project IDs or registered names.
 pub struct Scope {
     pub host_policy: bool,
@@ -748,6 +735,20 @@ mod tests {
 
     fn active() -> Value {
         json!({"installation": INST, "generation": 1, "destination": "https://x/machine", "credential": "c"})
+    }
+
+    // H-A2: legacy remote profiles cannot report saved after writing an ignored project fallback.
+    #[test]
+    fn host_policy_refuses_legacy_remote_project_writes() {
+        let t=setup("host-profile");let before=config(&t);
+        let host=json!({"limits":{"codex":2},"owner_field":"preserve"}).to_string();
+        fs::write(t.install.join("host.json"),&host).unwrap();
+        let fence=Fence {clock:&||100,live:&||true};
+        with(&t.install,|s|decide(&t.install,s,&submit("host-profile",json!({"runtime_limit":0})),(INST,1),true,100,&fence)).unwrap();
+        assert_eq!(receipt_of(&t,"host-profile")["state"],"rejected");
+        assert_eq!(receipt_of(&t,"host-profile")["reason"],"unsupported");
+        assert_eq!(config(&t),before);assert_eq!(fs::read_to_string(t.install.join("host.json")).unwrap(),host);
+        fs::remove_dir_all(t.base).unwrap();
     }
 
     fn conn_file(install: &Path) -> PathBuf {
@@ -1101,7 +1102,7 @@ mod tests {
         fs::remove_dir_all(&t.base).unwrap();
     }
 
-    // Chain: service resources --grant/--revoke -> report; service capacity write -> revision; sweep and pruning.
+    // Chain: service resources --grant/--revoke -> report; sweep and pruning.
     // Risk: a grant naming an unknown or ambiguous project, an unbounded grant, or the store lost to cleanup.
     #[test]
     fn host_grants_resolve_projects_and_survive_cleanup() {
@@ -1109,7 +1110,6 @@ mod tests {
         let fresh = t.base.join("fresh");
         let mut d = Dash { replies: vec![], posts: vec![], at: 0, cut: None };
         assert_eq!(exchange(&fresh, &active(), &mut d, 0).unwrap(), (vec![], false));
-        revised(&fresh, &t.root, 0).unwrap();
         assert!(d.posts.is_empty() && !dir(&fresh).exists(), "no grant ever made: no exchange, no store");
         let scope =|projects: &[&str], runtimes: &[&str], hours| Scope { host_policy: false, projects: projects.iter().map(|x| x.to_string()).collect(), runtimes: runtimes.iter().map(|x| x.to_string()).collect(), hours };
         fs::write(conn_file(&t.install), conn(None).to_string()).unwrap();
@@ -1126,8 +1126,6 @@ mod tests {
         assert!(r.iter().any(|l| l.starts_with("Grant g: actor op generation 1, projects project-1, runtimes codex; expires")), "{r:?}");
         revoke(&t.install, "g").unwrap();
         assert!(report(&t.install, 20).unwrap().iter().any(|l| l == "Grant g: actor op generation 1, projects project-1, runtimes codex; revoked"));
-        revised(&t.install, &t.root, 30).unwrap();
-        assert_ne!(read(&t.install).unwrap().projects["project-1"].revision, "r1", "a local capacity write is a new revision");
         crate::platform::sweep(&t.install, &t.base.join("absent-shim"));
         crate::data::prune(&t.root, &t.install, "proj", &[]);
         assert!(read(&t.install).unwrap().grants.contains_key("g"), "the store survives sweep and pruning");

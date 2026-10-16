@@ -11,9 +11,9 @@ Status: design detail for the adopted host model in [taskq.md](../../taskq.md). 
 - Native recovery records stay under protected `<install>/native/`, keyed only by canonical registered project roots; [handover contract](../runtime-qualification.md#adapter-recovery-matrix).
 - `service install` and `service uninstall` in a project edit `<install>/projects` and poke the process; they install or remove the host unit only when it is missing or no project remains.
 
-## Proposed taskq.md diff
+## Historical design map
 
-These are proposed replacements, not active rules. Apply by section and quoted text, not line number; retain the 300-line/60 KiB limit (R8). The proposal amends R3 (service ownership), R9 (host configuration ownership) and R10 (explicit registration), with details in sections 3-5 and 8-9. No board fold or golden trace changes are proposed.
+Original old-to-target proposal, retained as design rationale. The adopted taskq.md contract, current linked owner pages and H-A1–H-A5 below govern implementation; these historical quotations are not independent active rules and include superseded telemetry wording. R8 retains the 300-line/60 KiB root bound. No board fold or golden trace change belongs to this transition.
 
 ### § 3 Host admission (line 144)
 
@@ -69,11 +69,11 @@ With:
 
 Replace:
 
-> - Tray (macOS, Windows; [menu](docs/design/menu.md#contract-detail) M1–M14): one per host, started by any installed service when `<install>/tray` (its pid) is older than 30 s.
+> - Tray (macOS, Windows; [menu](menu.md#contract-detail) M1–M14): one per host, started by any installed service when `<install>/tray` (its pid) is older than 30 s.
 
 With:
 
-> - Tray (macOS, Windows; [menu](docs/design/menu.md#contract-detail) M1–M14): one per host, started by the installed service when `<install>/tray` (its pid) is older than 30 s; restart and stop act on the host service and name every project first; pause, resume and uninstall stay per project.
+> - Tray (macOS, Windows; [menu](menu.md#contract-detail) M1–M14): one per host, started by the installed service when `<install>/tray` (its pid) is older than 30 s; restart and stop act on the host service and name every project first; pause, resume and uninstall stay per project.
 
 ### § 4 Profiling (line 177, first sentence)
 
@@ -89,11 +89,11 @@ With:
 
 Replace the `Does` cell:
 
-> § 4, § 8; `permissions`: § 8 Access read, or one grant write with readback; `hold`/`release`/`recover`: § 3, § 4 emergency; `stop`: until the next logon, the unit stays; `list`: this host's projects and their focus; `tray --snapshot DIR [--route R,..]`: § 4; `tray --icon FILE`: [custom icon](docs/design/custom-icon.md#contract-detail)
+> § 4, § 8; `permissions`: § 8 Access read, or one grant write with readback; `hold`/`release`/`recover`: § 3, § 4 emergency; `stop`: until the next logon, the unit stays; `list`: this host's projects and their focus; `tray --snapshot DIR [--route R,..]`: § 4; `tray --icon FILE`: [custom icon](custom-icon.md#contract-detail)
 
 With:
 
-> § 4, § 8; `install`/`uninstall [--host]`: register or drop this project in `<install>/projects` and poke the host service (`--host`: drain, verify exit, then remove only the host unit, § 8 rollback); `permissions`: § 8 Access read, or one grant write with readback; `hold`/`release`/`recover`: § 3, § 4 emergency; `stop`/`restart`: the host service, every project (`stop` until the next logon, the unit stays); `status`: the process, then one block per project; `list`: this host's projects and their focus; `tray --snapshot DIR [--route R,..]`: § 4; `tray --icon FILE`: [custom icon](docs/design/custom-icon.md#contract-detail)
+> § 4, § 8; `install`/`uninstall [--host]`: register or drop this project in `<install>/projects` and poke the host service (`--host`: drain, verify exit, then remove only the host unit, § 8 rollback); `permissions`: § 8 Access read, or one grant write with readback; `hold`/`release`/`recover`: § 3, § 4 emergency; `stop`/`restart`: the host service, every project (`stop` until the next logon, the unit stays); `status`: the process, then one block per project; `list`: this host's projects and their focus; `tray --snapshot DIR [--route R,..]`: § 4; `tray --icon FILE`: [custom icon](custom-icon.md#contract-detail)
 
 ### § 8 Shared core (line 266, unit names)
 
@@ -103,17 +103,17 @@ Replace:
 
 With:
 
-> one host unit `com.taskq.service`, `TaskQ`, `taskq.service` ([host service](docs/design/host-service.md#migration) removes the legacy `com.taskq.<project>`, `TaskQ-<project>`, `taskq-<project>.service`).
+> one host unit `com.taskq.service`, `TaskQ`, `taskq.service` ([host service](host-service.md#migration) removes the legacy `com.taskq.<project>`, `TaskQ-<project>`, `taskq-<project>.service`).
 
 ### § 8 step 3 (line 269)
 
 Replace:
 
-> 3. At step 7 an installed service older than `current` re-execs through the launcher; live CLI children pass over through the protected native handover record; an active Claude, codex-app or operator turn defers it. Detail: [runtime qualification](docs/runtime-qualification.md#contract-detail).
+> 3. At step 7 an installed service older than `current` re-execs through the launcher; live CLI children pass over through the protected native handover record; an active Claude, codex-app or operator turn defers it. Detail: [runtime qualification](../runtime-qualification.md#contract-detail).
 
 With:
 
-> 3. At step 7 an installed service older than `current` re-execs through the launcher, once for all projects; on Unix, live CLI children pass over through each project's protected native handover record with the same pid; an active Claude, codex-app or operator turn of any project defers it. On Windows, all projects must have no live child or active turn before exit 75; the unit restarts with a new pid, with no child adoption. Detail: [runtime qualification](docs/runtime-qualification.md#contract-detail).
+> 3. At step 7 an installed service older than `current` re-execs through the launcher, once for all projects; on Unix, live CLI children pass over through each project's protected native handover record with the same pid; an active Claude, codex-app or operator turn of any project defers it. On Windows, all projects must have no live child or active turn before exit 75; the unit restarts with a new pid, with no child adoption. Detail: [runtime qualification](../runtime-qualification.md#contract-detail).
 
 ### § 8 step 5 (line 271)
 
@@ -145,9 +145,9 @@ Replace `Load gate (opt-in, § 9)` with `Load gate (host policy, § 9)`; retain 
 
 ### § 5 capacity command replacement
 
-> `taskq service capacity [--max N|none] [--claude N] [--codex N] [--codex-app N] [--load-gate on|off] [--cpu-max P] [--memory-min P] [--project P]`
+> Use the canonical `taskq service capacity` syntax in taskq.md section5; `--host` is explicit and local for writes. No --mode or remote-host edit. Optional project limits remain narrowing project configuration; this target adds no unimplemented --project command.
 
-> Without a project root, read or edit this host's host.json; `--project P` selects exactly one registered project's optional runtime limits only. Reject admission/load-gate edits with --project; reject a cap that raises the host ceiling. Show host limits/use and project cap separately, write atomically on explicit owner instruction (R9), poke and report applied only after daemon readback. Remove --mode and remote --host edits; host identity is local. Preserve existing resource-grant checks and revision/receipt guards; no new authority for workers.
+> Read or edit this host's host.json through the same policy operation regardless of invocation directory. Show host limits/use and narrowing project caps separately, write atomically on explicit owner instruction (R9), poke and report applied only after daemon readback. Preserve resource-grant checks and revision/receipt guards; no new authority for workers. Legacy per-project edits remain a qualified compatibility path only until retirement.
 
 ### § 9 host and project configuration replacement
 
@@ -229,11 +229,31 @@ Each task is one reviewable diff. Lines `Depends on` go into the task body as wr
 
 ## Open
 
-- Owner approval of this diff and of the drain-based handoff (no admission during handoff).
+- Host topology and drain-based handoff are accepted design decisions; implementation and installed qualification remain subject to H-A1–H-A5.
 - The macOS `launchctl bootout` child-survival probe decides whether macOS may adopt instead of drain later; not needed for N.
 
 ## Contract detail
 
-Host runtime detail for taskq.md sections 3, 4 and 9. Install, capacity CLI, multi-project status and legacy-unit handoff remain separate implementation targets.
+Host runtime detail for taskq.md sections 3, 4 and 9. Implementation and installed acceptance are tracked separately by H-A1–H-A5.
 
 - Data ([specq data](https://github.com/taskqorg/specq/blob/main/engineering/data.md#files)): telemetry uses [SQLite/WAL bounds and migration](standalone-telemetry.md#sqlite-implementation-and-transition), pruned each host/project pass under the profile lock. Text-log bounds live in `src/data.rs`; legacy `taskq.log` is checked each host pass (each project pass on legacy services), under `taskq-profile.lock`, and keeps its newest half past the collection threshold of 4 MiB − 512 bytes. A busy lock or failed read/write leaves collection unknown and retries next pass. Other files are pruned hourly: `<project>.log` past 4 MiB and `.taskq/cli-errors.log` past 256 KiB keep their newest half; attempt logs the newest 50 plus live attempts; `.taskq/inputs/*.txt` the newest 50 plus files locked by live Claude turns; `incidents/` the newest 50; `requests/comments` past 1000 lines the newest half plus comments still eligible; `events`, `requests/` and `requests.log` follow [taskq.md section 4](../../taskq.md#4-service). A corrupt local state file reads unknown, admits or adopts nothing and deletes no release ([menu](menu.md#contract-detail)).
+
+## Command-surface acceptance
+
+Contract detail for R3/R8/R9 and sections3/4/5/8/9. These cases complete the accepted host transition; they are not evidence that it is implemented. Reuse the existing model/adapter tests and native qualification matrix.
+
+| Case | Required observation |
+|---|---|
+| H-A1 Service entrypoints | Invocation from the install or an explicitly registered project selects the same host owner; no cwd-dependent second scheduler. Unregistered roots cannot register themselves through run. |
+| H-A2 Policy surfaces | CLI, tray, operator and authorized remote resource edits use one canonical host-policy operation; actor/scope/grant/revision validation remains at each trust boundary. Equivalent accepted changes produce the same saved policy and effective service readback. Unsupported target/schema is refused before effects. |
+| H-A3 Failure and restriction | Missing/corrupt/newer host policy holds new admission without fallback to project settings. Owned work remains supervised; restrictive commands retain their explicit receipt-failure policy. |
+| H-A4 Shared occupancy | Two projects, pending claims, running children, reviewer/resume and unknown native execution cannot double-spend capacity; one pending-to-running transition adds no slot. |
+| H-A5 Lifecycle and retirement | Install/restart/stop/uninstall/update preserve the declared scope and owned work; legacy unit/child absence is verified before retirement. Keep original configuration and qualified rollback; an incompatible old authority cannot restart against unresolved work. |
+
+The transition owner is the host service. Project loops and status are consumers/projections, not fallback authorities. Legacy project units, capacity_hosts/mode and admission.json expiry may remain only for identified migration/compatibility readers; after cutover no supported writer/admission path may use them. Retire them only after H-A1–H-A5 and the existing installed acceptance pass. Exact receipts and native release evidence remain required.
+
+## Shared core mapping
+
+Contract detail for taskq.md section8.
+
+**Shared core.** Release, update, launcher and rollback, service units, the `status.json` common keys and the GitLab board token follow [coreq.md](https://github.com/taskqorg/coreq/blob/8a99727d3dde12efa0e506052c804528f9122749/coreq.md) (crate `coreq`, immutable revision in Cargo.toml/Cargo.lock; JS packaging uses the same revision) as `Tool::new("taskq", "TaskQ", "taskqorg/taskq", VERSION)`: install `~/.local/share/taskq` (Windows `%LOCALAPPDATA%\taskq`), files `taskq-<ver>-<os>-<arch>`, host units `com.taskq.service`, `TaskQ`, `taskq.service`; per-project units are legacy migration inputs only.

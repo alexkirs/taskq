@@ -240,7 +240,7 @@ routeBody:function(){
   }
 },
 resourceGroup:function(p){return {...p.resources,key:p.root,labels:{host:p.cap_host||'this host',project:p.name}};},
-resourceCapability:function(g){const p=view.S&&view.S.projects.find(p=>p.root===g.key),e=p&&p.cap_saved&&p.cap_saved.error;return e||!p?{edit:false,reason:'Read-only here',note:e?'Config: '+e:null}:{edit:true};},
+resourceCapability:function(g){const p=view.S&&view.S.projects.find(p=>p.root===g.key),e=p&&p.cap_saved&&p.cap_saved.error;return e||!p?{edit:false,reason:'Read-only here',note:e?'Config: '+e:null}:p.resources?.targets?.some(t=>t.supported?.some(s=>s.policy_schema==='taskq.host-capacity/1'))?{edit:false,reason:'Editing unavailable here',note:'Host limits affect all registered projects. Edit them with taskq service capacity.'}:{edit:true};},
 resourceSet:function(op){const set={limits:{}};for(const o of op.ops){if('runtime_limit' in o.changes)set.limits[o.target.runtime_id]=o.changes.runtime_limit;if(o.changes.load_gate)Object.assign(set,o.changes.load_gate);if('mode' in o.changes)set.mode=o.changes.mode;if('maximum' in o.changes)set.maximum=o.changes.maximum;}return set;},
 
 resourceReceipt:function(m){
@@ -264,8 +264,9 @@ mountResources:function(){
   for(const slot of menu.querySelectorAll('[data-resources]')){
     const p=view.S.projects.find(p=>p.root===slot.dataset.resources);
     if(!p)continue;
+    const scope=p.resources.targets?.[0]?.supported?.[0]?.policy_schema;
     let card=resourceCards.get(p.root);
-    if(!card){const el=document.createElement('div');card={el,ui:TaskqResources.mount(el,{capability:resourceCapability,send:resourceSend,now:()=>view.S.now})};resourceCards.set(p.root,card);}
+    if(!card||card.scope!==scope){const el=document.createElement('div');card={el,scope,ui:TaskqResources.mount(el,{capability:resourceCapability,send:resourceSend,now:()=>view.S.now})};resourceCards.set(p.root,card);}
     slot.append(card.el);
     card.ui.update(resourceGroup(p));
   }
@@ -449,6 +450,8 @@ function answerSend(board,op){
   return promise;
 }
 function resourceSend(g,op){
+  const capability=resourceCapability(g);
+  if(!capability.edit)return Promise.resolve({state:'rejected',reason:capability.reason});
   const p=view.S.projects.find(p=>p.root===g.key),key=g.key+'#'+op.id;
   // A lost receipt retries the reviewed expectation, never a newer config; keep one operation per project.
   if(resourcePayloads.get(g.key)?.id!==op.id)resourcePayloads.set(g.key,JSON.parse(JSON.stringify({a:'capacity',root:g.key,id:op.id,set:resourceSet(op),expect:p&&p.cap_saved})));

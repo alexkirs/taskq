@@ -207,8 +207,10 @@ fn session(rt: &str, log: &Path) -> Option<String> {
 /// `taskq retro` also uses this path, with a read/recommend-only request.
 pub fn exec(rt: &str, brief: &str, root: &Path, logs: &Path, name: &str, resume: Option<&str>) -> Result<String, String> {
     if !["claude", "codex"].contains(&rt) { return Err(format!("operator runtime {rt} unsupported; select claude or codex")); }
-    let (cfg, config) = crate::load(root)?;
-    let cap = crate::service::capacity(&config, &cfg.me)?;
+    let (mut cfg, config) = crate::load(root)?;
+    let policy = crate::host::Policy::read(&cfg.install)?;
+    policy.apply(&mut cfg);
+    let cap = policy.project(&config)?;
     if cap.limits.get(rt).copied().unwrap_or(if cap.auto { u32::MAX } else { 0 }) == 0 {
         return Err(format!("operator runtime {rt} disabled on this host; no fallback"));
     }
@@ -891,6 +893,8 @@ mod tests {
         fs::create_dir_all(dir(&root)).unwrap();
         let install = root.join("fixture-install");
         fs::create_dir_all(&install).unwrap();
+        assert_eq!(crate::platform::default_install(), install, "set TASKQ_INSTALL to the isolated fixture-install path");
+        fs::write(install.join("host.json"), json!({"limits": {rt.clone():1}, "permission_mode":"dontAsk", "codex":["-s","workspace-write","-c","sandbox_workspace_write.network_access=true"]}).to_string()).unwrap();
         fs::write(install.join("projects"), format!("{}\n", root.display())).unwrap();
         let exe = std::env::current_exe().unwrap();
         let wait = |id: &str| {
@@ -919,10 +923,9 @@ mod tests {
         assert!(!running(&root));
         let log = fs::read_to_string(dir(&root).join("1.out")).unwrap();
         assert!(if rt == "claude" { log.contains("tool_use") } else { log.contains("command_execution") }, "actual tools, not acknowledgement");
-        let mut config = read(&root.join("taskq.json"));
-        let (cfg, _) = crate::load(&root).unwrap();
-        config["capacity_hosts"][&cfg.me]["limits"][&rt] = json!(0);
-        fs::write(root.join("taskq.json"), config.to_string()).unwrap();
+        let mut config = read(&install.join("host.json"));
+        config["limits"][&rt] = json!(0);
+        fs::write(install.join("host.json"), config.to_string()).unwrap();
         fs::write(dir(&root).join("3.json"), json!({"after":"2", "text":"Read input.txt again."}).to_string()).unwrap();
         step(&root, &install, &exe, Some(&rt));
         let disabled = wait("3");

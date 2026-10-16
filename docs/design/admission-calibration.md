@@ -1,5 +1,7 @@
 # Admission calibration on the Mac host (D03)
 
+Scope: measurement/calibration evidence is retained. Its legacy capacity_hosts/admission.mode persistence detail is superseded by taskq.md sections3/9 and [host-service transition](host-service.md#command-surface-acceptance); it is not a current host-policy writer. No measurement result here qualifies the later topology cutover.
+
 Research for [#893](https://github.com/taskqorg/taskq/issues/893), plan batch 2 D03; input for WS5 host admission.
 Target: [dynamic resources](dynamic-resources.md) R2. Authority: [taskq.md](../../taskq.md) § 3, § 4, § 9 until WS5 ships.
 Budget rules: [specq performance](https://github.com/taskqorg/specq/blob/main/engineering/performance.md#budget).

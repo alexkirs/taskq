@@ -1,5 +1,7 @@
 # Shared resource controls
 
+Host-policy scope: taskq.md sections3/9 and [host transition acceptance](host-service.md#command-surface-acceptance) supersede the legacy Auto/Fixed policy target. Versioned capacity/admission wire profiles below remain compatibility contracts; their mode/Fixed and project-policy writers do not authorize edits to current host.json. A host producer advertises only qualified fields and refuses unsupported mode/scope/schema before effects; it never drops a field or falls back to a project writer. This spec edit changes no wire version, grant or released component asset.
+
 Accepted target under [taskq.md](../../taskq.md), extending reuse of the [answer card](answer-card.md). TaskQ owns reusable domain components; DashQ supplies layout and authorized transport. No change to live limits, admission or permissions is made by this design.
 
 Follow [shared-block inheritance B1–B4](shared-blocks.md). Compact placement does not authorize independent icons, tokens, counter layouts or simplified editors; the parent package governs visual fidelity.
@@ -10,7 +12,7 @@ Follow [shared-block inheritance B1–B4](shared-blocks.md). Compact placement d
 |---|---|---|
 | Node/runtime summary | taskq.md § 4/§ 5 | Stable installation/runtime identity, freshness, supported runtimes and live usage; unknown per [unknown is never healthy](https://github.com/taskqorg/specq/blob/main/engineering/verification.md#unknown-is-never-healthy) |
 | Capacity and guard | taskq.md § 3/§ 9, [capacity](capacity.md) | Runtime used/limit, effective settings, CPU/available-memory guard, blocking reasons, saved versus applied |
-| Auto / Fixed policy | [dynamic resources R1–R4](dynamic-resources.md) | Host-wide authority, optional host/project/runtime caps, source of effective limits, migration and admission reasons; implemented through #896 |
+| Host policy / legacy mode profile | [dynamic resources R1–R4](dynamic-resources.md) | Host-wide authority, optional host/project/runtime caps, source of effective limits, migration and admission reasons; implemented through #896 |
 | Work mode editor | [menu M12](menu.md#m12-shared-work-mode) | Named host and selected registered projects, Mixed values, explicit edited fields, old→new review and per-target readback |
 
 Reuse compact rows, aligned counts, disclosures and existing theme/text-size tokens. Extract components from existing TaskQ UI alongside the answer-card assets; no general widget framework, new package registry, scheduler or duplicate admission logic. Pin the same versioned local assets and fixtures in both consumers. TaskQ's native adapter remains functional.
@@ -24,6 +26,12 @@ Reuse compact rows, aligned counts, disclosures and existing theme/text-size tok
 - Display current/effective policy, optional ceiling, usage, all blocking reasons and observation age. Unknown/stale/provider limits are distinct from CPU/RAM holds. Auto numerical defaults come from its qualified producer version, not copied constants in DashQ.
 - Admission CPU/RAM/pressure samples keep their source/cadence/units; AgentQ historical resource charts are a different observation stream. Do not overwrite a fresh admission signal with a delayed chart sample or use disk usage as an invented admission rule.
 - Review identifies exact host, selected projects/runtimes and old→new fields before write. Cancel changes nothing. Saved/pending is not applied; applied requires fresh matching effective policy revision from the actual target authority, with per-target partial outcomes.
+
+## Host-policy observation during cutover
+
+The local tray uses the same component with a read-only `taskq.host-capacity/1` projection profile. This is not a remote mutation capability. Its host target carries `maximum` and `load_gate`, host runtime targets carry `runtime_limit` with null `project_id`, and a project target carries its separate narrowing `limits`. Advertise empty editable fields/scopes until the host editor has qualified scope review, operation identity and saved/applied receipts; never route a legacy project edit into host.json. Remote mutation parsers continue to reject this profile as unsupported.
+
+Show host occupancy/limits and gate observations from `capacity.host_policy`/`host_runtime_used`, and project ceilings separately. Missing explicit host readback remains unknown even when a legacy project snapshot is fresh. Optional ceilings have no Auto/Fixed selector; absent means no count ceiling, zero disables. A current policy is saved, never applied merely because it was read from disk. During this transition the tray names the read-only limitation and the local `taskq service capacity` command. H-A2 remains incomplete until the guarded editor and remote host profile pass their acceptance cases.
 
 ## Remote host adapter
 
@@ -139,7 +147,7 @@ Shared fixtures cover legacy and Auto modes, mixed targets, zero/absent limits, 
 - Work mode (#954, [menu M12](menu.md#m12-shared-work-mode)): `workFields`, `workStatus`, `workStep`, `workRender` and `mountWork(el, adapter, selected)` reuse `fields`, `changes`, `review` and `status` over the explicitly selected project groups of one host; nothing is preselected from home, the project page's entry preselects that project. A field whose selected values differ, or that a selected project lacks, shows Mixed until touched; each selected project with an edited field gets its own operation and receipt, so review lists every project old→new (`unchanged` included) and partial failure stays per project. Mode and Host maximum come first and appear only where `taskq.admission/1` advertises `mode`/`maximum`; the tray advertises them when the service reports admission and writes them through `service capacity --mode/--max`. Auto with the gate off is refused before review. The fixtures' `work` cases cover Mixed, unselected and legacy projects, zero versus absent, conflict, per-project partial failure, applied readback and same-ID retry; the node test also checks the parent's order (projects, Mode, maximum, runtime overrides).
 - Release: `taskq-<version>-resource-controls.js`, `.css` and `-fixtures.json` ship in each release, listed in `SHA256SUMS`. Checksums of this source, checked by the node test:
 
-`src/resource-controls.js` SHA-256: `b66e2c694a11cbecc538634c6f41862e6b3fd1d6f4c7ae0bd92eabd0bf64c4ad`
+`src/resource-controls.js` SHA-256: `4dcfc97eb3025ededccc428e79bf69983243a6047632ef72adf2d1940a97d555`
 `src/resource-controls.css` SHA-256: `9f81ec867aaf0cf95c4abbd5c37889632e1a6034b0e33331b52c41f92b836907`
 `tests/fixtures/resource-controls.json` SHA-256: `9b809eafc0317e7c3465bbf7eb8153e4dd46ade6475005131007efb0819c5cef`
 

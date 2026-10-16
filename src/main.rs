@@ -71,7 +71,7 @@ const USAGE: &str = "taskq agents
  taskq enroll <https-url> [--headless] | taskq connection status | taskq disconnect
  taskq service install|run|pause|resume|status|restart|stop|uninstall|list
  taskq service focus [all|off|<label..>] [--request TEXT]
- taskq service capacity [--host H] [--mode auto|fixed] [--max N|none] [--claude N] [--codex N] [--codex-app N] [--load-gate on|off] [--cpu-max P] [--memory-min P]
+ taskq service capacity [--host H] [--max N|none] [--claude N] [--codex N] [--codex-app N] [--load-gate on|off] [--cpu-max P] [--memory-min P]
  taskq service permissions [--runtime R --mode restricted|workspace|full|none [--scope host|project]]
  taskq service resources [--grant ID --actor ID --hours N [--project P].. [--runtime R].. [--host-policy] | --revoke ID]
  taskq tray [--snapshot DIR [--route R,..]] [--icon FILE] | taskq selftest
@@ -818,7 +818,9 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
                     let h = h.lock().map_err(|_| "host admission poisoned; launches held")?;
                     let p = h.policy.as_ref().map_err(Clone::clone)?;
                     p.apply(&mut s.cfg);
-                    p.project(&v)
+                    let cap=p.project(&v)?;
+                    s.cfg.limits=v["limits"].as_object().into_iter().flatten().map(|(rt,n)|(rt.clone(),n.as_u64().unwrap() as u32)).collect();
+                    Ok(cap)
                 }
                 None => service::capacity(&v, &cfg.me),
             });
@@ -1142,12 +1144,7 @@ impl CapEdit {
                 e.limits.insert(rt.into(), n);
             }
         }
-        e.mode = match a.one("mode") {
-            None => None,
-            Some("auto") => Some(true),
-            Some("fixed") => Some(false),
-            Some(x) => return Err(format!("--mode: auto or fixed, not {x}")),
-        };
+        if a.one("mode").is_some() {return Err("host policy has no mode selector; use optional limits and the load gate".into());}
         e.max = match a.one("max") {
             None => None,
             Some("none") => Some(None),
@@ -1217,25 +1214,6 @@ fn edit_capacity(text: &str, host: &str, me: &str, e: &CapEdit, expect: Option<&
     let mut ser = serde_json::Serializer::with_formatter(&mut out, serde_json::ser::PrettyFormatter::with_indent(pad.as_bytes()));
     serde::Serialize::serialize(&v, &mut ser).map_err(|e| e.to_string())?;
     Ok(String::from_utf8_lossy(&out).into_owned() + if text.ends_with('\n') { "\n" } else { "" })
-}
-
-/// Validate, refuse a concurrent edit, replace `taskq.json` atomically, read back: the saved capacity of `host`.
-fn write_capacity(root: &Path, host: &str, e: &CapEdit, expect: Option<&Value>) -> Res<(service::Capacity, service::Capacity)> {
-    let p = root.join("taskq.json");
-    let read = || fs::read_to_string(&p).map_err(|e| format!("taskq.json: {e}"));
-    let text = read()?;
-    let (cfg, v) = load(root)?;
-    let old = service::capacity(&v, host)?;
-    let out = edit_capacity(&text, host, &cfg.me, e, expect)?;
-    if read()? != text {
-        return Err("taskq.json changed while saving; nothing written".into());
-    }
-    platform::write_atomic(&p, &out)?;
-    let saved = service::capacity(&serde_json::from_str(&read()?).map_err(|e| e.to_string())?, host)?;
-    if host == cfg.me {
-        poke(root)?;
-    }
-    Ok((old, saved))
 }
 
 fn cap_changes(old: &service::Capacity, new: &service::Capacity) -> String {
@@ -1351,27 +1329,40 @@ fn resources_cmd(root: &Path, a: &Args) -> Res<()> {
 }
 
 /// `taskq service capacity` (§ 5).
-fn capacity_cmd(root: &Path, a: &Args) -> Res<()> {
-    let (cfg, v) = load(root)?;
-    let host = a.one("host").unwrap_or(&cfg.me).to_string();
-    let project = project_name(root);
-    let status = || -> Option<Value> {
-        let st: Value = fs::read_to_string(dot(root).join("status.json")).ok().and_then(|t| serde_json::from_str(&t).ok())?;
-        (st["host"] == cfg.me.as_str() && file_age(&dot(root).join("status.json")).is_some_and(|x| x <= 60)).then_some(st)
+fn capacity_cmd(a: &Args) -> Res<()> {
+    let install=platform::default_install();
+    let policy=host::Policy::read(&install);
+    let me=policy.as_ref().map(|p|p.me.clone()).unwrap_or_else(|_|std::env::var("TASKQ_HOST").unwrap_or_else(|_|hostname()));
+    let host=a.one("host").unwrap_or(&me).to_string();
+    let roots=host::projects(&install)?;
+    let status=|| -> Option<Value> {
+        let now=SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).ok()?.as_secs();
+        roots.iter().find_map(|root| {
+            let path=dot(root).join("status.json");
+            let st:Value=serde_json::from_slice(&fs::read(&path).ok()?).ok()?;
+            (st["host"]==me && st["at"].as_u64().is_some_and(|at|at<=now && now-at<=60)
+                && file_age(&path).is_some_and(|age|age<=60)).then_some(st)
+        })
     };
     let e = CapEdit::from_args(a)?;
     if e.is_empty() {
-        let saved = service::capacity(&v, &host);
-        println!("Capacity: {project} on {host}");
-        let c = status().map(|st| st["capacity"].clone()).filter(|c| !c.is_null() && host == cfg.me);
+        let saved = policy.and_then(|policy| {
+            if policy.me!=host {return Err("no local policy for remote host".into());}
+            Ok(policy.cap)
+        });
+        if let Err(reason)=&saved {println!("Saved host policy: unknown ({reason})");}
+        println!("Capacity on {host}");
+        let c = status().and_then(|st|service::host_capacity(&st["capacity"])).filter(|_|host==me);
         let limits = c.as_ref().map(|c| c["limits"].clone()).or_else(|| saved.as_ref().ok().map(|s| s.json()["limits"].clone())).unwrap_or_default();
-        let mut rts: Vec<&String> = limits.as_object().into_iter().flatten().map(|(k, _)| k).collect();
+        let mut rts: std::collections::BTreeSet<String> = RUNTIMES.iter().map(|rt|rt.to_string()).collect();
+        rts.extend(limits.as_object().into_iter().flatten().map(|(k,_)|k.clone()));
         if let Some(c) = &c {
-            rts.extend(c["used"].as_object().into_iter().flatten().map(|(k, _)| k).filter(|k| !limits.get(k.as_str()).is_some()));
+            rts.extend(c["used"].as_object().into_iter().flatten().map(|(k,_)|k.clone()));
         }
         for rt in rts {
-            let used = c.as_ref().and_then(|c| c["used"][rt].as_u64()).map_or("?".into(), |n| n.to_string());
-            println!("{} {used}/{}", runtime_name(rt), limits[rt].as_u64().unwrap_or(0));
+            let used = c.as_ref().and_then(|c| c["used"][&rt].as_u64()).map_or("?".into(), |n| n.to_string());
+            let limit=limits[&rt].as_u64().map(|n|n.to_string()).unwrap_or_else(||if c.is_some()||saved.is_ok(){"no cap".into()}else{"?".into()});
+            println!("{} {used}/{limit}",runtime_name(&rt));
         }
         match (&c, &saved) {
             (Some(c), _) => {
@@ -1379,7 +1370,7 @@ fn capacity_cmd(root: &Path, a: &Args) -> Res<()> {
                 println!("{}", admission_text(c));
             }
             (None, Err(e)) => println!("Unknown: {e}"),
-            (None, Ok(_)) if host != cfg.me => println!("Unknown: no local snapshot of {host}"),
+            (None, Ok(_)) if host != me => println!("Unknown: no local snapshot of {host}"),
             (None, Ok(_)) => println!("Unknown: service has no fresh capacity status"),
         }
         if let (Some(c), Ok(s)) = (&c, &saved)
@@ -1392,31 +1383,21 @@ fn capacity_cmd(root: &Path, a: &Args) -> Res<()> {
     // a write names its host explicitly (§ 5)
     let host = a.need("host")?.to_string();
     let wrote = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    let (old, saved) = write_capacity(root, &host, &e, None)?;
-    let changes = cap_changes(&old, &saved);
-    if host == cfg.me
-        && let Err(e) = resources::revised(&cfg.install, root, wrote)
-    {
-        println!("Resource revision unknown: {e}");
-    }
-    if host != cfg.me {
-        println!("Saved for {host} in {project}: {changes}; applies when {host}'s service reads this config");
-        return Ok(());
-    }
+    let (old,saved)=host::write_capacity(&install,&host,&e,None)?;
+    let changes=cap_changes(&old,&saved);
+    for root in &roots {poke(root).map_err(|e|format!("host policy saved; notification unknown: {e}"))?;}
     // `Applied` only after a fresh service readback of the same values (R12)
     for _ in 0..20 {
         if let Some(st) = status()
             && st["at"].as_u64().is_some_and(|t| t >= wrote)
-            && st["capacity"]["limits"] == saved.json()["limits"]
-            && st["capacity"]["load_gate"] == saved.json()["load_gate"]
-            && st["capacity"]["admission"] == saved.json()["admission"]
+            && st["capacity"]["host_policy"] == saved.json()
         {
-            println!("Applied in {project} on {host}: {changes}; running tasks continue");
+            println!("Applied on {host}: {changes}; running tasks continue");
             return Ok(());
         }
         std::thread::sleep(Duration::from_secs(1));
     }
-    println!("Saved; waiting for service in {project} on {host}: {changes}; running tasks continue");
+    println!("Saved; waiting for host service on {host}: {changes}; running tasks continue");
     Ok(())
 }
 
@@ -1709,11 +1690,26 @@ fn service(args: &Args) -> Res<()> {
         }
         return Ok(());
     }
-    if sub == "run" && find_root().is_err() { return host::run(&platform::default_install()); }
+    if sub == "capacity" {return capacity_cmd(args);}
+    if sub == "run" {
+        let install=platform::default_install();
+        let in_install=std::env::current_dir().and_then(|p|p.canonicalize()).ok()
+            .zip(install.canonicalize().ok()).is_some_and(|(cwd,install)|cwd==install);
+        if !in_install {
+            match find_root() {
+                Ok(root)=>{
+                    let root=root.canonicalize().map_err(|e|format!("service root unknown: {e}"))?;
+                    if !host::projects(&install)?.contains(&root) {return Err("service root is not registered; install it explicitly before running".into());}
+                },
+                Err(error) if std::env::var_os("TASKQ_ROOT").is_some()=>return Err(error),
+                Err(_)=>{},
+            }
+        }
+        return host::run(&install);
+    }
     let root = find_root()?;
     let d = dot(&root);
     match sub {
-        "run" => service_run(&ctx()?, None),
         "focus" => {
             let f = args.pos[2..].join(" ");
             if f.is_empty() {
@@ -1744,7 +1740,6 @@ fn service(args: &Args) -> Res<()> {
             println!("{}", service_fields(&root));
             Ok(())
         }
-        "capacity" => capacity_cmd(&root, args),
         "permissions" => permissions_cmd(&root, args),
         "resources" => resources_cmd(&root, args),
         "hold" | "release" => hold_cmd(sub == "hold", args.one("text")),
@@ -2149,7 +2144,7 @@ fn run(argv: &[String]) -> Res<()> {
         // § 5: the operator over the request log; no board
         "retro" => {
             let (cfg, raw) = load(&find_root()?)?;
-            let cap = service::capacity(&raw, &cfg.me)?;
+            let cap = host::Policy::read(&cfg.install)?.project(&raw)?;
             let rt = ["claude", "codex"].into_iter().find(|rt| cap.limits.get(*rt).copied().unwrap_or(if cap.auto { u32::MAX } else { 0 }) > 0);
             print!("{}", retro::run(&cfg.root, rt)?);
             Ok(())
@@ -4003,7 +3998,7 @@ mod tests {
         run(&["close".into(), "12".into(), "--help".into()]).unwrap();
         assert!(USAGE.contains("--recommend K"));
         assert!(USAGE.contains("--snapshot DIR"));
-        assert!(USAGE.contains("taskq service capacity [--host H] [--mode auto|fixed] [--max N|none] [--claude N] [--codex N] [--codex-app N] [--load-gate on|off] [--cpu-max P] [--memory-min P]"));
+        assert!(USAGE.contains("taskq service capacity [--host H] [--max N|none] [--claude N] [--codex N] [--codex-app N] [--load-gate on|off] [--cpu-max P] [--memory-min P]"));
         run(&["service".into(), "capacity".into(), "--help".into()]).unwrap();
         let e = platform::error_text("#7 is ready", None);
         assert!(e.starts_with("Error: #7 is ready\nNext: "));

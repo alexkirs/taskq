@@ -6,7 +6,7 @@ Accepted product target (D03), not current runtime behavior. Inherit [product pr
 
 - New host default: Auto. No session-count question is required. Start eligible work gradually while measured resources permit it; ten sessions are valid if the machine sustains them.
 - Auto + optional maximum: host, project and runtime ceilings intersect. No maximum means no user-imposed count ceiling, not a promise of unlimited resources. Zero explicitly disables that target; absence is not zero in the new schema.
-- Fixed: explicit count ceilings with automatic load gating disabled. Show the trade-off and load; preserve task/dependency/access checks. Never silently switch Auto to Fixed when metrics fail.
+- Current host policy has no Fixed mode (taskq.md sections3/9). Preserve explicit legacy settings until reviewed migration; unknown metrics hold rather than selecting a fallback mode. The legacy wire/editor profile is not a second current admission policy.
 - Host operator owns resource policy. Project/task text cannot raise it. Project/runtime ceilings may narrow it. Disabled runtimes, paused projects, provider restrictions and host grants remain separate constraints.
 - One host-wide admission/reservation authority coordinates every project and managed worker, reviewer and operator. Reserve before spawn, reconcile failed/unknown spawns, and prevent simultaneous projects from consuming the same headroom. Do not add a second canonical task queue.
 - Urgent eligible work gets the next launch; ordinary projects rotate. Define and test reviewer/resume/operator liveness without unlimited privileged bypass. Drafting and deterministic status/answers remain usable while admission waits.
@@ -31,7 +31,7 @@ Keep the current Work mode editor; no new top-level panel.
 |---|---|
 | Menu | `Auto · 7 running` or `Auto · waiting: memory pressure` |
 | Optional cap | `Auto · 7 / 10 running`; caps count sessions, not CPU cores |
-| Work mode | Auto / Fixed; optional maximum; project/runtime overrides behind Details |
+| Work mode | Host admission and optional maximum; lowering project/runtime caps behind Details; no Fixed selector in the current host target |
 | Details | Named host, sample freshness, CPU/RAM, observation window, effective ceilings and their sources |
 | Waiting task | Actual cause: load, ceiling, pause, dependency, scope, access or provider; show all blockers in Details |
 | AI request | “Use spare resources, at most six sessions; frontend at most two” → exact settings diff → confirmation → readback |

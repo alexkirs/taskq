@@ -366,60 +366,45 @@ fn revision(v: &Value) -> Value {
     json!(format!("r{:016x}", h.finish()))
 }
 
-/// The project's capacity as one group of `taskq.resources/1` projection targets (host, project, runtimes) for the
-/// shared resource controls (docs/design/shared-resource-controls.md): `cap` is `status.json` `capacity` (null:
-/// unknown), `saved` the host's capacity from `taskq.json`. The only writes the tray offers are `service capacity`
-/// fields: legacy limits and gate, and Auto/Fixed with its maximum when the service reports admission.
-fn resource_group(cap: &Value, saved: &Value, observed_at: Option<i64>, installation: Option<String>, project: &str) -> Value {
-    let ok = cap.is_object();
+/// Host policy and occupancy are distinct from this project's narrowing ceilings.
+/// shortcut: observation only until host edits have qualified operation identity and receipt replay.
+fn resource_group(cap: &Value, saved: &Value, project_limits: &Value, observed_at: Option<i64>, installation: Option<String>, project: &str) -> Value {
+    let host = crate::service::host_capacity(cap).unwrap_or(Value::Null);
+    let ok = host.is_object();
     let saved = if saved["error"].is_null() { saved } else { &Value::Null };
-    let auto = if ok { cap["admission"]["mode"] == "auto" } else { saved["admission"]["mode"] == "auto" };
     let target = |p: bool, rt: Option<&str>| json!({"installation_id": installation, "generation": 1, "project_id": if p { json!(project) } else { Value::Null }, "runtime_id": rt});
-    let legacy = |field: &str, scope: &str| json!({"policy_schema": "taskq.capacity/1", "modes": ["fixed"], "fields": [field], "scopes": [scope]});
-    let none = json!({"sample": null, "runtime_usage": [], "blockers": [], "completeness": if ok { "complete" } else { "unknown" }});
-    let entry = |t: Value, supported: Value, current: Value, effective: Value, rest: &Value| {
-        let rev = |p: &Value| { let mut p = p.clone(); p.as_object_mut().map(|o| o.remove("sources")); revision(&p) };
-        let mut e = json!({"target": t, "service_version": null, "supported": supported, "current_revision": if saved.is_null() { Value::Null } else { rev(&current) },
-            "effective_revision": if ok { rev(&effective) } else { Value::Null }, "current_policy": current, "effective_policy": effective});
-        for (k, v) in rest.as_object().unwrap() { e[k] = v.clone(); }
-        e
-    };
-    let mut host_supported = vec![];
-    let (mut cur, mut eff) = (json!({"sources": {}}), json!({"sources": {}}));
-    if ok && cap["admission"].is_object() {
-        // writable through `service capacity --mode/--max` (§ 5); advertised only when the service reports admission
-        host_supported.push(json!({"policy_schema": "taskq.admission/1", "modes": ["auto", "fixed"], "fields": ["mode", "maximum"], "scopes": ["host"]}));
-        let pol = |a: &Value| json!({"mode": a["mode"], "maximum": a["max"], "sources": {"mode": "unknown", "maximum": "unknown"}});
-        (cur, eff) = (pol(&saved["admission"]), pol(&cap["admission"]));
-    }
-    let mut targets = vec![entry(target(false, None), json!(host_supported), cur, eff, &none)];
-    let mut rts: Vec<String> = ["claude", "codex"].map(String::from).to_vec();
-    for m in [&saved["limits"], &cap["limits"], &cap["used"]] {
+    let entry = |t: Value, current: Value, effective: Value| json!({"target": t, "service_version": null,
+        "supported": [{"policy_schema": "taskq.host-capacity/1", "modes": [], "fields": [], "scopes": []}],
+        "current_revision": if saved.is_null() { Value::Null } else { revision(&current) },
+        "effective_revision": if ok { revision(&effective) } else { Value::Null },
+        "current_policy": current, "effective_policy": effective,
+        "sample": null, "runtime_usage": [], "blockers": [], "completeness": if ok { "complete" } else { "unknown" }});
+    let pol = |c: &Value| json!({"maximum": c["admission"]["max"], "load_gate": c["load_gate"]});
+    let mut h = entry(target(false, None), pol(saved), pol(&host));
+    let mut rts: Vec<String> = crate::service::RUNTIMES.iter().map(|rt| rt.to_string()).collect();
+    for m in [&saved["limits"], &host["limits"], &host["used"]] {
         for k in m.as_object().into_iter().flatten().map(|(k, _)| k) { if !rts.contains(k) { rts.push(k.clone()); } }
     }
-    let limits = if ok { &cap["limits"] } else { &saved["limits"] };
-    let usage: Vec<Value> = rts.iter().map(|rt| {
-        let l = limits[rt].as_u64();
-        let kind = if !ok && saved.is_null() { "unknown" } else { match l { Some(0) => "disabled", Some(_) => "ceiling", None if auto => "unbounded", None => "disabled" } };
-        json!({"runtime_id": rt, "used": if ok { json!(cap["used"][rt].as_u64().unwrap_or(0)) } else { Value::Null }, "limit": l, "limit_kind": kind})
-    }).collect();
-    let sample = if cap["sample_at"].is_i64() {
-        json!({"source": format!("taskq-admission-{}", if cfg!(windows) { "windows" } else if cfg!(target_os = "macos") { "macos" } else { "linux" }),
-            "sampled_at": cap["sample_at"], "age_seconds": cap["sample_age_seconds"], "cadence_seconds": 30, "window_seconds": if auto { 60 } else { 30 },
-            "cpu_busy_percent": cap["cpu_percent"], "memory_available_percent": cap["memory_available_percent"], "memory_available_gib": null, "pressure": null})
-    } else { Value::Null };
+    h["runtime_usage"] = json!(rts.iter().map(|rt| {
+        let l = if ok { host["limits"][rt].as_u64() } else { saved["limits"][rt].as_u64() };
+        let kind = if !ok && saved.is_null() { "unknown" } else { match l { Some(0) => "disabled", Some(_) => "ceiling", None => "unbounded" } };
+        json!({"runtime_id": rt, "used": host["used"][rt].as_u64(), "limit": l, "limit_kind": kind})
+    }).collect::<Vec<_>>());
+    if ok && host["sample_at"].is_i64() {
+        h["sample"] = json!({"source": format!("taskq-admission-{}", if cfg!(windows) { "windows" } else if cfg!(target_os = "macos") { "macos" } else { "linux" }),
+            "sampled_at": host["sample_at"], "age_seconds": host["sample_age_seconds"], "cadence_seconds": 30, "window_seconds": 60,
+            "cpu_busy_percent": host["cpu_percent"], "memory_available_percent": host["memory_available_percent"], "memory_available_gib": null, "pressure": null});
+    }
     const CODES: [&str; 18] = ["cpu", "memory", "pressure", "sample", "config", "cooldown", "spacing", "max", "version", "host", "runtime_disabled", "pause", "focus", "dependency", "routing", "access", "provider", "unknown"];
-    let blockers: Vec<Value> = cap["reasons"].as_array().into_iter().flatten().map(|r| {
+    h["blockers"] = json!(host["reasons"].as_array().into_iter().flatten().map(|r| {
         let code = match r["code"].as_str().unwrap_or("") { "hold" => "host", c if CODES.contains(&c) => c, _ => "unknown" };
-        let host_scope = ["host", "max", "spacing", "version"].contains(&code);
-        json!({"code": code, "scope": target(!host_scope, None), "knowledge": if code == "sample" || code == "unknown" || (code == "host" && cap["gate"] == "unknown") { "unknown" } else { "known" }})
-    }).collect();
-    let gate = |g: &Value| json!({"load_gate": g, "sources": {"load_gate": "unknown"}});
-    targets.push(entry(target(true, None), json!([legacy("load_gate", "project")]), gate(&saved["load_gate"]), gate(&cap["load_gate"]),
-        &json!({"sample": sample, "runtime_usage": usage, "blockers": blockers, "completeness": if ok { "complete" } else { "unknown" }})));
+        let host_scope = ["host", "max", "spacing", "version", "cpu", "memory", "pressure", "sample", "config"].contains(&code);
+        json!({"code": code, "scope": target(!host_scope, None), "knowledge": if code == "sample" || code == "unknown" || (code == "host" && host["gate"] == "unknown") { "unknown" } else { "known" }})
+    }).collect::<Vec<_>>());
+    let mut targets = vec![h, entry(target(true, None), json!({"limits": project_limits}), json!({"limits": cap["project_limits"]}))];
     for rt in &rts {
-        let lim = |m: &Value| json!({"runtime_limit": m[rt], "sources": {"runtime_limit": "unknown"}});
-        targets.push(entry(target(true, Some(rt)), json!([legacy("runtime_limit", "runtime")]), lim(&saved["limits"]), lim(&cap["limits"]), &none));
+        let lim = |c: &Value| json!({"runtime_limit": c["limits"][rt]});
+        targets.push(entry(target(false, Some(rt)), lim(saved), lim(&host)));
     }
     json!({"schema": "taskq.resources/1", "observed_at": observed_at, "targets": targets})
 }
@@ -442,15 +427,15 @@ fn project(install: &Path, root: &str) -> Value {
         Some(json!([w.first()?.parse::<i64>().ok()?, w.get(2)?, w.get(3)?, w.get(1)?.strip_prefix('#')?.parse::<u64>().ok()?]))
     }).collect();
     // the local host's saved capacity, for `Edit limits` and its readback (§ 4 Capacity)
-    let (cap_host, cap_saved, board_kind) = match crate::load(r) {
-        Ok((c, v)) => (json!(c.me), crate::service::capacity(&v, &c.me).map(|x| x.json()).unwrap_or_else(|e| json!({"error": e})), json!(c.board.name)),
-        Err(e) => (Value::Null, json!({"error": e}), Value::Null),
+    let (cap_host, cap_saved, board_kind, project_limits) = match crate::load(r) {
+        Ok((c, raw)) => (json!(c.me), crate::host::Policy::read(install).map(|p|p.cap.json()).unwrap_or_else(|e| json!({"error": e})), json!(c.board.name), if raw["limits"].is_null() {json!({})} else {raw["limits"].clone()}),
+        Err(e) => (Value::Null, json!({"error": e}), Value::Null, Value::Null),
     };
     let mut tasks = s["tasks"].as_array().cloned().unwrap_or_default();
     for task in &mut tasks { task_session(r, cap_host.as_str().unwrap_or(""), task); }
     let installation = fs::read_to_string(install.join("installation-id")).ok().filter(|i| i.len() == 64 && i.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)));
     let id: String = crate::project_name(r).chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' }).take(64).collect();
-    let resources = resource_group(&s["capacity"], &cap_saved, age.map(|a| now() - a as i64), installation, &id);
+    let resources = resource_group(&s["capacity"], &cap_saved, &project_limits, age.map(|a| now() - a as i64), installation, &id);
     json!({"root": root, "name": s["project"].as_str().map(String::from).unwrap_or_else(|| crate::project_name(r)),
         "issues": s["issues"].as_str().unwrap_or(""), "board_kind": board_kind, "closed": Value::Null,
         "log": s["log"].is_string(), "alive": age.is_some_and(|a| a < 300), "age": age,
@@ -1581,33 +1566,8 @@ fn install_service(install: &Path, mut a: Value) -> Value {
 }
 
 /// Write the page's capacity edit for this host; the outcome line for the page.
-fn capacity(root: &Path, m: &Value) -> String {
-    let set = &m["set"];
-    let mut e = crate::CapEdit { gate: set["enabled"].as_bool(), ..Default::default() };
-    let num = |k: &str| set[k].as_u64().map(|n| u32::try_from(n).map_err(|_| format!("{k}: not an integer 0..{}", u32::MAX))).transpose();
-    let r = (|| {
-        e.cpu_max = num("cpu_max")?;
-        e.memory_min = num("memory_min")?;
-        e.mode = match &set["mode"] {
-            Value::Null => None,
-            m if m == "auto" || m == "fixed" => Some(m == "auto"),
-            m => return Err(format!("mode: auto or fixed, not {m}")),
-        };
-        e.max = match set.get("maximum") {
-            None => None,
-            Some(Value::Null) => Some(None),
-            Some(n) => Some(Some(n.as_u64().and_then(|n| u32::try_from(n).ok()).ok_or(format!("maximum: not an integer 0..{}", u32::MAX))?)),
-        };
-        for (rt, n) in set["limits"].as_object().into_iter().flatten() {
-            e.limits.insert(rt.clone(), n.as_u64().and_then(|n| u32::try_from(n).ok()).ok_or(format!("{rt}: not an integer 0..{}", u32::MAX))?);
-        }
-        let me = crate::load(root)?.0.me;
-        crate::write_capacity(root, &me, &e, Some(&m["expect"]))
-    })();
-    match r {
-        Ok((old, new)) => format!("Saved: {}", crate::cap_changes(&old, &new)),
-        Err(e) => format!("Error: {e}"),
-    }
+fn capacity(_root: &Path, _m: &Value) -> String {
+    "Error: host editing unavailable here; use taskq service capacity".into()
 }
 
 fn open(arg: &str) {
@@ -2071,46 +2031,37 @@ mod tests {
         assert!(!blur_refocuses(Duration::from_millis(300)) && !blur_refocuses(Duration::from_secs(5)));
     }
 
-    // Chain: status.json capacity -> tray projection -> shared resource controls. Risk: absent reads as zero, a legacy
-    // guard reads as Auto, saved reads as applied, or an unknown producer reason disappears.
+    // H-A2: host policy/readback cannot be confused with a project's lower ceiling or legacy writable scope.
     #[test]
     fn capacity_projects_to_resource_targets() {
-        let saved = json!({"limits": {"claude": 0}, "load_gate": {"enabled": true, "cpu_max": 85, "memory_min": 10}, "admission": {"mode": "auto", "max": null}});
-        let cap = json!({"limits": {"claude": 0}, "used": {"claude": 1}, "load_gate": {"enabled": true, "cpu_max": 90, "memory_min": 10},
-            "sample_at": 95, "sample_age_seconds": 3, "cpu_percent": 12.5, "memory_available_percent": 40.0, "reasons": [{"code": "hold"}, {"code": "future"}, {"code": "cpu"}]});
-        let g = resource_group(&cap, &saved, Some(100), None, "taskq");
-        let t = g["targets"].as_array().unwrap();
-        assert_eq!(t.len(), 4);
-        assert!(t[0]["target"]["project_id"].is_null() && t[0]["supported"] == json!([]), "no admission in status: legacy guard");
-        let u = &t[1]["runtime_usage"];
-        assert_eq!(u[0], json!({"runtime_id": "claude", "used": 1, "limit": 0, "limit_kind": "disabled"}));
-        assert_eq!(u[1], json!({"runtime_id": "codex", "used": 0, "limit": null, "limit_kind": "disabled"}), "Fixed: absent admits none");
-        assert_ne!(t[1]["current_revision"], t[1]["effective_revision"], "saved gate 85 is not applied 90");
-        assert_eq!(t[2]["current_revision"], t[2]["effective_revision"]);
-        let codes: Vec<_> = t[1]["blockers"].as_array().unwrap().iter().map(|b| b["code"].as_str().unwrap()).collect();
-        assert_eq!(codes, ["host", "unknown", "cpu"]);
-        assert!(t[1]["blockers"][0]["scope"]["project_id"].is_null());
-        assert_eq!(t[1]["sample"]["age_seconds"], 3);
-        let mut auto = cap.clone();
-        auto["admission"] = json!({"mode": "auto", "max": null});
-        let g = resource_group(&auto, &saved, Some(100), None, "taskq");
-        assert_eq!(g["targets"][0]["supported"][0]["policy_schema"], "taskq.admission/1");
-        assert_eq!(g["targets"][0]["supported"][0]["fields"], json!(["mode", "maximum"]), "Work mode writes Auto/maximum");
-        assert_eq!(g["targets"][1]["runtime_usage"][1]["limit_kind"], "unbounded", "Auto: absent has no count cap");
-        let unknown = resource_group(&Value::Null, &json!({"error": "not configured"}), None, None, "taskq");
-        assert_eq!(unknown["targets"][1]["runtime_usage"][0], json!({"runtime_id": "claude", "used": null, "limit": null, "limit_kind": "unknown"}));
-        assert!(unknown["targets"][1]["effective_revision"].is_null() && unknown["targets"][1]["current_revision"].is_null());
+        let saved = json!({"limits":{"claude":0,"codex":3},"load_gate":{"enabled":true,"cpu_max":85,"memory_min":10},"admission":{"mode":"auto","max":null}});
+        let cap = json!({"host_policy":saved,"host_runtime_used":{"claude":1,"codex":2},"project_limits":{"codex":1},
+            "limits":{"codex":1},"used":{"codex":1},"load_gate":{"enabled":true,"cpu_max":85,"memory_min":10},
+            "sample_at":95,"sample_age_seconds":3,"cpu_percent":12.5,"memory_available_percent":40.0,
+            "reasons":[{"code":"hold"},{"code":"future"},{"code":"cpu"}]});
+        let group = resource_group(&cap, &saved, &json!({"codex":1}), Some(100), None, "taskq");
+        let t = group["targets"].as_array().unwrap();
+        assert_eq!(t[0]["runtime_usage"][1],json!({"runtime_id":"codex","used":2,"limit":3,"limit_kind":"ceiling"}));
+        assert_eq!(t[1]["current_policy"]["limits"]["codex"],1);
+        assert_eq!(t[0]["current_revision"],t[0]["effective_revision"]);
+        assert!(t.iter().all(|t|t["supported"][0]["fields"]==json!([])),"no legacy project writer may advertise a host edit");
+        assert!(t[3]["target"]["project_id"].is_null(),"runtime ceiling belongs to the host");
+        assert!(t[0]["current_policy"]["mode"].is_null());
+        let codes:Vec<_>=t[0]["blockers"].as_array().unwrap().iter().map(|b|b["code"].as_str().unwrap()).collect();
+        assert_eq!(codes,["host","unknown","cpu"]);
+        assert_eq!(t[0]["sample"]["age_seconds"],3);
+        let mut stale=cap.clone();stale.as_object_mut().unwrap().remove("host_policy");
+        let unknown=resource_group(&stale,&saved,&json!({"codex":1}),Some(100),None,"taskq");
+        assert!(unknown["targets"][0]["effective_revision"].is_null());
+        assert!(unknown["targets"][0]["runtime_usage"][1]["used"].is_null(),"legacy project snapshot cannot prove host use");
     }
 
-    // Chain: Work mode -> tray bridge -> `service capacity --mode/--max`. Risk: an unknown mode reads as Fixed or a
-    // malformed maximum removes the ceiling.
+    // H-A2: a stale page cannot repurpose a legacy project operation as an edit to every project on the host.
     #[test]
-    fn work_mode_bridge_refuses_malformed_mode_and_maximum() {
-        let root = Path::new("/nonexistent-taskq-954");
-        assert!(capacity(root, &json!({"set": {"mode": "fast"}})).starts_with("Error: mode: auto or fixed"));
-        assert!(capacity(root, &json!({"set": {"maximum": "4"}})).starts_with("Error: maximum: not an integer"));
-        assert!(capacity(root, &json!({"set": {"maximum": -1}})).starts_with("Error: maximum: not an integer"));
-        assert!(!capacity(root, &json!({"set": {"mode": "auto", "maximum": null}})).contains("mode:"), "valid fields reach the config read");
+    fn capacity_bridge_refuses_unqualified_host_edits() {
+        for set in [json!({"mode":"auto"}),json!({"limits":{"codex":4}}),json!({"maximum":null})] {
+            assert!(capacity(Path::new("/nonexistent-taskq-954"),&json!({"set":set})).starts_with("Error: host editing unavailable here"));
+        }
     }
 
     // Chain: § 4 tray opens an incident report. Risk: tray opens a file outside .taskq/incidents.

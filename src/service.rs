@@ -325,6 +325,15 @@ pub struct Service<'a> {
 
 const MONTH: i64 = 30 * 86400;
 
+/// Host readback stays separate from a project's effective narrowing limits.
+pub fn host_capacity(capacity:&Value)->Option<Value> {
+    if !capacity["host_policy"].is_object() {return None;}
+    let mut host=capacity.clone();
+    for field in ["limits","load_gate","admission"] {host[field]=capacity["host_policy"][field].clone();}
+    host["used"]=capacity["host_runtime_used"].clone();
+    Some(host)
+}
+
 /// Load gate settings (§ 9).
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct GateCfg {
@@ -741,7 +750,10 @@ impl<'a> Service<'a> {
             *used.entry(rt).or_default() += 1;
         }
         let last = self.gate.last.filter(|_| self.gate.enabled());
-        json!({"limits": limits, "used": used, "load_gate": self.cap.as_ref().map(|c| c.json()["load_gate"].clone()).unwrap_or(Value::Null),
+        let (host_policy,host_used)=self.host.as_ref().and_then(|h|h.lock().ok().map(|h| {
+            (h.policy.as_ref().map(|p|p.cap.json()).unwrap_or(Value::Null),json!(h.used()))
+        })).unwrap_or((Value::Null,Value::Null));
+        json!({"host_policy":host_policy,"host_runtime_used":host_used,"project_limits":self.cap.as_ref().ok().map(|_| &self.cfg.limits),"limits": limits, "used": used, "load_gate": self.cap.as_ref().map(|c| c.json()["load_gate"].clone()).unwrap_or(Value::Null),
             "admission": self.cap.as_ref().map(|c| c.json()["admission"].clone()).unwrap_or(Value::Null), "host_used": self.host_used,
             "min_service_version": crate::admission::MIN_SERVICE, "reservations": reservations,
             "gate": gate, "reasons": reasons.iter().map(|(c, t)| json!({"code": c, "text": t})).collect::<Vec<_>>(),

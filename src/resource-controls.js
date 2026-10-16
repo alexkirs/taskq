@@ -5,24 +5,25 @@ const execution=ui.execution;
 const {scopes,freshness,policy,gate,age,usage,applied,headline,fields,edited,problem,changes,review,fresh,status,step,render,input,mount,workFields,freshWork,workStatus,workStep,workRender,mountWork,replayWork,replay}=execution.module("resource-controls",{
 scopes:function(group) {
     const t = group.targets || [];
-    return {host: t.find(x => x.target.project_id == null), project: t.find(x => x.target.project_id != null && x.target.runtime_id == null),
-      runtimes: t.filter(x => x.target.runtime_id != null)};
+    const host=t.find(x => x.target.project_id == null && x.target.runtime_id == null),project=t.find(x => x.target.project_id != null && x.target.runtime_id == null);
+    return {host, project, observation:schemaOf(host, 'taskq.host-capacity/1')?host:project, runtimes:t.filter(x => x.target.runtime_id != null)};
   },
 freshness:function(group, now) {
-    const p = scopes(group).project, obs = group.observed_at, s = p && p.sample;
+    const p = scopes(group).observation, obs = group.observed_at, s = p && p.sample;
     const status = obs == null || now < obs ? null : now - obs;
     const sample = s && s.sampled_at != null && s.age_seconds != null && status != null && s.sampled_at <= obs ? s.age_seconds + status : null;
     return {status, sample, fresh: status != null && status <= FRESH};
   },
 policy:function(group) {
     const h = scopes(group).host, c = h && h.current_policy || {};
+    if (schemaOf(h, 'taskq.host-capacity/1')) return 'Host limits · ' + (c.maximum == null ? 'no maximum' : 'maximum ' + c.maximum);
     if (!schemaOf(h, 'taskq.admission/1')) return 'Legacy guard · Fixed limits';
     if (c.mode === 'auto') return 'Auto · ' + (c.maximum == null ? 'no host maximum' : 'host maximum ' + c.maximum);
     if (c.mode === 'fixed') return 'Fixed';
     return 'Policy unknown';
   },
 gate:function(group, now) {
-    const p = scopes(group).project, f = freshness(group, now);
+    const p = scopes(group).observation, f = freshness(group, now);
     if (!p) return 'Unknown: no capacity status';
     if (!f.fresh) return 'Unknown: status ' + (f.status == null ? 'missing' : age(f.status) + ' old');
     const g = p.effective_policy && p.effective_policy.load_gate, bs = (p.blockers || []);
@@ -36,7 +37,7 @@ gate:function(group, now) {
   },
 age:function(s) { return s < 120 ? s + ' s' : s < 7200 ? Math.round(s / 60) + ' min' : s < 172800 ? Math.round(s / 3600) + ' h' : Math.round(s / 86400) + ' d'; },
 usage:function(group, now) {
-    const p = scopes(group).project, fresh = freshness(group, now).fresh;
+    const p = scopes(group).observation, fresh = freshness(group, now).fresh;
     return ((p && p.runtime_usage) || []).map(u => {
       const used = fresh && u.used != null ? u.used : null, l = u.limit;
       const limit = u.limit_kind === 'unbounded' ? 'no cap' : u.limit_kind === 'unknown' || (l == null && u.limit_kind !== 'disabled') ? '?' : l == null ? 'none' : String(l);
@@ -162,14 +163,18 @@ render:function(group, local, cap, now) {
     h += '<p class="rsc-row"><span>Policy</span><span class="rsc-muted">' + esc(policy(group)) + '</span></p>';
     for (const u of usage(group, now)) h += '<p class="rsc-row' + (u.over ? ' rsc-over' : '') + '" aria-label="' + esc(rtName(u.runtime) + ': ' + (u.used == null ? 'unknown' : u.used) + ' used of ' + u.limit + (u.over ? ', over limit; running tasks continue' : '')) + '"><span>' + esc(rtName(u.runtime)) + '</span><span class="rsc-count">' + esc(u.text) + '</span></p>';
     h += '<p class="rsc-row"><span>Load gate</span><span class="rsc-muted">' + esc(gate(group, now)) + '</span></p>';
-    const sm = s.project && s.project.sample;
+    const sm = s.observation && s.observation.sample;
     if (sm && (sm.cpu_busy_percent != null || sm.memory_available_percent != null)) {
       const parts = [sm.cpu_busy_percent != null ? 'CPU ' + Math.round(sm.cpu_busy_percent) + ' %' : 'CPU unknown', sm.memory_available_percent != null ? 'available memory ' + Math.round(sm.memory_available_percent) + ' %' : 'memory unknown'];
       h += '<p class="rsc-muted">' + esc(parts.join(' · ') + (f.sample != null ? ' · ' + (f.sample > FRESH ? 'last sample ' + age(f.sample) + ' ago' : age(f.sample) + ' ago') : '')) + '</p>';
     }
-    const other = (s.project && s.project.blockers || []).filter(b => !GATE.includes(b.code) && b.code !== 'sample' && b.code !== 'config');
+    const other = (s.observation && s.observation.blockers || []).filter(b => !GATE.includes(b.code) && b.code !== 'sample' && b.code !== 'config');
     if (other.length) h += '<p class="rsc-muted">Also blocked: ' + esc(other.map(b => BLOCKERS[b.code] || BLOCKERS.unknown).join(', ')) + '</p>';
-    if (s.project && s.project.completeness !== 'complete') h += '<p class="rsc-muted">Blockers ' + esc(s.project.completeness === 'partial' ? 'partly unknown' : 'unknown') + '</p>';
+    if (s.observation && s.observation.completeness !== 'complete') h += '<p class="rsc-muted">Blockers ' + esc(s.observation.completeness === 'partial' ? 'partly unknown' : 'unknown') + '</p>';
+    if (schemaOf(s.host, 'taskq.host-capacity/1')) {
+      const limits=s.project?.current_policy?.limits;
+      h += '<p class="rsc-muted">Project ceilings: ' + esc(limits==null?'unknown':Object.entries(limits).map(([rt,n])=>rtName(rt)+' '+n).join(', ')||'none') + '</p>';
+    }
     if (cap && cap.note) h += '<p class="rsc-alert">' + esc(cap.note) + '</p>';
     if (st === 'view' || st === 'read-only') {
       const a = applied(group, now);

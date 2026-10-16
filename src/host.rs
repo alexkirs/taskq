@@ -66,6 +66,11 @@ impl Policy {
     }
 
     pub fn read(install: &Path) -> Res<Self> {
+        match fs::symlink_metadata(install.join("host.json.pending")) {
+            Err(e) if e.kind()==std::io::ErrorKind::NotFound=>{},
+            Err(e)=>return Err(format!("host policy prepare unknown: {e}")),
+            Ok(_)=>return Err("host policy interrupted write retained; admission held for reconciliation".into()),
+        }
         let v = fs::read(install.join("host.json")).map_err(|e| format!("host.json unknown: {e}"))?;
         Self::parse(serde_json::from_slice(&v).map_err(|e| format!("host.json unknown: {e}"))?, &crate::hostname())
     }
@@ -80,6 +85,77 @@ impl Policy {
         }
         Ok(c)
     }
+}
+
+/// Existing resource-control lock serializes policy writers with grants and migration.
+#[tracing::instrument(name="host.policy.write",skip_all)]
+pub fn write_capacity(install:&Path, host:&str, edit:&crate::CapEdit, expect:Option<&Value>)->Res<(Capacity,Capacity)> {
+    if std::env::var_os("TASKQ_ATTEMPT").is_some() {return Err("a worker cannot change host policy".into());}
+    crate::resources::locked(install,|| {
+        let migration=install.join("host-policy-migration");
+        if migration.join("plan.json").try_exists().map_err(|e|e.to_string())?
+            && !migration.join("complete").try_exists().map_err(|e|e.to_string())? {
+            return Err("host policy migration incomplete; edits held until verified readback".into());
+        }
+        let path=install.join("host.json");
+        let original=fs::read_to_string(&path).map_err(|e|format!("host.json unknown: {e}"))?;
+        let hostname=crate::hostname();
+        let old=Policy::parse(serde_json::from_str(&original).map_err(|e|format!("host.json unknown: {e}"))?,&hostname)?;
+        if host!=old.me {return Err("host policy edits require this local host; remote edits are unsupported".into());}
+        if edit.mode.is_some() {return Err("host policy has no mode selector; use optional limits and the load gate".into());}
+        if expect.is_some_and(|v|*v!=old.cap.json()) {return Err("host policy changed; refresh before applying".into());}
+        let mut next=old.raw.clone();
+        for rt in edit.limits.keys().chain(&edit.unset) {
+            if !service::RUNTIMES.contains(&rt.as_str()) {return Err(format!("unknown runtime {rt}"));}
+        }
+        if !edit.limits.is_empty() {
+            if next["limits"].is_null() {next["limits"]=json!({});}
+            for (rt,n) in &edit.limits {next["limits"][rt]=json!(n);}
+        }
+        for rt in &edit.unset {if let Some(limits)=next["limits"].as_object_mut() {limits.remove(rt);}}
+        if let Some(max)=edit.max {if next["admission"].is_null() {next["admission"]=json!({});}next["admission"]["max"]=json!(max);}
+        if edit.gate.is_some()||edit.cpu_max.is_some()||edit.memory_min.is_some() {
+            if next["load_gate"].is_null() {next["load_gate"]=json!({});}
+            if let Some(value)=edit.gate {next["load_gate"]["enabled"]=json!(value);}
+            if let Some(value)=edit.cpu_max {next["load_gate"]["cpu_max"]=json!(value);}
+            if let Some(value)=edit.memory_min {next["load_gate"]["memory_min"]=json!(value);}
+        }
+        let candidate=Policy::parse(next,&hostname)?;
+        replace_policy(&path,&original,&candidate.raw)?;
+        let saved=Policy::read(install)?;
+        if saved.raw!=candidate.raw {return Err("host policy write uncertain: readback differs".into());}
+        Ok((old.cap,saved.cap))
+    })
+}
+
+/// Reuse migration's native replacement so a settings edit preserves owner/group/ACL and file permissions.
+fn replace_policy(path:&Path, original:&str, next:&Value)->Res<()> {
+    use std::io::Write;
+    let metadata=fs::symlink_metadata(path).map_err(|e|e.to_string())?;
+    if !metadata.is_file() || metadata.permissions().readonly() {return Err("host policy is not a writable regular file; kept".into());}
+    let owner=ownership(path)?;
+    let stage=path.with_file_name("host.json.pending");
+    let mut file=fs::OpenOptions::new().write(true).create_new(true).open(&stage)
+        .map_err(|e|format!("host policy prepare refused; interrupted state kept: {e}"))?;
+    let result=(|| {
+        stage_owner(&stage,&owner)?;
+        file.set_permissions(metadata.permissions()).map_err(|e|e.to_string())?;
+        file.write_all((serde_json::to_string_pretty(next).map_err(|e|e.to_string())?+"\n").as_bytes()).map_err(|e|e.to_string())?;
+        file.sync_all().map_err(|e|e.to_string())?;
+        drop(file);
+        if fs::read_to_string(path).map_err(|e|e.to_string())?!=original || ownership(path)?!=owner {
+            return Err("host policy changed while saving; current file kept".into());
+        }
+        replace_project(path,&stage)?;
+        #[cfg(windows)] stage_owner(path,&owner)?;
+        #[cfg(unix)] fs::File::open(path.parent().ok_or("host policy parent missing")?).and_then(|f|f.sync_all()).map_err(|e|e.to_string())?;
+        if ownership(path)?!=owner {return Err("host policy ownership readback differs".into());}
+        Ok(())
+    })();
+    if result.is_err() && let Err(cleanup)=fs::remove_file(&stage) && cleanup.kind()!=std::io::ErrorKind::NotFound {
+        return Err(format!("host policy write uncertain: {}; temporary cleanup failed: {cleanup}",result.unwrap_err()));
+    }
+    result.map_err(|e:String|format!("host policy write uncertain: {e}"))
 }
 
 pub type Shared = Arc<Mutex<Host>>;
@@ -197,6 +273,12 @@ impl Host {
     }
 
     pub fn elapsed(&self) -> u64 { self.began.elapsed().as_secs() }
+
+    pub fn used(&self)->BTreeMap<String,usize> {
+        let mut used=BTreeMap::new();
+        for runtime in self.slots.values() {*used.entry(runtime.clone()).or_default()+=1;}
+        used
+    }
 }
 
 /// A fresh pid file names another live daemon. A malformed fresh record is unknown, never permission to start.
@@ -427,6 +509,10 @@ impl Registry {
 
 /// Compare all copies before any write. The durable plan is a configuration backup, never task state (R1).
 pub fn migrate(install: &Path, roots: &[PathBuf]) -> Res<()> {
+    crate::resources::locked(install,||migrate_locked(install,roots))
+}
+
+fn migrate_locked(install: &Path, roots: &[PathBuf]) -> Res<()> {
     let backup = install.join("host-policy-migration");
     let manifest = backup.join("plan.json");
     if backup.join("complete").exists() { Policy::read(install)?; return Ok(()); }
@@ -613,6 +699,36 @@ mod tests {
     }
     fn policy() -> Policy {
         Policy::parse(json!({"limits": {"codex": 2}, "admission": {"max": 2}, "load_gate": {"enabled": false}}), "invented").unwrap()
+    }
+
+    // H-A3: acknowledged policy replacement survives killing its writer, preserving unrelated policy fields.
+    #[test]
+    fn acknowledged_policy_survives_writer_termination() {
+        let root=temp("policy-commit");
+        fs::write(root.join("host.json"),json!({"limits":{"codex":2},"owner_field":"preserve"}).to_string()).unwrap();
+        let mut child=std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact","host::tests::policy_writer","--ignored"])
+            .env("TASKQ_HOST_POLICY_FIXTURE",&root).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+        let until=Instant::now()+std::time::Duration::from_secs(10);
+        while !root.join("ack").is_file() && child.try_wait().unwrap().is_none() && Instant::now()<until {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let acknowledged=root.join("ack").is_file();
+        if child.try_wait().unwrap().is_none() {child.kill().unwrap();child.wait().unwrap();}
+        let read=Policy::read(&root);
+        fs::remove_dir_all(root).unwrap();
+        assert!(acknowledged,"writer did not acknowledge before the fixture deadline");
+        let read=read.unwrap();assert_eq!(read.cap.limits["codex"],3);assert_eq!(read.raw["owner_field"],"preserve");
+    }
+
+    #[test]
+    #[ignore="owned subprocess used by acknowledged_policy_survives_writer_termination"]
+    fn policy_writer() {
+        let root=PathBuf::from(std::env::var_os("TASKQ_HOST_POLICY_FIXTURE").unwrap());
+        let owner=Policy::read(&root).unwrap().me;
+        write_capacity(&root,&owner,&crate::CapEdit {limits:BTreeMap::from([("codex".into(),3)]),..Default::default()},None).unwrap();
+        fs::write(root.join("ack"),"committed").unwrap();
+        loop {std::thread::park();}
     }
 
     // Chain: published project passes -> host release qualification; failure keeps owned work and recovery can qualify.

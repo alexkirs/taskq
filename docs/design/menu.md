@@ -148,7 +148,7 @@ Canonical selections/default candidates: [D01–D14](decision-register.md). The 
 - Review exact project/host old→new changes; current attempts continue. Cancel preserves settings; readback is per project, including partial failure.
 - Preserve CPU/memory gate controls and saved-vs-applied distinction from the current UI. Gate semantics remain in taskq.md.
 - AI prepares the same reviewable operations; no hidden alternate apply route. Preview matches/exclusions for UC-05 once the filter contract exists.
-- Native tray (#954): Work mode edits Auto/Fixed, host maximum, runtime limits and the load gate with the [shared resource controls](shared-resource-controls.md#shared-component-930); the new-task filter stays in Scope until the filter contract exists.
+- Native tray (#954): Work mode edits host maximum, runtime limits and the load gate; Fixed remains legacy-only. Use the [shared resource controls](shared-resource-controls.md#shared-component-930); the new-task filter stays in Scope until the filter contract exists.
 
 ## M13 Pinned window
 

@@ -190,7 +190,7 @@ mod tests {
                 let began = std::time::Instant::now();
                 let code = loop {
                     if let Some(code) = child.exited().unwrap() { break code; }
-                    if began.elapsed().as_secs() > 180 { child.kill(); panic!("owned qualification deadline"); }
+                    if began.elapsed().as_secs() > 180 { crate::runtime::stop(child.as_mut()).expect("owned qualification cleanup"); panic!("owned qualification deadline"); }
                     std::thread::sleep(std::time::Duration::from_millis(200));
                 };
                 let log = fs::read_to_string(crate::runtime::log_path(&root, &l)).unwrap();

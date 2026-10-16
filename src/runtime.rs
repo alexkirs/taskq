@@ -23,8 +23,17 @@ pub trait Proc {
     /// The exit code once the child has exited; `Err` is an unknown read (§ 4 reconciliation), never an exit.
     fn exited(&mut self) -> Result<Option<i32>, String>;
     fn exit_error(&self) -> Option<&'static str> { None }
-    fn kill(&mut self);
+    /// Request termination; success is not exit. The owner retains this handle until `exited` confirms it.
+    fn kill(&mut self) -> Result<(), String>;
     fn id(&self) -> u32;
+}
+
+/// One owned stop attempt; a pending/failed read never releases the caller's process or capacity.
+pub fn stop(proc: &mut dyn Proc) -> Result<i32, String> {
+    coreq::telemetry::capture::operation("runtime.stop", || {
+        proc.kill()?;
+        proc.exited()?.ok_or_else(|| "stop pending; process exit unconfirmed".into())
+    }, |_| "stop-unconfirmed")
 }
 
 impl Proc for Child {
@@ -34,12 +43,14 @@ impl Proc for Child {
             Err(e) => Err(format!("wait failed: {e}")),
         }
     }
-    fn kill(&mut self) {
+    fn kill(&mut self) -> Result<(), String> {
+        if self.exited()?.is_some() { return Ok(()); }
         // Windows: the child is `cmd.exe` running `codex.cmd`; node and `codex.exe` below it survive a plain kill (#933)
         #[cfg(windows)]
-        let _ = crate::platform::quiet(Command::new("taskkill").args(["/F", "/T", "/PID", &Child::id(self).to_string()])).output();
-        let _ = Child::kill(self);
-        let _ = self.wait();
+        coreq::process::output("runtime.taskkill", Command::new("taskkill").args(["/F", "/T", "/PID", &Child::id(self).to_string()]), std::time::Duration::from_secs(10)).map_err(|e| format!("process tree stop unconfirmed: {e}"))?;
+        #[cfg(not(windows))]
+        Child::kill(self).map_err(|e| format!("process stop unconfirmed: {e}"))?;
+        Ok(())
     }
     fn id(&self) -> u32 {
         Child::id(self)
@@ -113,11 +124,12 @@ impl Proc for Adopted {
             }
         }
     }
-    fn kill(&mut self) {
-        unsafe {
-            libc::kill(self.0, libc::SIGKILL);
-            libc::waitpid(self.0, &mut 0, 0);
+    fn kill(&mut self) -> Result<(), String> {
+        if self.exited()?.is_some() { return Ok(()); }
+        if unsafe { libc::kill(self.0, libc::SIGKILL) } != 0 {
+            return Err(format!("adopted process stop unconfirmed: {}", std::io::Error::last_os_error()));
         }
+        Ok(())
     }
     fn id(&self) -> u32 {
         self.0 as u32
@@ -247,6 +259,7 @@ pub struct CliTurn {
     pub log: PathBuf,
     /// Log bytes already read: a resume appends to the log of earlier turns.
     pub pos: u64,
+    pub stopping: bool,
 }
 
 impl CliTurn {
@@ -265,12 +278,13 @@ impl CliTurn {
 impl Proc for CliTurn {
     fn exited(&mut self) -> Result<Option<i32>, String> {
         if let Some(code) = self.proc.exited()? { return Ok(Some(code)); }
-        if !self.ended() { return Ok(None); }
-        log!("{}: turn ended; stopping its lingering process", self.log.display());
-        self.proc.kill();
-        Ok(Some(self.proc.exited()?.unwrap_or(-1)))
+        if !self.stopping && self.ended() {
+            self.stopping = true;
+            log!("{}: turn ended; stopping its lingering process", self.log.display());
+        }
+        if self.stopping { stop(self.proc.as_mut()).map(Some) } else { Ok(None) }
     }
-    fn kill(&mut self) { self.proc.kill() }
+    fn kill(&mut self) -> Result<(), String> { self.stopping = true; self.proc.kill() }
     fn id(&self) -> u32 { self.proc.id() }
 }
 
@@ -775,7 +789,11 @@ fn turn_input(root: &Path, text: &str) -> Result<(PathBuf, crate::data::InputLoc
     let dir = root.join(".taskq/inputs");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let path = dir.join(format!("{}.txt", uuid()));
-    let mut file = File::options().read(true).write(true).create_new(true).open(&path).map_err(|e| e.to_string())?;
+    let mut options = File::options();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(&path).map_err(|e| e.to_string())?;
     file.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
     let file = crate::data::InputLock::new(file).map_err(|e| e.to_string())?;
     Ok((path, file))
@@ -807,6 +825,16 @@ impl std::fmt::Display for StartError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { self.message.fmt(f) }
 }
 
+/// Prepare stdin before spawn: a child that never reads cannot block its execution owner.
+pub fn start_command(command: &mut Command, root: &Path, text: &str) -> Result<Child, StartError> {
+    coreq::telemetry::capture::operation("runtime.launch", || {
+        let (path, _input) = turn_input(root, text).map_err(|message| StartError { message, reportable: false })?;
+        let input = File::open(path).map_err(|e| StartError::io(e, None))?;
+        coreq::telemetry::capture::inherit_context(command);
+        command.stdin(input).spawn().map_err(|e| StartError::io(e, None))
+    }, |_| "launch")
+}
+
 /// § 8 Access of `rt` here, resolved again for every start and resume; a refusal starts nothing.
 pub fn access(env: &Env, rt: &str) -> Result<crate::policy::Effective, StartError> {
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from).unwrap_or_default();
@@ -832,7 +860,7 @@ fn spawn_inner(env: &Env, l: &Launch) -> Result<Box<dyn Proc>, StartError> {
     rules_line(&log, phase, &text).map_err(|e| StartError::io(e, None))?;
     if l.rt == "codex-app" {
         let (text, input_file) = app_input(env.root, &text).map_err(|message| StartError { message, reportable: false })?;
-        let mut turn = AppTurn { hand: None, log, text, _input: Some(input_file), thread: l.session.clone(), done: 0, rollout: None, running: app_running };
+        let mut turn = AppTurn { hand: None, log, text, _input: Some(input_file), thread: l.session.clone(), done: 0, rollout: None, running: app_running, cancelled: false };
         match &l.resume {
             Some(_) => {
                 turn.queue().map_err(|message| StartError { message, reportable: false })?;
@@ -846,7 +874,7 @@ fn spawn_inner(env: &Env, l: &Launch) -> Result<Box<dyn Proc>, StartError> {
     }
     let pos = std::fs::metadata(&log).map_or(0, |m| m.len());
     let child = start(env, l, &log, &text, &access)?;
-    Ok(Box::new(CliTurn { proc: Box::new(child), log, pos }))
+    Ok(Box::new(CliTurn { proc: Box::new(child), log, pos, stopping: false }))
 }
 
 /// The attempt log's evidence of § 8 Rule delivery: the injected header and part counts, one JSON line.
@@ -866,14 +894,7 @@ fn start(env: &Env, l: &Launch, log: &Path, text: &str, access: &crate::policy::
     let out = File::options().create(true).append(true).open(log).map_err(|e| StartError::io(e, None))?;
     let err = out.try_clone().map_err(|e| StartError::io(e, None))?;
     let mut c = command(env, l, access).map_err(|message| StartError { message, reportable: false })?;
-    let mut child = c.stdin(Stdio::piped()).stdout(out).stderr(err).spawn().map_err(|e| StartError::io(e, Some(&l.rt)))?;
-    let mut stdin = child.stdin.take().unwrap();
-    if let Err(e) = stdin.write_all(text.as_bytes()) {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(StartError::io(e, Some(&l.rt)));
-    }
-    Ok(child)
+    start_command(c.stdout(out).stderr(err), env.root, text)
 }
 
 /// Native background sessions are not children of TaskQ. Keep their full identity and
@@ -929,18 +950,25 @@ fn claude_transcript(session: &str) -> Option<PathBuf> {
 fn claude_stop(root: &Path, id: &str, known_pid: u32) -> Result<(), String> {
     let rows = claude_agents(root)?;
     let row = rows.iter().find(|v| v["id"] == id).ok_or("Claude stop identity unavailable")?;
-    let pid = row["pid"].as_u64().unwrap_or(known_pid as u64) as u32;
-    if row["pid"].as_u64().is_none() && (pid == 0 || !alive(pid)) && row["state"] != "working" { return Ok(()); }
+    let pid = claude_pid(row)?.unwrap_or(known_pid);
+    if claude_stopped(row, pid)? { return Ok(()); }
     let (ok, out) = probe("runtime.stop", &which("claude"), &["stop", id]).ok_or("Claude stop unavailable or timed out; state unknown")?;
     if !ok { return Err(format!("claude stop: {out}")); }
-    // Native stop acknowledges the request before the process has actually stopped.
-    for _ in 0..50 {
-        let rows = claude_agents(root)?;
-        let row = rows.iter().find(|v| v["id"] == id).ok_or("stopped Claude session disappeared; state unknown")?;
-        if row["pid"].as_u64().is_none() && (pid == 0 || !alive(pid)) { return Ok(()); }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    Err("Claude stop still pending; do not launch another turn".into())
+    // Native stop acknowledges the request first; the service owns later retries/readback.
+    let rows = claude_agents(root)?;
+    let row = rows.iter().find(|v| v["id"] == id).ok_or("stopped Claude session disappeared; state unknown")?;
+    if claude_stopped(row, pid)? { Ok(()) } else { Err("Claude stop still pending; do not launch another turn".into()) }
+}
+
+fn claude_pid(row: &serde_json::Value) -> Result<Option<u32>, String> {
+    if row["pid"].is_null() { return Ok(None); }
+    row["pid"].as_u64().and_then(|n| u32::try_from(n).ok()).filter(|n| *n > 0).map(Some).ok_or_else(|| "Claude process identity invalid".into())
+}
+
+fn claude_stopped(row: &serde_json::Value, known_pid: u32) -> Result<bool, String> {
+    let state = row["state"].as_str().ok_or("Claude state unavailable; stop unknown")?;
+    if claude_pid(row)?.is_some() || state == "working" { return Ok(false); }
+    if known_pid == 0 { Ok(true) } else { liveness(known_pid).map(|live| !live) }
 }
 
 impl ClaudeTurn {
@@ -997,7 +1025,11 @@ impl Proc for ClaudeTurn {
         self.observe(row)
     }
     fn exit_error(&self) -> Option<&'static str> { self.failure }
-    fn kill(&mut self) { if let Err(e) = claude_stop(&self.root, &self.id, self.pid) { log!("{e}"); } }
+    fn kill(&mut self) -> Result<(), String> {
+        claude_stop(&self.root, &self.id, self.pid)?;
+        self.done = true;
+        Ok(())
+    }
     fn id(&self) -> u32 { self.pid }
 }
 
@@ -1006,6 +1038,7 @@ impl ClaudeTurn {
         // Failed background launches can have neither status nor a transcript (#1208).
         let state = row["state"].as_str().ok_or("Claude job state unavailable; state unknown")?;
         if !matches!(state, "working" | "idle" | "done" | "blocked") {
+            if !claude_stopped(row, self.pid)? { return Err("Claude reports terminal state with a live process; exit unconfirmed".into()); }
             self.failure = Some(claude_failure(row, &self.root, &self.id, claude_home().as_deref()));
             return Ok(Some(-1));
         }
@@ -1019,7 +1052,7 @@ impl ClaudeTurn {
             writeln!(file, "{}", serde_json::json!({"type":"thread.started", "thread_id":session, "session_id":session, "runtime":"claude-bg", "permission_mode":self.mode})).map_err(|e| e.to_string())?;
             self.announced = true;
         }
-        self.pid = row["pid"].as_u64().unwrap_or(self.pid as u64) as u32;
+        self.pid = claude_pid(row)?.unwrap_or(self.pid);
         let path = claude_transcript(&self.session).ok_or("Claude transcript unavailable; completion unknown")?;
         let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
         let events: Vec<serde_json::Value> = content.lines().skip(self.before).filter_map(|line| serde_json::from_str(line).ok()).collect();
@@ -1074,6 +1107,7 @@ pub struct AppTurn {
     done: usize,
     rollout: Option<PathBuf>,
     running: fn() -> Result<bool, String>,
+    cancelled: bool,
 }
 
 impl AppTurn {
@@ -1116,6 +1150,7 @@ impl Proc for AppTurn {
         if let Some(h) = &mut self.hand {
             let Some(code) = h.exited()? else { return Ok(None) };
             self.hand = None;
+            if self.cancelled { return Ok(Some(code)); }
             self.thread = codex_thread(&self.log).unwrap_or_default();
             if self.thread.is_empty() || self.queue().is_err() {
                 return Ok(Some(if code == 0 { -1 } else { code }));
@@ -1132,11 +1167,13 @@ impl Proc for AppTurn {
         if count < self.done { return Err("Codex rollout truncated; completion unknown".into()); }
         Ok((count > self.done).then_some(0))
     }
-    fn kill(&mut self) {
+    fn kill(&mut self) -> Result<(), String> {
+        self.cancelled = true;
         // the app turn itself cannot be stopped from outside: it runs on, fenced (§ 3 app lease)
         if let Some(h) = &mut self.hand {
-            h.kill();
+            h.kill()?;
         }
+        Ok(())
     }
     fn id(&self) -> u32 {
         self.hand.as_ref().map(|h| h.id()).unwrap_or(0)
@@ -1299,6 +1336,120 @@ pub fn agent_text(r: &serde_json::Value) -> String {
 mod tests {
     use super::*;
 
+    // Chain: prepared brief -> native stdin -> consumer or non-reading child, with no blocking producer.
+    #[test]
+    fn file_stdin_handoff_preserves_bytes_and_never_waits_for_a_reader() {
+        let root = std::env::temp_dir().join(format!("taskq-input-handoff-{}", uuid()));
+        std::fs::create_dir_all(&root).unwrap();
+        let text = format!("{}EOF-CANARY", "private-input-".repeat(12_000));
+        for mode in ["blocked", "read"] {
+            let go = root.join(mode);
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", "runtime::tests::stdin_child", "--ignored"])
+                .env("TASKQ_STDIN_MODE", mode).env("TASKQ_STDIN_GO", &go).stdout(Stdio::null()).stderr(Stdio::null());
+            let began = std::time::Instant::now();
+            let mut child = start_command(&mut command, &root, &text).unwrap_or_else(|e| panic!("{e}"));
+            assert!(began.elapsed() < std::time::Duration::from_secs(3), "handoff waited for the child to read");
+            for entry in std::fs::read_dir(root.join(".taskq/inputs")).unwrap() {
+                let path = entry.unwrap().path();
+                #[cfg(unix)]
+                { use std::os::unix::fs::PermissionsExt; assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600); }
+                std::fs::remove_file(path).unwrap();
+            }
+            if mode == "blocked" { let _pending = stop(&mut child); }
+            else { std::fs::write(&go, "read now").unwrap(); }
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() { break status; }
+                if std::time::Instant::now() >= until {
+                    let cleanup = stop(&mut child);
+                    panic!("input fixture did not finish; cleanup: {cleanup:?}");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
+            if mode == "read" { assert!(status.success(), "child could not read the original bytes after cache unlink"); }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "file stdin handoff fixture"]
+    fn stdin_child() {
+        if std::env::var("TASKQ_STDIN_MODE").unwrap() == "blocked" {
+            std::thread::sleep(std::time::Duration::from_secs(30)); return;
+        }
+        let go = PathBuf::from(std::env::var_os("TASKQ_STDIN_GO").unwrap());
+        while !go.exists() { std::thread::sleep(std::time::Duration::from_millis(5)); }
+        let mut text = String::new(); std::io::stdin().read_to_string(&mut text).unwrap();
+        assert_eq!(text, format!("{}EOF-CANARY", "private-input-".repeat(12_000)));
+    }
+
+    // Chain: native owned child / exec-adopted child -> stop request -> OS exit readback.
+    #[test]
+    fn native_stop_reaps_the_owned_process() {
+        let spawn = || Command::new(std::env::current_exe().unwrap()).args(["--exact", "runtime::tests::stop_child", "--ignored"])
+            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+        let check = |proc: &mut dyn Proc| {
+            let requested = stop(proc);
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            loop {
+                if proc.exited().unwrap().is_some() { break; }
+                assert!(std::time::Instant::now() < until, "owned stop did not finish: {requested:?}");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        check(&mut spawn());
+        #[cfg(unix)]
+        {
+            let child = spawn(); let pid = child.id(); drop(child);
+            check(&mut Adopted(pid as i32));
+            assert_eq!(liveness(pid), Ok(false));
+        }
+    }
+
+    #[test]
+    #[ignore = "owned process stop fixture"]
+    fn stop_child() { std::thread::sleep(std::time::Duration::from_secs(30)); }
+
+    // Chain: terminal CLI log / cancelled app handshake -> stop -> observed exit, never a synthetic completion.
+    #[test]
+    fn stop_retains_terminal_cli_and_cancelled_handshake_until_exit() {
+        use std::{cell::Cell, rc::Rc};
+        struct Pending { exit: Rc<Cell<bool>>, kills: Rc<Cell<usize>> }
+        impl Proc for Pending {
+            fn exited(&mut self) -> Result<Option<i32>, String> { Ok(self.exit.get().then_some(-9)) }
+            fn kill(&mut self) -> Result<(), String> { self.kills.set(self.kills.get() + 1); Ok(()) }
+            fn id(&self) -> u32 { 0 }
+        }
+        use tracing_subscriber::prelude::*;
+        let dir = std::env::temp_dir().join(format!("taskq-stop-{}", uuid()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = std::sync::Arc::new(coreq::telemetry::Store::open(&dir.join("db")).unwrap());
+        let capture = coreq::telemetry::capture::Capture::new(store.clone(), "taskq", "fixture").unwrap();
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(capture.clone()), || {
+            let log = dir.join("turn.log");
+            std::fs::write(&log, "{\"type\":\"turn.completed\"}\n").unwrap();
+            let exit = Rc::new(Cell::new(false)); let kills = Rc::new(Cell::new(0));
+            let make = || Box::new(Pending { exit: exit.clone(), kills: kills.clone() }) as Box<dyn Proc>;
+            let mut cli = CliTurn { proc: make(), log: log.clone(), pos: 0, stopping: false };
+            assert!(cli.exited().is_err()); assert!(cli.exited().is_err());
+            assert_eq!(kills.get(), 2, "terminal state must survive a pending stop");
+            exit.set(true); assert_eq!(cli.exited(), Ok(Some(-9)));
+            exit.set(false);
+            let mut app = AppTurn { hand: Some(make()), log, text: String::new(), _input: None, thread: String::new(), done: 0,
+                rollout: None, running: || Ok(true), cancelled: false };
+            assert!(stop(&mut app).is_err());
+            assert!(app.hand.is_some());
+            exit.set(true); assert_eq!(app.exited(), Ok(Some(-9)));
+            assert!(app.thread.is_empty(), "cancelled handshake must not open or queue an app task");
+        });
+        capture.flush().unwrap();
+        let rows = store.export(0, 0, 100).unwrap();
+        assert!(rows["events"].as_array().unwrap().iter().any(|r| r["observation"]["operation"] == "taskq.operation.runtime.stop"
+            && r["observation"]["error"] == "stop-unconfirmed"));
+        drop(capture); drop(store); std::fs::remove_dir_all(dir).unwrap();
+    }
+
     // Chain: § 4 step 1 `gone` reason, #1034. Risk: a worker's last message publishes local paths or many lines.
     #[test]
     fn last_message_is_one_public_line_without_local_paths() {
@@ -1375,7 +1526,7 @@ mod tests {
     #[test]
     fn app_turn_keeps_unreadable_completion_unknown() {
         let p = std::env::temp_dir().join(format!("taskq-rollout-unknown-{}.jsonl", std::process::id()));
-        let mut t = AppTurn { hand: None, log: p.clone(), text: String::new(), _input: None, thread: "th".into(), done: 1, rollout: Some(p.clone()), running: || Ok(true) };
+        let mut t = AppTurn { hand: None, log: p.clone(), text: String::new(), _input: None, thread: "th".into(), done: 1, rollout: Some(p.clone()), running: || Ok(true), cancelled: false };
         let _ = std::fs::remove_file(&p);
         assert!(t.exited().is_err(), "missing history must retain an explicit unknown reason");
         std::fs::write(&p, "{\"type\":\"event_msg\"").unwrap();
@@ -1402,7 +1553,7 @@ mod tests {
         let p = std::env::temp_dir().join(format!("taskq-rollout-{}.jsonl", std::process::id()));
         let done = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"}}\n";
         std::fs::write(&p, format!("{done}{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"user_message\"}}}}\n")).unwrap();
-        let mut t = AppTurn { hand: None, log: p.clone(), text: String::new(), _input: None, thread: "th".into(), done: completes(&p).unwrap(), rollout: Some(p.clone()), running: || Ok(true) };
+        let mut t = AppTurn { hand: None, log: p.clone(), text: String::new(), _input: None, thread: "th".into(), done: completes(&p).unwrap(), rollout: Some(p.clone()), running: || Ok(true), cancelled: false };
         assert_eq!((t.done, t.exited()), (1, Ok(None)), "the handshake's task_complete does not end the turn");
         std::fs::OpenOptions::new().append(true).open(&p).unwrap().write_all(done.as_bytes()).unwrap();
         assert_eq!(t.exited(), Ok(Some(0)));
@@ -1467,6 +1618,9 @@ mod tests {
         assert_eq!(t.exit_error(), Some("argument-too-long"));
         assert_eq!(t.observe(&serde_json::json!({"state":"failed", "detail":"permission denied"})), Ok(Some(-1)));
         assert_eq!(t.exit_error(), Some("permission"));
+        for pid in [serde_json::json!(0), serde_json::json!(u64::MAX), serde_json::json!("unknown"), serde_json::json!(std::process::id())] {
+            assert!(t.observe(&serde_json::json!({"state":"failed", "pid":pid})).is_err(), "native terminal state cannot hide a present or invalid pid");
+        }
     }
 
     // Chain: § 8 codex-app handshake -> open thread -> queue -> one new `task_complete` on this host's app.
@@ -1482,7 +1636,7 @@ mod tests {
         let l = Launch { task: 0, title: "live".into(), attempt: 0, role: "worker".into(), rt: "codex-app".into(), session: "-".into(), url: String::new(), resume: None };
         let log = root.join("app-turn.log");
         let (text, input) = app_input(&root, &format!("{}Reply with the single word QUEUED and do nothing else.", "A taskq test line; ignore it.\n".repeat(700))).unwrap();
-        let mut t = AppTurn { hand: None, log: log.clone(), text, _input: Some(input), thread: String::new(), done: 0, rollout: None, running: app_running };
+        let mut t = AppTurn { hand: None, log: log.clone(), text, _input: Some(input), thread: String::new(), done: 0, rollout: None, running: app_running, cancelled: false };
         t.hand = Some(Box::new(start(&env, &l, &log, HANDSHAKE, &access(&env, "codex-app").unwrap()).unwrap()));
         let code = (0..600).find_map(|_| { std::thread::sleep(std::time::Duration::from_secs(1)); t.exited().unwrap() });
         eprintln!("thread {} rollout {:?} completes {} exit {code:?}", t.thread, t.rollout, t.rollout.as_ref().map_or(0, |p| completes(p).unwrap()));

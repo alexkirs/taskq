@@ -242,11 +242,7 @@ pub fn exec(rt: &str, brief: &str, root: &Path, logs: &Path, name: &str, resume:
     }
     let f = fs::File::create(&out).map_err(|e| e.to_string())?;
     let err = fs::File::create(logs.join(format!("{name}.err"))).map_err(|e| e.to_string())?;
-    let mut child = c.current_dir(root).stdin(std::process::Stdio::piped()).stdout(f).stderr(err).spawn().map_err(|e| format!("{rt}: {e}"))?;
-    if let Err(e) = std::io::Write::write_all(&mut child.stdin.take().unwrap(), text.as_bytes()) {
-        crate::runtime::Proc::kill(&mut child);
-        return Err(format!("operator input failed: {e}; partial effects unknown"));
-    }
+    let mut child = crate::runtime::start_command(c.current_dir(root).stdout(f).stderr(err), root, &text).map_err(|e| format!("{rt}: {e}"))?;
     let status = child.wait().map_err(|e| format!("operator wait: {e}; partial effects unknown"))?;
     let events: Vec<Value> = fs::read_to_string(&out).map_err(|e| e.to_string())?.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
     if !status.success() || events.iter().any(|v| v["is_error"] == true || v["type"] == "turn.failed") {

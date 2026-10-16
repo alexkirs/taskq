@@ -267,6 +267,7 @@ pub struct Service<'a> {
     pub refused_access: BTreeMap<String, String>,
     /// Children whose last liveness read failed, by attempt: kept and reported unknown, never `gone` (§ 4).
     pub unknown: HashMap<u64, String>,
+    stopping: BTreeSet<u64>,
     /// Children by attempt: role, runtime, and start with attempt log offset; `None` when adopted across a re-exec
     /// (§ 4 Profiling stages).
     begun: HashMap<u64, (String, String, Option<(std::time::Instant, u64)>)>,
@@ -497,7 +498,7 @@ pub fn record(path: &std::path::Path, now: i64, moves: &[(u64, &str, u64)]) -> R
 impl<'a> Service<'a> {
     pub fn new(board: &'a dyn Board, cfg: &'a Config, version: &str, start: Box<dyn FnMut(&Launch) -> Result<Box<dyn Proc>, crate::runtime::StartError> + 'a>) -> Self {
         let cap = Ok(Capacity::fixed(cfg.limits.clone(), GATE_DEFAULT));
-        Service { reduced_at: None, host: None, wall: 0, reserved: vec![], requested: vec![], refused: None, host_used: None, board, cfg: cfg.clone(), version: version.into(), kids: vec![], instance: String::new(), machine: String::new(), focus: vec![], focus_error: None, delivered: HashMap::new(), cache: HashMap::new(), deps: HashMap::new(), label_fixes: HashMap::new(), pruned: HashSet::new(), start, #[cfg(test)] agent_status: json!([]), log: vec![], snapshot: None, tasks_read: None, host_issue: None, owner_comments: vec![], seen: HashMap::new(), gone_after: None, moved_after: None, events_since: None, cap, gate: Gate::default(), mono: 0, held: vec![], pending: BTreeSet::new(), hold: None, refused_access: BTreeMap::new(), unknown: HashMap::new(), begun: HashMap::new(), asked: HashMap::new(), sessions: HashMap::new() }
+        Service { reduced_at: None, host: None, wall: 0, reserved: vec![], requested: vec![], refused: None, host_used: None, board, cfg: cfg.clone(), version: version.into(), kids: vec![], instance: String::new(), machine: String::new(), focus: vec![], focus_error: None, delivered: HashMap::new(), cache: HashMap::new(), deps: HashMap::new(), label_fixes: HashMap::new(), pruned: HashSet::new(), start, #[cfg(test)] agent_status: json!([]), log: vec![], snapshot: None, tasks_read: None, host_issue: None, owner_comments: vec![], seen: HashMap::new(), gone_after: None, moved_after: None, events_since: None, cap, gate: Gate::default(), mono: 0, held: vec![], pending: BTreeSet::new(), hold: None, refused_access: BTreeMap::new(), unknown: HashMap::new(), stopping: BTreeSet::new(), begun: HashMap::new(), asked: HashMap::new(), sessions: HashMap::new() }
     }
 
     /// Rebuild board-derived state after unwind; live handles, pending launches and delivery cursors stay owned.
@@ -537,8 +538,8 @@ impl<'a> Service<'a> {
     /// Liveness/handoff monitoring remains available if the reduced board loop fails; it never renews a lease.
     pub fn reap_owned(&mut self) {
         self.kids.retain_mut(|k| match k.proc.exited() {
-            Ok(Some(_)) => { self.unknown.remove(&k.attempt); false }
-            Ok(None) => { self.unknown.remove(&k.attempt); true }
+            Ok(Some(_)) => { self.unknown.remove(&k.attempt); self.stopping.remove(&k.attempt); false }
+            Ok(None) => { if !self.stopping.contains(&k.attempt) { self.unknown.remove(&k.attempt); } true }
             Err(e) => { self.unknown.insert(k.attempt, e); true }
         });
     }
@@ -789,14 +790,16 @@ impl<'a> Service<'a> {
         // 1. reap; a failed read keeps the child, unknown with its reason
         let mut exited = vec![];
         let unknown = &mut self.unknown;
+        let stopping = &mut self.stopping;
         self.kids.retain_mut(|k| match k.proc.exited() {
             Ok(Some(code)) => {
                 exited.push((k.task, k.attempt, code, k.proc.exit_error()));
                 unknown.remove(&k.attempt);
+                stopping.remove(&k.attempt);
                 false
             }
             Ok(None) => {
-                unknown.remove(&k.attempt);
+                if !stopping.contains(&k.attempt) { unknown.remove(&k.attempt); }
                 true
             }
             Err(e) => {
@@ -833,8 +836,11 @@ impl<'a> Service<'a> {
         self.kids.retain_mut(|k| {
             let current = by_n.get(&k.task).is_some_and(|v| v.task.attempt == Some(k.attempt));
             if !current {
-                k.proc.kill();
-                stopped.push((k.task, k.attempt));
+                self.stopping.insert(k.attempt);
+                match crate::runtime::stop(k.proc.as_mut()) {
+                    Ok(_) => { stopped.push((k.task, k.attempt)); self.stopping.remove(&k.attempt); }
+                    Err(e) => { self.unknown.insert(k.attempt, e); return true; }
+                }
             }
             current
         });
@@ -930,7 +936,7 @@ impl<'a> Service<'a> {
         for v in &views {
             let (n, t) = (v.issue.number, &v.task);
             let (Some(a), Some(h)) = (t.attempt, host_of(t)) else { continue };
-            if h != me || !matches!(t.state, State::Doing | State::Review) || touched.contains(&n) || self.kids.iter().any(|k| k.attempt == a) {
+            if h != me || !matches!(t.state, State::Doing | State::Review) || touched.contains(&n) || self.kids.iter().any(|k| k.task == n) {
                 continue;
             }
             if let Some(i) = self.held.iter().position(|l| l.attempt == a) {
@@ -986,6 +992,7 @@ impl<'a> Service<'a> {
         let mut queue: Vec<&View> = views
             .iter()
             .filter(|v| !touched.contains(&v.issue.number))
+            .filter(|v| !self.kids.iter().any(|k| k.task == v.issue.number))
             .filter(|v| v.task.state == State::Ready || (v.task.state == State::Review && v.task.attempt.is_none()))
             .filter(|v| {
                 if let Err(e) = crate::labels::validate(&v.issue.labels) { log!("#{}: {e}; not admitted", v.issue.number); return false; }
@@ -1287,12 +1294,51 @@ mod tests {
                 c => Ok(c),
             }
         }
-        fn kill(&mut self) {
-            *self.0.borrow_mut() = Some(-9);
+        fn kill(&mut self) -> Result<(), String> {
+            *self.0.borrow_mut() = Some(-9); Ok(())
         }
         fn id(&self) -> u32 {
             0
         }
+    }
+
+    // Chain: requeue -> stop request -> uncertain exit -> occupied slot -> confirmed exit -> replacement.
+    #[test]
+    fn cancellation_retains_an_unconfirmed_child_and_blocks_replacement() {
+        struct SlowStop(Rc<std::cell::Cell<u8>>);
+        impl Proc for SlowStop {
+            fn exited(&mut self) -> Result<Option<i32>, String> {
+                if self.0.get() == 2 { Err("invented read failure".into()) } else { Ok((self.0.get() == 3).then_some(-9)) }
+            }
+            fn kill(&mut self) -> Result<(), String> {
+                if self.0.get() == 1 { Err("invented stop refusal".into()) } else { Ok(()) }
+            }
+            fn id(&self) -> u32 { 0 }
+        }
+        let b = Fake::default();
+        let n = b.create("T", "", &[TASK_LABEL.into()]).unwrap();
+        let mut c = cfg("mac"); c.limits = BTreeMap::from([("claude".into(), 3)]);
+        let exited = Rc::new(std::cell::Cell::new(0));
+        let starts = Rc::new(std::cell::Cell::new(0));
+        let mut s = Service::new(&b, &c, "test", Box::new(|_| {
+            starts.set(starts.get() + 1); Ok(Box::new(SlowStop(exited.clone())))
+        }));
+        s.focus = vec!["all".into()]; s.pass().unwrap();
+        let attempt = s.kids[0].attempt;
+        b.comment(n, "taskq: requeue").unwrap();
+        for mode in [1, 0, 2, 0] {
+            exited.set(mode);
+            s.pass().unwrap();
+            assert_eq!(starts.get(), 1, "an unconfirmed old process cannot overlap its replacement even with spare capacity");
+            assert_eq!(s.kids[0].attempt, attempt);
+            assert!(s.unknown.contains_key(&attempt));
+            assert_eq!(task(&b, n).state, State::Ready);
+            s.reap_owned();
+            assert!(s.unknown.contains_key(&attempt), "reduced monitoring must retain the pending-stop reason");
+        }
+        exited.set(3); s.pass().unwrap();
+        assert_eq!(starts.get(), 2);
+        assert!(s.kids.iter().all(|k| k.attempt != attempt));
     }
 
     // Chain: §4 log retention -> service pass -> collection/selftest. Risk: the hourly timer leaves a full log stuck.
@@ -1386,11 +1432,11 @@ mod tests {
         assert_ne!(r, a);
         eprintln!("win reviewer start attempt {r}");
         // End only this disposable native job; do not wait through Claude's spawn-retry backoff.
-        s.kids[0].proc.kill();
+        crate::runtime::stop(s.kids[0].proc.as_mut()).unwrap();
         s.pass().unwrap();
         let log = b.comments(n).unwrap();
         for comment in &log { eprintln!("{}", comment.body); }
-        for kid in &mut s.kids { kid.proc.kill(); }
+        for kid in &mut s.kids { crate::runtime::stop(kid.proc.as_mut()).unwrap(); }
         assert!(log.iter().any(|e| e.body.contains(&format!("taskq: gone attempt {r}"))), "next pass must reap the native terminal job");
         assert!(task(&b, n).result.is_some());
         std::fs::remove_dir_all(&c.install).unwrap();
@@ -1745,7 +1791,7 @@ mod tests {
             let log = crate::runtime::log_path(&r, l);
             std::fs::create_dir_all(log.parent().unwrap()).unwrap();
             std::fs::write(&log, "{\"type\":\"thread.started\",\"thread_id\":\"t\"}\n").unwrap();
-            Ok(Box::new(crate::runtime::CliTurn { proc: Box::new(FakeProc(flag)), log, pos: 0 }) as Box<dyn Proc>)
+            Ok(Box::new(crate::runtime::CliTurn { proc: Box::new(FakeProc(flag)), log, pos: 0, stopping: false }) as Box<dyn Proc>)
         }));
         s.focus = vec!["all".into()];
         s.pass().unwrap();
@@ -2185,7 +2231,7 @@ mod tests {
                 Some(crate::runtime::claude_failure(&serde_json::json!({"id":"abcdef12", "state":"failed"}),
                     &self.root, "abcdef12", Some(&self.root)))
             }
-            fn kill(&mut self) {}
+            fn kill(&mut self) -> Result<(), String> { Ok(()) }
             fn id(&self) -> u32 { 0 }
         }
         let b = Fake::default();

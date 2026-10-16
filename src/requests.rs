@@ -311,6 +311,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let wall = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
         std::fs::write(dir.join("taskq.log"), line(wall - 60_000, "worker result", &[("GET issues/N/comments", 5)]).repeat(2)).unwrap();
+        drop(crate::profile::log_lock(&dir.join("taskq.log")).unwrap());
+        crate::telemetry::read(&dir,wall).unwrap();
         assert!(crate::profile::report(&dir).contains("| worker result | 2 | 10 |"), "`taskq profile` prints the table");
         std::fs::remove_dir_all(dir).unwrap();
     }

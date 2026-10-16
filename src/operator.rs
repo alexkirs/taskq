@@ -215,7 +215,7 @@ pub fn exec(rt: &str, brief: &str, root: &Path, logs: &Path, name: &str, resume:
     let board_env = cfg.board.worker_env(&crate::platform::tool(&cfg.install), &cfg.web_host)?;
     let exe = cfg.install.join(crate::platform::tool(&cfg.install).exe_name());
     let env = crate::runtime::Env { root, exe: &exe, install: &cfg.install, permission_mode: &cfg.permission_mode, codex: &cfg.codex, publish: &cfg.delivery, board_env: &board_env };
-    let l = crate::runtime::Launch { task: 0, title: name.into(), attempt: 0, role: "operator".into(), rt: rt.into(),
+    let l = crate::runtime::Launch { execution: None, task: 0, title: name.into(), attempt: 0, role: "operator".into(), rt: rt.into(),
         session: resume.map(String::from).unwrap_or_else(|| crate::runtime::new_session(rt)), url: String::new(), resume: resume.map(String::from) };
     // § 8 Access: the operator runs under the same grants as workers
     let access = crate::runtime::access(&env, rt).map_err(|e| e.to_string())?;
@@ -227,7 +227,7 @@ pub fn exec(rt: &str, brief: &str, root: &Path, logs: &Path, name: &str, resume:
     let out = logs.join(format!("{name}.out"));
     if rt == "claude" && (resume.is_none() || crate::runtime::claude_background(root, &l.session)?) {
         use crate::runtime::Proc;
-        let mut turn = crate::runtime::ClaudeTurn::start(&env, &l, &out, &text, &access)?;
+        let mut turn = crate::runtime::ClaudeTurn::start(&env, &l, &out, &text, &access).map_err(|e| e.to_string())?;
         loop {
             match turn.exited() {
                 Ok(Some(0)) => break,
@@ -243,10 +243,18 @@ pub fn exec(rt: &str, brief: &str, root: &Path, logs: &Path, name: &str, resume:
     let f = fs::File::create(&out).map_err(|e| e.to_string())?;
     let err = fs::File::create(logs.join(format!("{name}.err"))).map_err(|e| e.to_string())?;
     let mut child = crate::runtime::start_command(c.current_dir(root).stdout(f).stderr(err), root, &text).map_err(|e| format!("{rt}: {e}"))?;
-    let status = child.wait().map_err(|e| format!("operator wait: {e}; partial effects unknown"))?;
+    let mut wait_error=None;
+    let status=loop {
+        match child.exited() {
+            Ok(Some(code))=>break code,
+            Err(reason) if wait_error.as_ref()!=Some(&reason)=>{log!("{rt} operator termination unknown: {reason}; retaining execution");wait_error=Some(reason);},
+            _=>{},
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
     let events: Vec<Value> = fs::read_to_string(&out).map_err(|e| e.to_string())?.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
-    if !status.success() || events.iter().any(|v| v["is_error"] == true || v["type"] == "turn.failed") {
-        return Err(format!("{rt} operator failed (exit {}); partial effects unknown; inspect request log before retry", status.code().unwrap_or(-1)));
+    if status!=0 || events.iter().any(|v| v["is_error"] == true || v["type"] == "turn.failed") {
+        return Err(format!("{rt} operator failed (exit {}); partial effects unknown; inspect request log before retry", status));
     }
     crate::runtime::final_text(&events).ok_or("operator returned no final response; partial effects unknown".into())
 }
@@ -368,7 +376,7 @@ fn onboard(root: &Path, req: &Value) -> Option<PathBuf> {
 fn cmd(prog: impl AsRef<std::ffi::OsStr>, args: &[&str], dir: &Path, env: &[(&str, &str)]) -> Result<String, String> {
     let mut c = std::process::Command::new(prog);
     c.args(args).current_dir(dir).envs(env.iter().copied()).env_remove("TASKQ_TASK").env_remove("TASKQ_ATTEMPT").stdin(std::process::Stdio::null());
-    let o = crate::platform::quiet(&mut c).output().map_err(|e| format!("{}: {e}", args.first().unwrap_or(&"")))?;
+    let o = crate::platform::output("operator.command", &mut c, std::time::Duration::from_secs(30))?;
     let (out, err) = (String::from_utf8_lossy(&o.stdout).trim().to_string(), String::from_utf8_lossy(&o.stderr).to_string());
     if o.status.success() { Ok(out) } else { Err(err.lines().chain(out.lines()).find(|l| !l.trim().is_empty()).unwrap_or("failed").trim().to_string()) }
 }
@@ -629,8 +637,8 @@ fn apply(install: &Path, exe: &Path, ops: &[Value], id: &str, rev: u64) -> (bool
                 // a repeated `add` item takes the op id of its first copy: one issue, the first receipt again (§ 5)
                 let k = if args[0] == "add" { ops.iter().position(|x| x == o).unwrap_or(k) } else { k };
                 args.extend(["--json".into(), "--op-id".into(), format!("{id}.{rev}.{k}")]);
-                let out = std::process::Command::new(exe).args(&args).current_dir(&r).env("TASKQ_ROOT", &r)
-                    .env_remove("TASKQ_TASK").env_remove("TASKQ_ATTEMPT").output().map_err(|e| e.to_string())?;
+                let out = crate::platform::output("operator.board-command", std::process::Command::new(exe).args(&args).current_dir(&r).env("TASKQ_ROOT", &r)
+                    .env_remove("TASKQ_TASK").env_remove("TASKQ_ATTEMPT"), std::time::Duration::from_secs(60))?;
                 let text = String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
                 let rc: Value = String::from_utf8_lossy(&out.stdout).lines().rev().find_map(|l| serde_json::from_str(l).ok()).unwrap_or_default();
                 receipts.push(rc.clone());

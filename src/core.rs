@@ -179,6 +179,27 @@ pub struct Entry {
     pub edited: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Release { Exit, NoStart }
+
+/// A board intent, its exact-input acceptance and independent native release evidence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Execution {
+    pub id: u64,
+    pub attempt: u64,
+    pub through: u64,
+    pub host: String,
+    pub runtime: String,
+    pub accepted: bool,
+    pub release: Option<Release>,
+}
+
+pub fn executions(n: u64, entries: &[Entry]) -> Vec<Execution> { replay(n, entries, false).4 }
+
+pub fn delivered(n: u64, entries: &[Entry], attempt: u64) -> Option<u64> {
+    executions(n, entries).into_iter().filter(|x| x.attempt == attempt && x.accepted).map(|x| x.through).max()
+}
+
 struct Line<'a> {
     kind: &'a str,
     args: Vec<&'a str>,
@@ -362,12 +383,13 @@ pub fn owner_comments(n: u64, entries: &[Entry]) -> Vec<u64> {
 }
 
 /// The folded task, the ignored owner comments, the revision and the ids of the entries that changed the task.
-fn replay(n: u64, entries: &[Entry], deps_open: bool) -> (Task, Vec<u64>, u64, Vec<u64>) {
+fn replay(n: u64, entries: &[Entry], deps_open: bool) -> (Task, Vec<u64>, u64, Vec<u64>, Vec<Execution>) {
     let mut log: Vec<&Entry> = entries.iter().filter(|e| !e.edited).collect();
     log.sort_by_key(|e| e.id);
     let mut t = Task::default();
     let mut resume = None; // the state an `ask` entry left; None when a retry limit asked
     let (mut free, mut accepted) = (vec![], vec![]);
+    let mut executions: Vec<Execution> = vec![];
     let (mut ops, mut card_at, mut last) = (std::collections::HashSet::new(), None, 0);
     for e in log {
         if let Some(l) = parse(n, &e.body) {
@@ -378,6 +400,34 @@ fn replay(n: u64, entries: &[Entry], deps_open: bool) -> (Task, Vec<u64>, u64, V
             let asked = t.state == State::Ask;
             let before = t.clone();
             step(&mut t, &mut resume, e.id, &l, last == 0);
+            if l.kind == "spawn" && t.attempt == Some(e.id) && before.attempt != t.attempt {
+                executions.push(Execution { id:e.id, attempt:e.id, through:e.id, host:l.args[2].into(),
+                    runtime:l.args[1].split(':').next().unwrap_or("").into(), accepted:false, release:None });
+            } else if l.kind == "executing" && l.args.len() == 1 && l.attempt.is_some() && l.attempt == t.attempt
+                && matches!(t.state,State::Doing|State::Review) && executions.iter().all(|x|x.release.is_some()) {
+                if let Ok(through) = l.args[0].parse::<u64>() {
+                    let attempt=l.attempt.unwrap();
+                    if t.inbox.last() == Some(&through) && executions.iter().filter(|x|x.attempt==attempt)
+                        .all(|x| (x.accepted && x.through < through) || (x.release == Some(Release::NoStart) && x.through <= through)) {
+                        if let Some(previous)=executions.iter().find(|x|x.attempt==attempt) {
+                            executions.push(Execution {id:e.id,attempt,through,host:previous.host.clone(),runtime:previous.runtime.clone(),accepted:false,release:None});
+                        }
+                    }
+                }
+            } else if l.kind == "accepted" && l.args.len() == 1 {
+                if let Ok(id) = l.args[0].parse::<u64>() {
+                    if let Some(x) = executions.iter_mut().find(|x| x.id == id && Some(x.attempt) == l.attempt && x.release != Some(Release::NoStart)) {
+                        x.accepted = true;
+                    }
+                }
+            } else if l.kind == "released" && l.args.len() == 2 && matches!(l.args[1],"exit"|"no-start") {
+                if let Ok(id)=l.args[0].parse::<u64>() {
+                    let proof = if l.args[1] == "exit" { Release::Exit } else { Release::NoStart };
+                    if let Some(x)=executions.iter_mut().find(|x|x.id==id && Some(x.attempt)==l.attempt && x.release.is_none()) {
+                        if proof != Release::NoStart || !x.accepted { x.release = Some(proof); }
+                    }
+                }
+            }
             if t != before {
                 last = e.id;
                 accepted.push(e.id);
@@ -397,7 +447,7 @@ fn replay(n: u64, entries: &[Entry], deps_open: bool) -> (Task, Vec<u64>, u64, V
         t.state = State::Waiting;
     }
     let rev = t.card.as_ref().and(card_at).or(t.attempt).unwrap_or(last);
-    (t, free, rev, accepted)
+    (t, free, rev, accepted, executions)
 }
 
 fn step(t: &mut Task, resume: &mut Option<State>, id: u64, l: &Line, first: bool) {
@@ -532,6 +582,120 @@ pub const GOLDEN: &str = include_str!("../tests/golden/fold.json");
 
 #[cfg(test)]
 mod tests {
+    // Chain: native observations -> replay -> continuation. Risk: late, duplicate or contradictory evidence consumes/replays input.
+    #[test]
+    fn execution_observations_keep_acceptance_and_exit_independent() {
+        use super::*;
+        let mut log = vec![Entry { id:10, body:"taskq: spawn worker codex:s mac".into(), edited:false }];
+        for (id, body, edited, delivered_cursor, release) in [
+            (11,"taskq: accepted 10 attempt 9",false,None,None),
+            (12,"taskq: accepted 10 attempt 10",true,None,None),
+            (13,"taskq: released 10 exit attempt 10\nop-id: release-10",false,None,Some(Release::Exit)),
+            (14,"taskq: released 10 no-start attempt 10",false,None,Some(Release::Exit)),
+            (15,"taskq: accepted 99 attempt 10",false,None,Some(Release::Exit)),
+            (16,"taskq: accepted 10 attempt 10\nop-id: accept-10",false,Some(10),Some(Release::Exit)),
+            (17,"taskq: accepted 10 attempt 10\nop-id: accept-10",false,Some(10),Some(Release::Exit)),
+        ] {
+            log.push(Entry {id,body:body.into(),edited});
+            assert_eq!(delivered(7,&log,10),delivered_cursor,"entry {id}");
+            assert_eq!(executions(7,&log)[0].release,release,"entry {id}");
+            assert_eq!(revision(7,&log),10);
+            let mut reversed=log.clone(); reversed.reverse();
+            assert_eq!(executions(7,&reversed),executions(7,&log),"transport order is not board order");
+        }
+        log.extend([
+            Entry {id:18,body:"taskq: steer\nnext".into(),edited:false},
+            Entry {id:19,body:"taskq: executing 18 attempt 10".into(),edited:false},
+            Entry {id:20,body:"taskq: released 19 no-start attempt 10".into(),edited:false},
+            Entry {id:21,body:"taskq: accepted 19 attempt 10".into(),edited:false},
+            Entry {id:22,body:"taskq: released 19 exit attempt 10".into(),edited:false},
+        ]);
+        assert_eq!(delivered(7,&log,10),Some(10),"no-start cannot later become acceptance");
+        assert_eq!(executions(7,&log)[1].release,Some(Release::NoStart));
+        log.extend([
+            Entry {id:23,body:"taskq: executing 18 attempt 10\nop-id: retry".into(),edited:false},
+            Entry {id:24,body:"taskq: executing 18 attempt 10\nop-id: retry".into(),edited:false},
+            Entry {id:25,body:"taskq: accepted 23 attempt 10".into(),edited:false},
+            Entry {id:26,body:"taskq: released 23 no-start attempt 10".into(),edited:false},
+        ]);
+        assert_eq!(executions(7,&log).len(),3);
+        assert_eq!(executions(7,&log)[2].release,None,"accepted input cannot be declared never started");
+        assert_eq!(delivered(7,&log,10),Some(18));
+        log.extend([
+            Entry {id:27,body:"taskq: requeue".into(),edited:false},
+            Entry {id:28,body:"taskq: released 23 exit attempt 10".into(),edited:false},
+            Entry {id:29,body:"taskq: spawn worker claude:new win".into(),edited:false},
+            Entry {id:30,body:"taskq: accepted 23 attempt 10".into(),edited:false},
+            Entry {id:31,body:"taskq: released 29 exit attempt 10".into(),edited:false},
+        ]);
+        assert_eq!(delivered(7,&log,29),None,"old evidence cannot accept a replacement");
+        assert_eq!(executions(7,&log).last().unwrap().release,None);
+    }
+
+    // Chain: continuation refusal -> restart -> same input retry. Risk: intent consumes undelivered input.
+    #[test]
+    fn no_start_preserves_the_continuation_cursor() {
+        use super::*;
+        let bodies = [
+            "taskq: spawn worker claude:s mac",
+            "taskq: accepted 10 attempt 10",
+            "taskq: released 10 exit attempt 10",
+            "taskq: steer\ncontinue",
+            "taskq: executing 13 attempt 10\nop-id: execute-10-13-10",
+            "taskq: released 14 no-start attempt 10",
+            "taskq: executing 13 attempt 10\nop-id: execute-10-13-14",
+        ];
+        let log: Vec<_> = bodies.iter().enumerate().map(|(i, body)| Entry { id: 10+i as u64, body: (*body).into(), edited:false }).collect();
+        assert_eq!(executions(7,&log).iter().map(|x|x.id).collect::<Vec<_>>(), [10,14,16]);
+        assert_eq!(revision(7,&log),10);
+    }
+
+    // Chain: submission -> task mutation/continuation -> exact release. Risk: task state is mistaken for execution exit.
+    #[test]
+    fn execution_release_survives_replacement_and_distinguishes_continuations() {
+        use super::*;
+        let mut log=vec![];
+        for (id,body,edited,pending) in [
+            (10,"taskq: spawn worker claude:s mac",false,vec![10]),
+            (11,"taskq: requeue",false,vec![10]),
+            (12,"taskq: released 10 exit attempt 999",false,vec![10]),
+            (13,"taskq: released 10 exit attempt 10",true,vec![10]),
+            (14,"taskq: released 10 exit attempt 10",false,vec![]),
+            (15,"taskq: released 16 exit attempt 16",false,vec![]),
+            (16,"taskq: spawn worker codex:s win",false,vec![16]),
+            (17,"taskq: released 16 timeout attempt 16",false,vec![16]),
+            (18,"taskq: released 16 no-start attempt 16\nop-id: release.16",false,vec![]),
+            (19,"taskq: released 16 no-start attempt 16\nop-id: release.16",false,vec![]),
+        ] {
+            log.push(Entry {id,body:body.into(),edited});
+            assert_eq!(executions(7,&log).iter().filter(|x|x.release.is_none()).map(|x|x.id).collect::<Vec<_>>(),pending,"entry{id}");
+        }
+        assert_eq!(revision(7,&log),16,"execution evidence does not change task revision");
+        log.clear();
+        for (id,body,pending) in [
+            (8,"taskq: spawn worker claude:s mac",vec![8]),
+            (9,"taskq: accepted 8 attempt 8",vec![8]),
+            (11,"taskq: ask attempt 8\nWhich?\n1. x ★",vec![8]),
+            (12,"taskq: released 8 exit attempt 8",vec![]),
+            (13,"taskq: answer 1",vec![]),
+            (14,"taskq: executing 13 attempt 8",vec![14]),
+            (15,"taskq: released 8 exit attempt 8",vec![14]),
+            (16,"taskq: released 14 exit attempt 8",vec![]),
+            (17,"taskq: executing 13 attempt 8",vec![]),
+            (18,"taskq: steer\nnew input",vec![]),
+            (19,"taskq: accepted 14 attempt 8",vec![]),
+            (20,"taskq: executing 18 attempt 8",vec![20]),
+            (21,"taskq: released 20 exit attempt 9",vec![20]),
+            (22,"taskq: released 20 exit attempt 8",vec![]),
+        ] {
+            log.push(Entry {id,body:body.into(),edited:false});
+            let executions=executions(7,&log);
+            assert_eq!(executions.iter().filter(|x|x.release.is_none()).map(|x|x.id).collect::<Vec<_>>(),pending,"entry{id}");
+            assert!(executions.iter().all(|x|x.attempt==8 && x.host=="mac" && x.runtime=="claude"));
+        }
+        assert_eq!(executions(7,&log).iter().map(|x|x.through).collect::<Vec<_>>(),[8,13,18]);
+    }
+
     // Chain: § 2 fold over tests/golden. Risk: fold drifts from the traces; a wrong expectation still passes.
     #[test]
     fn golden_traces() {

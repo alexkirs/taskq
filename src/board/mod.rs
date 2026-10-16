@@ -534,6 +534,8 @@ pub struct FakeState {
     pub fail_labels: bool,
     /// The next this many `comment` calls fail like a board rate-limit pause.
     pub fail_comments: usize,
+    /// The write commits, but its response is lost.
+    pub lose_comment_response: bool,
     /// The next this many `comments` reads fail.
     pub fail_comment_reads: usize,
     /// A concurrent writer: this body lands just before the next `comment`.
@@ -620,7 +622,9 @@ impl Board for Fake {
         if let Some(other) = race {
             self.raw(n, &other, true, false);
         }
-        Ok(self.raw(n, body, true, false))
+        let id = self.raw(n, body, true, false);
+        if std::mem::take(&mut self.state.borrow_mut().lose_comment_response) { return Err("comment response lost".into()); }
+        Ok(id)
     }
     fn edit_comment(&self, n: u64, id: u64, body: &str) -> Result<()> {
         let mut st = self.state.borrow_mut();

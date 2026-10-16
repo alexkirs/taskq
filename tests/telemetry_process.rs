@@ -185,7 +185,11 @@ fn resume_records_its_result_without_releasing_the_host_hold() {
 fn resident_analysis_owner() {
     use std::io::Write;
     let path=std::path::PathBuf::from(std::env::var_os("TASKQ_ANALYSIS_OWNER").unwrap());
-    let _runtime=coreq::telemetry::capture::Runtime::install(&path,"fixtureq","1").unwrap();
+    let dir=path.parent().unwrap();let install=dir.parent().unwrap();
+    let budget=coreq::telemetry::Budget {lock:install.join("taskq-profile.lock"),
+        peers:vec![dir.join("telemetry.sqlite3"),dir.join("telemetry.sqlite3-wal"),dir.join("telemetry.sqlite3-shm"),install.join("taskq.log")],
+        total:64<<20,reserved:(4<<20)+(64<<10)+(2<<20)};
+    let _runtime=coreq::telemetry::capture::Runtime::install_bounded(&path,"fixtureq","1",budget).unwrap();
     println!("ANALYSIS_READY");std::io::stdout().flush().unwrap();
     let mut line=String::new();std::io::stdin().read_line(&mut line).unwrap();
 }

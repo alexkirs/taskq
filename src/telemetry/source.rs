@@ -101,7 +101,7 @@ mod tests {
     use rusqlite::OptionalExtension;
     const LINE:&str=r#"taskq-profile {"op":"spawn","us":10,"error":"none","at_ms":null}"#;
     fn dir() -> std::path::PathBuf {
-        let dir=std::env::temp_dir().join(format!("taskq-source-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));std::fs::create_dir(&dir).unwrap();dir
+        let dir=std::env::temp_dir().join(format!("taskq-source-{}-{}",std::process::id(),crate::runtime::uuid()));std::fs::create_dir(&dir).unwrap();dir
     }
     fn now() -> i64 {std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64}
     fn add(db: &Connection) {db.execute("INSERT INTO records(retained_ms,line) VALUES(?1,?2)",params![now(),LINE]).unwrap();}
@@ -230,7 +230,7 @@ mod tests {
         }after=page["next"].as_i64().unwrap();if page["more"]==false {break;}}
         let digest=|value:ring::digest::Digest|value.as_ref().iter().map(|byte|format!("{byte:02x}")).collect::<String>();
         let expected=digest(expected.finish());let actual=digest(actual.finish());assert_eq!(expected,actual);assert_eq!(retained,count);assert_eq!(target.storage().unwrap()["pruned_count"],0);
-        let indexed=super::super::semantic::read(&target,super::super::semantic::KINDS).unwrap();assert_eq!(crate::profile::legacy_reports(&indexed,at).unwrap(),reports);assert_eq!(crate::profile::legacy_reports(&restored,at).unwrap(),reports);
+        let indexed=super::super::semantic::read(&coreq::telemetry::Reader::open(&common).unwrap(),super::super::semantic::KINDS).unwrap();assert_eq!(crate::profile::legacy_reports(&indexed,at).unwrap(),reports);assert_eq!(crate::profile::legacy_reports(&restored,at).unwrap(),reports);
         let mut preserved=ring::digest::Context::new(&ring::digest::SHA256);let mut found=0;let mut after=0;
         loop {let page=target.export(0,after,1024).unwrap();for row in page["events"].as_array().unwrap() {if original_ids.contains(row["id"].as_str().unwrap()) {preserved.update((row.to_string()+"\n").as_bytes());found+=1;}}after=page["next"].as_i64().unwrap();if page["more"]==false {break;}}
         assert_eq!(found,original_ids.len());assert_eq!(preserved.finish().as_ref(),original_hash.as_ref());

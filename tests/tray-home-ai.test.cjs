@@ -2,8 +2,7 @@
 const fs=require('node:fs'),vm=require('node:vm'),assert=require('node:assert/strict');
 const html=fs.readFileSync('src/tray.html','utf8');
 const source=html.slice(html.indexOf('const aiStates='),html.indexOf('// Add project'));
-// the preview is bounded and scrolls inside itself
-assert.match(html,/\.aichain\{max-height:10em;overflow-y:auto[;}]/);
+// Layout bounds are checked by tray-home-proposal.browser.cjs.
 const long=Array.from({length:40},(_,i)=>'Answer line '+(i+1)).join('\n');
 const cases={
   result:[{state:'result',text:long+'\nNext: 1 Open #41 ★ · 2 Start #44'},['data-a="ai-next" data-v="1"','data-a="ai-send"','<textarea id="ai"']],

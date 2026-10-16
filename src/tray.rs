@@ -337,7 +337,7 @@ fn answer(install: &Path, m: &Value) -> Value {
     let prepare = || -> Result<_, String> {
         let args = answer_args(install, m)?;
         let root = Path::new(m["root"].as_str().unwrap());
-        let out = crate::platform::quiet(owner_command(root)?.args(["status", "--json"])).output().map_err(|e| e.to_string())?;
+        let out = crate::platform::output("tray.answer-status",owner_command(root)?.args(["status", "--json"]),Duration::from_secs(30))?;
         let snapshot = serde_json::from_slice(&out.stdout).map_err(|_| String::from_utf8_lossy(&out.stderr).into_owned())?;
         answer_snapshot(&snapshot, m)?;
         Ok((root, args))
@@ -347,7 +347,7 @@ fn answer(install: &Path, m: &Value) -> Value {
         Err(e) => return response("rejected", &e, "Refresh the question or open it on the board."),
     };
     let r = answer_dispatch(m, &args, |args| {
-        let out = owner_command(root).and_then(|mut c| crate::platform::quiet(c.args(args)).output().map_err(|e| e.to_string()));
+        let out = owner_command(root).and_then(|mut c| crate::platform::output("tray.answer-command",c.args(args),Duration::from_secs(60)));
         match out {
             Ok(out) => serde_json::from_slice(&out.stdout).unwrap_or_else(|_| json!({"task": m["op"]["task"], "op_id": args[args.len()-3], "outcome": "unknown", "reason": String::from_utf8_lossy(&out.stderr), "next": "Check the board; retry the same operation id."})),
             Err(e) => json!({"task": m["op"]["task"], "op_id": args[args.len()-3], "outcome": "unknown", "reason": e, "next": "Check the board; retry the same operation id."}),
@@ -486,7 +486,7 @@ fn task_session(root: &Path, local: &str, row: &mut Value) {
         return;
     }
     let id = if own && ((id == "-" && rt == "codex") || rt == "claude") {
-        let l = crate::runtime::Launch { task: row["n"].as_u64().unwrap_or(0), title: String::new(), attempt: row["attempt"].as_u64().unwrap_or(0),
+        let l = crate::runtime::Launch { execution: None, task: row["n"].as_u64().unwrap_or(0), title: String::new(), attempt: row["attempt"].as_u64().unwrap_or(0),
             role: row["role"].as_str().unwrap_or("").into(), rt: rt.into(), session: id.into(), url: String::new(), resume: None };
         crate::runtime::codex_thread(&crate::runtime::log_path(root, &l)).unwrap_or_else(|| id.into())
     } else { id.into() };
@@ -1480,7 +1480,7 @@ fn pick() -> Option<PathBuf> {
 /// `taskq selftest` in `dir`: its first error line on failure.
 fn selftest(dir: &Path) -> Result<(), String> {
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
-    let o = crate::platform::quiet(std::process::Command::new(me).arg("selftest").current_dir(dir).env("TASKQ_ROOT", dir)).output().map_err(|e| e.to_string())?;
+    let o = crate::platform::output("tray.selftest",std::process::Command::new(me).arg("selftest").current_dir(dir).env("TASKQ_ROOT", dir),Duration::from_secs(30))?;
     let text = String::from_utf8_lossy(&o.stderr).to_string() + &String::from_utf8_lossy(&o.stdout);
     if o.status.success() { Ok(()) } else { Err(text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("selftest failed").chars().take(160).collect()) }
 }
@@ -1508,7 +1508,7 @@ fn install_service(install: &Path, mut a: Value) -> Value {
         // a separate process group: launchctl must not take the tray with it
         #[cfg(unix)]
         std::os::unix::process::CommandExt::process_group(&mut c, 0);
-        let o = crate::platform::quiet(&mut c).output().map_err(|e| e.to_string())?;
+        let o = crate::platform::output("tray.install", &mut c, Duration::from_secs(60))?;
         let text = String::from_utf8_lossy(&o.stderr).to_string() + &String::from_utf8_lossy(&o.stdout);
         if !o.status.success() {
             return Err(text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("service install failed").to_string());
@@ -1552,7 +1552,7 @@ fn capacity(root: &Path, m: &Value) -> String {
 
 fn open(arg: &str) {
     let opener = if cfg!(windows) { "explorer" } else { "open" };
-    let _ = crate::platform::quiet(std::process::Command::new(opener).arg(arg)).spawn();
+    let _ = coreq::telemetry::capture::operation("tray.open-request",||crate::platform::quiet(std::process::Command::new(opener).arg(arg)).spawn().map(|_|()),|_|"spawn");
 }
 
 /// The menu bar's theme: macOS follows the app appearance; the Windows taskbar has its own setting.
@@ -1561,7 +1561,7 @@ fn is_dark(_w: &Window) -> bool {
     {
         let mut c = std::process::Command::new("reg");
         c.args(["query", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize", "/v", "SystemUsesLightTheme"]);
-        let out = crate::platform::quiet(&mut c).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+        let out = crate::platform::output("tray.theme", &mut c, Duration::from_secs(10)).map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
         !out.contains("0x1")
     }
     #[cfg(not(windows))]

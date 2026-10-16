@@ -76,7 +76,36 @@ fn attempt_of(name: &str) -> Option<u64> {
     a.parse().ok()
 }
 
-/// One pruning round of the service (§ 4 Data); `live`: attempts of live children. Lines name what went.
+/// Input bindings of retained attempts; uncertainty preserves inputs instead of deleting recovery evidence.
+fn bound_inputs(root:&Path,live:&[u64])->Result<std::collections::HashSet<String>,String> {
+    use std::io::Read;
+    let mut names=std::collections::HashSet::new();
+    if live.is_empty() {return Ok(names);}
+    let mut budget=8*1024*1024u64;
+    let mut seen=std::collections::HashSet::new();
+    for entry in fs::read_dir(crate::dot(root)).map_err(|e|e.to_string())? {
+        let entry=entry.map_err(|e|e.to_string())?;
+        let name=entry.file_name();
+        let Some(attempt)=name.to_str().and_then(attempt_of).filter(|a|live.contains(a)) else {continue};
+        if !entry.file_type().map_err(|e|e.to_string())?.is_file() {return Err("nonregular native recovery log".into());}
+        let mut text=String::new();
+        fs::File::open(entry.path()).map_err(|e|e.to_string())?.take(budget+1).read_to_string(&mut text).map_err(|e|e.to_string())?;
+        if text.len() as u64>budget {return Err("native recovery scan exceeds 8 MiB; inputs kept".into());}
+        budget-=text.len() as u64;seen.insert(attempt);
+        for line in text.lines().filter(|l|l.trim_start().starts_with('{')) {
+            let v:Value=serde_json::from_str(line).map_err(|_|"incomplete native recovery log; inputs kept")?;
+            if v["type"]!="taskq.input" {continue;}
+            if v["attempt"].as_u64()!=Some(attempt) || !v["execution"].as_u64().is_some_and(|e|e>=attempt) {return Err("invalid native input binding; inputs kept".into());}
+            let path=Path::new(v["path"].as_str().ok_or("native input path missing; inputs kept")?);
+            let name=path.file_name().and_then(|n|n.to_str()).filter(|n|n.ends_with(".txt")).ok_or("native input filename invalid; inputs kept")?;
+            names.insert(name.to_owned());
+        }
+    }
+    if live.iter().any(|a|*a>0 && !seen.contains(a)) {return Err("retained attempt log missing; inputs kept".into());}
+    Ok(names)
+}
+
+/// One pruning round of the service (§ 4 Data); `live`: native handles plus unresolved reservations.
 pub fn prune(root: &Path, install: &Path, project: &str, live: &[u64]) -> Vec<String> {
     let d = crate::dot(root);
     let mut out = vec![];
@@ -93,11 +122,14 @@ pub fn prune(root: &Path, install: &Path, project: &str, live: &[u64]) -> Vec<St
         out.push(format!("pruned {n} attempt logs beyond the newest {ATTEMPT_LOGS}"));
     }
     let inputs = d.join("inputs");
-    let n = keep_newest(&inputs, INPUTS, |f| f.ends_with(".txt"), |f| {
+    let bound=bound_inputs(root,live);
+    if let Err(e)=&bound {out.push(format!("input retention unknown: {e}"));}
+    let n = if let Ok(bound)=bound {keep_newest(&inputs, INPUTS, |f| f.ends_with(".txt"), |f| {
+        if bound.contains(f) {return true;}
         // A live turn holds a shared lock; an unreadable file stays rather than risking its input.
         fs::File::options().read(true).write(true).open(inputs.join(f))
             .map_or(true, |file| file.try_lock().is_err())
-    });
+    })} else {0};
     if n > 0 {
         out.push(format!("pruned {n} input files beyond the newest {INPUTS}"));
     }
@@ -153,20 +185,52 @@ pub fn focus(root: &Path) -> Result<Vec<String>, String> {
     Ok(t.split_whitespace().filter(|f| *f != "off").map(String::from).collect())
 }
 
-/// The kids file of the § 8 step 3 handover: the writer's pid and `task attempt runtime pid delivered` per child.
-/// Err with the reason on any malformed line (unknown: nothing is adopted, the file stays).
-pub type KidLine = (u64, u64, String, i32, u64);
+pub const KIDS_MAX: u64 = 1 << 20;
 
-pub fn kids(text: &str) -> Result<(u32, Vec<KidLine>), String> {
+#[derive(Clone,Debug,PartialEq,Eq)]
+pub struct KidLine {
+    pub task:u64, pub attempt:u64, pub runtime:String, pub process:coreq::process::Identity,
+    pub execution:u64, pub offset:u64, pub job:Option<String>,
+}
+
+pub fn job_key(key:&str)->bool {
+    key.len()==36 && key.bytes().enumerate().all(|(i,b)|if [8,13,18,23].contains(&i) {b==b'-'} else {b.is_ascii_digit() || (b'a'..=b'f').contains(&b)})
+}
+
+/// Existing handover record; legacy/invalid evidence is preserved, never guessed from a delivery cursor.
+pub fn kids(text: &str) -> Result<(coreq::process::Identity, Vec<KidLine>), String> {
+    if text.len() as u64 > KIDS_MAX { return Err("kids: over 1 MiB; file kept".into()); }
+    let identity=|pid:&str,started:&str|->Option<coreq::process::Identity> {
+        let pid=pid.parse::<u32>().ok().filter(|n| *n>0 && *n<=i32::MAX as u32)?;
+        if started.is_empty() || started.len()>128 || !started.bytes().all(|b|b.is_ascii_alphanumeric() || b==b'-') { return None; }
+        Some(coreq::process::Identity {pid,started:started.into()})
+    };
     let mut lines = text.lines();
-    let pid = lines.next().and_then(|l| l.strip_prefix("pid ")?.parse().ok()).ok_or("kids: no `pid <n>` first line; file kept")?;
+    let header=lines.next().unwrap_or_default().split_whitespace().collect::<Vec<_>>();
+    let owner=match header.as_slice() { ["pid",pid,started,"executor-v1"]=>identity(pid,started), _=>None }
+        .ok_or("kids: native executor identity version missing; legacy launcher or malformed file kept")?;
     let kid = |l: &str| -> Option<KidLine> {
         let w: Vec<&str> = l.split_whitespace().collect();
-        let [task, attempt, rt, pid, delivered] = w[..] else { return None };
-        Some((task.parse().ok()?, attempt.parse().ok()?, rt.into(), pid.parse().ok()?, delivered.parse().ok()?))
+        let (fields,job)=match w.as_slice() {
+            [_,_,_,_,_,_,_] =>(w.as_slice(),None),
+            [fields @ ..,scope] if fields.len()==7 =>{
+                let key=scope.strip_prefix("job-global:")?;
+                if !job_key(key) {return None;}
+                (fields,Some(key.to_owned()))
+            },
+            _=>return None,
+        };
+        let [task, attempt, rt, pid, started, execution, offset] = fields[..] else { return None };
+        let task=task.parse::<u64>().ok().filter(|n|*n>0)?;
+        let attempt=attempt.parse::<u64>().ok().filter(|n|*n>0)?;
+        let execution=execution.parse::<u64>().ok().filter(|n|*n>=attempt)?;
+        if !matches!(rt,"codex"|"claude") || rt=="claude" && (offset!="0" || job.is_some()) { return None; }
+        Some(KidLine {task,attempt,runtime:rt.into(),process:identity(pid,started)?,execution,offset:offset.parse().ok()?,job})
     };
-    let v = lines.enumerate().map(|(i, l)| kid(l).ok_or(format!("kids: line {} malformed; file kept", i + 2))).collect::<Result<_, _>>()?;
-    Ok((pid, v))
+    let v: Vec<KidLine> = lines.enumerate().map(|(i, l)| kid(l).ok_or(format!("kids: line {} malformed; file kept", i + 2))).collect::<Result<_, _>>()?;
+    let (mut tasks,mut pids,mut jobs)=(std::collections::HashSet::new(),std::collections::HashSet::new(),std::collections::HashSet::new());
+    if v.iter().any(|k|!tasks.insert(k.task) || !pids.insert(k.process.pid) || k.process.pid==owner.pid || k.job.as_ref().is_some_and(|job|!jobs.insert(job))) { return Err("kids: duplicate or service identity used as child; file kept".into()); }
+    Ok((owner, v))
 }
 
 #[cfg(test)]
@@ -235,11 +299,25 @@ mod tests {
         }
         let active = fs::File::options().read(true).write(true).open(dir.join("0.txt")).unwrap();
         let active = InputLock::new(active).unwrap();
-        prune(&root, &root.join("install"), "p", &[]);
-        assert_eq!(fs::read_dir(&dir).unwrap().count(), 51);
+        fs::write(root.join(".taskq/T7-42.log"),format!("{}\n",serde_json::json!({"type":"taskq.input","task":7,"attempt":42,"execution":44,"runtime":"claude","path":dir.join("1.txt")}))).unwrap();
+        prune(&root, &root.join("install"), "p", &[42]);
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 52);
         assert!(dir.join("0.txt").exists());
-        assert!(!dir.join("1.txt").exists());
+        assert!(dir.join("1.txt").exists(),"restart loses the lock, not the pending input binding");
+        assert!(!dir.join("2.txt").exists());
         drop(active);
+        prune(&root, &root.join("install"), "p", &[42]);
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 51);
+        assert!(dir.join("1.txt").exists());
+        let log=root.join(".taskq/T7-42.log");
+        for bad in ["{\"type\":\"taskq.input\"".to_owned(),serde_json::json!({"type":"taskq.input","attempt":42,"execution":41}).to_string(),"x".repeat(8*1024*1024+1)] {
+            fs::write(&log,bad).unwrap();
+            assert!(prune(&root,&root.join("install"),"p",&[42]).iter().any(|s|s.starts_with("input retention unknown:")));
+            assert_eq!(fs::read_dir(&dir).unwrap().count(),51,"uncertain recovery evidence must preserve the unlocked input");
+        }
+        fs::remove_file(log).unwrap();
+        assert!(prune(&root,&root.join("install"),"p",&[42]).iter().any(|s|s.contains("retained attempt log missing")));
+        assert!(dir.join("1.txt").exists());
         prune(&root, &root.join("install"), "p", &[]);
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 50);
         fs::remove_dir_all(root).unwrap();
@@ -303,10 +381,26 @@ mod tests {
             assert!(focus(&root).unwrap_err().contains(why));
             assert_eq!(fs::read(d.join("focus")).unwrap(), bad);
         }
-        assert_eq!(kids("pid 9\n7 41 claude 123 40\n"), Ok((9, vec![(7, 41, "claude".into(), 123, 40)])));
-        assert_eq!(kids("pid 9\n"), Ok((9, vec![])));
-        assert!(kids("pid x\n").unwrap_err().contains("pid"));
-        assert!(kids("pid 9\n7 41 claude\n").unwrap_err().contains("line 2"));
+        let owner=coreq::process::Identity {pid:9,started:"service".into()};
+        let row=KidLine {task:7,attempt:41,runtime:"codex".into(),process:coreq::process::Identity {pid:123,started:"child".into()},execution:43,offset:40,job:None};
+        assert_eq!(kids("pid 9 service executor-v1\n7 41 codex 123 child 43 40\n"), Ok((owner.clone(),vec![row.clone()])));
+        let key="11111111-1111-4111-8111-111111111111";
+        let scoped=format!("pid 9 service executor-v1\n7 41 codex 123 child 43 40 job-global:{key}\n");
+        let mut with_job=row.clone();with_job.job=Some(key.into());
+        assert_eq!(kids(&scoped),Ok((owner.clone(),vec![with_job])));
+        for scope in ["job-global:","job-global:../foreign","job-global:11111111-1111-4111-8111-11111111111G","job:11111111-1111-4111-8111-111111111111"] {assert!(kids(&format!("pid 9 service executor-v1\n7 41 codex 123 child 43 40 {scope}\n")).is_err());}
+        assert!(kids(&(scoped+&format!("8 42 codex 124 other 44 0 job-global:{key}\n"))).is_err(),"one native scope cannot own two tasks");
+        assert!(kids(&format!("pid 9 service executor-v1\n7 41 claude 123 child 43 0 job-global:{key}\n")).is_err());
+        assert!(kids("pid 9\n7 41 codex 123 40\n").is_err(),"legacy cursors never identify an execution");
+        assert_eq!(kids("pid 9 service executor-v1\n"), Ok((owner, vec![])));
+        assert!(kids("pid 9 service\n7 41 codex 123 child 43 40\n").unwrap_err().contains("legacy launcher"),"a historical wrapper PID is not native exit proof");
+        for row in ["7 41 codex 9 service 43 40", "7 41 codex 123 child 40 0", "7 41 codex 123 ../child 43 0", "7 41 claude 123 child 43 1", "7 41 codex-app 123 child 43 0"] {
+            assert!(kids(&format!("pid 9 service executor-v1\n{row}\n")).is_err(),"{row}");
+        }
+        assert!(kids("pid 9 service executor-v1\n7 41 codex 123 child 43 40\n7 41 codex 124 child2 44 40\n").is_err());
+        assert!(kids(&"x".repeat(KIDS_MAX as usize+1)).unwrap_err().contains("1 MiB"));
+        assert!(kids("pid x\n").unwrap_err().contains("identity"));
+        assert!(kids("pid 9 service executor-v1\n7 41 claude\n").unwrap_err().contains("line 2"));
         assert_eq!(json(&root.join("missing")), Ok(None));
         assert_eq!(json(&{ fs::write(d.join("t.json"), json!({"a": 1}).to_string()).unwrap(); d.join("t.json") }), Ok(Some(json!({"a": 1}))));
         let _ = fs::remove_dir_all(&root);

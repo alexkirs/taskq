@@ -180,7 +180,7 @@ mod tests {
         let attempt = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() * 2;
         let rules = [false, true].map(|resume| crate::runtime::instructions(&root, "", resume).unwrap());
         for (i, role) in ["worker", "reviewer"].iter().enumerate() {
-            let mut l = Launch { task: 1, title: "Owner-authorized isolated Windows boundary qualification; follow fixture taskq.md, no board or publication.".into(), attempt: attempt + i as u64,
+            let mut l = Launch { execution: None, task: 1, title: "Owner-authorized isolated Windows boundary qualification; follow fixture taskq.md, no board or publication.".into(), attempt: attempt + i as u64,
                 role: role.to_string(), rt: "codex".into(), session: crate::runtime::uuid(), url: "https://github.com/taskqorg/taskq".into(), resume: None };
             for turn in 0..2 {
                 fs::write(root.join("stage"), turn.to_string()).unwrap();

@@ -79,6 +79,14 @@ pub fn error_text(msg: &str, root: Option<&Path>) -> String {
     format!("Error: {}\nNext: {next}", crate::compact(msg, 153))
 }
 
+/// Complete bounded dependency output, including nonzero exits whose receipt the caller must inspect.
+pub fn output(name: &'static str, command: &mut std::process::Command, budget: std::time::Duration) -> Result<std::process::Output,String> {
+    match coreq::process::output(name,command,budget) {
+        Ok(output) | Err(coreq::process::Failure::Exit(output)) => Ok(output),
+        Err(error) => Err(format!("{name}: {error}; outcome unknown")),
+    }
+}
+
 /// § 8 update steps (coreq), then the sweep: Ok(Some(version)) when a new release became current; with `check`, when
 /// one is available.
 pub fn update(install: &Path, check: bool) -> Result<Option<String>, String> {
@@ -433,6 +441,35 @@ mod tests {
     use super::*;
 
     // Chain: § 4 service log lines. Risk: a line without its UTC time, or one message split over lines.
+    // Chain: short adapter -> silent/nonzero dependency -> bounded response and private failure evidence.
+    #[test]
+    fn short_dependency_outputs_are_bounded_and_preserve_nonzero_receipts() {
+        crate::with_test_capture(|store,_| {
+            let fixture=|mode:&str| {
+                let mut command=std::process::Command::new(std::env::current_exe().unwrap());
+                command.args(["--exact","platform::tests::short_dependency_child","--ignored","--nocapture"]).env("TASKQ_SHORT_DEPENDENCY",mode);command
+            };
+            let began=std::time::Instant::now();
+            let error=output("fixture.silent",&mut fixture("silent"),std::time::Duration::from_millis(100)).unwrap_err();
+            assert!(error.contains("timeout")&&error.contains("unknown"));
+            assert!(began.elapsed()<std::time::Duration::from_secs(2));
+            let receipt=output("fixture.nonzero",&mut fixture("nonzero"),std::time::Duration::from_secs(5)).unwrap();
+            assert_eq!(receipt.status.code(),Some(7));
+            assert!(String::from_utf8_lossy(&receipt.stderr).contains("private dependency receipt"));
+            tracing::dispatcher::get_default(|d|d.downcast_ref::<coreq::telemetry::capture::Capture>().unwrap().flush().unwrap());
+            let export=store.export(0,0,1024).unwrap();let rows=export["events"].as_array().unwrap();
+            for class in ["timeout","exit"] {assert!(rows.iter().any(|r|r["observation"]["error"]==class));}
+            assert!(!export.to_string().contains("private dependency receipt"));
+        });
+    }
+
+    #[test]
+    #[ignore="owned silent/nonzero subprocess for the short dependency adapter"]
+    fn short_dependency_child() {
+        if std::env::var("TASKQ_SHORT_DEPENDENCY").unwrap()=="nonzero" {eprintln!("private dependency receipt");std::process::exit(7);}
+        loop {std::thread::park();}
+    }
+
     #[test]
     fn service_log_lines_start_with_utc_time_and_fold() {
         let at = crate::board::iso("2026-10-14T04:27:05Z").unwrap();

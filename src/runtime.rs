@@ -3,9 +3,22 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command};
+
+#[cfg(any(target_os="macos",windows))]
+mod app_control;
+
+#[cfg(windows)]
+pub mod windows_process;
+
+fn app_cancel(thread:&str,turn:&str)->Result<(),String> {
+    #[cfg(any(target_os="macos",windows))] {app_control::cancel(thread,turn)}
+    #[cfg(not(any(target_os="macos",windows)))] {let _=(thread,turn);Err("Codex App native cancellation unavailable on this platform; execution remains reserved".into())}
+}
 
 pub struct Launch {
+    /// Exact board intent, assigned by the service before native submission; absent for non-task probes.
+    pub execution: Option<u64>,
     pub task: u64,
     pub title: String,
     pub attempt: u64,
@@ -20,6 +33,13 @@ pub struct Launch {
 
 /// A running child; a trait so the service can be tested with fake processes.
 pub trait Proc {
+    fn job(&self)->Option<String> {None}
+    /// Save missing native recovery identity after launch without surrendering the handle on failure.
+    fn checkpoint(&mut self, _cfg:&crate::service::Config, _launch:&Launch, _execution:u64)->Result<(),String> { Err("native recovery checkpoint unsupported".into()) }
+    fn native_identity(&self)->Result<coreq::process::Identity,String> { Err("native process identity unavailable for handover".into()) }
+    fn input_offset(&self) -> Result<u64,String> { Err("native input boundary unavailable for handover".into()) }
+    /// Exact input was accepted by the native runtime; a handle or process exit alone is not evidence.
+    fn accepted(&mut self) -> Result<bool, String> { Err("native input acceptance unavailable; reconcile this execution".into()) }
     /// The exit code once the child has exited; `Err` is an unknown read (§ 4 reconciliation), never an exit.
     fn exited(&mut self) -> Result<Option<i32>, String>;
     fn exit_error(&self) -> Option<&'static str> { None }
@@ -37,6 +57,7 @@ pub fn stop(proc: &mut dyn Proc) -> Result<i32, String> {
 }
 
 impl Proc for Child {
+    fn native_identity(&self)->Result<coreq::process::Identity,String> {coreq::process::identity(Child::id(self)).map_err(|e|e.to_string())?.ok_or("native process already exited".into())}
     fn exited(&mut self) -> Result<Option<i32>, String> {
         match self.try_wait() {
             Ok(s) => Ok(s.map(|s| s.code().unwrap_or(-1))),
@@ -78,62 +99,68 @@ pub fn alive(pid: u32) -> bool {
 
 #[cfg(windows)]
 pub fn liveness(pid: u32) -> Result<bool, String> {
-    if pid == 0 { return Err("invalid process id".into()); }
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut std::ffi::c_void;
-        fn GetExitCodeProcess(h: *mut std::ffi::c_void, code: *mut u32) -> i32;
-        fn CloseHandle(h: *mut std::ffi::c_void) -> i32;
-    }
-    unsafe {
-        let h = OpenProcess(0x1000, 0, pid); // PROCESS_QUERY_LIMITED_INFORMATION
-        if h.is_null() {
-            let e = std::io::Error::last_os_error();
-            return if e.raw_os_error() == Some(87) { Ok(false) } else { Err(format!("process liveness unknown: {e}")) };
-        }
-        let mut code = 0;
-        let read = GetExitCodeProcess(h, &mut code) != 0;
-        let error = std::io::Error::last_os_error();
-        CloseHandle(h);
-        if read { Ok(code == 259) } else { Err(format!("process liveness unknown: {error}")) }
-    }
+    coreq::process::identity(pid).map(|identity|identity.is_some()).map_err(|e|format!("process liveness unknown: {e}"))
 }
 
-/// A child of this process image's predecessor, kept across the update re-exec (§ 8 step 3). The PID is unchanged by
-/// `exec`, so it is still our child and `waitpid` works.
+/// Protected native identity recovered after re-exec or cold restart; control stays bound to that incarnation.
 #[cfg(unix)]
-pub struct Adopted(pub i32);
+pub struct Adopted { identity:coreq::process::Identity, ended:Option<i32>, direct:bool }
+
+#[cfg(unix)]
+impl Adopted {
+    pub fn new(identity:coreq::process::Identity)->Self { Self {identity,ended:None,direct:false} }
+}
 
 #[cfg(unix)]
 impl Proc for Adopted {
     fn exited(&mut self) -> Result<Option<i32>, String> {
+        if self.ended.is_some() { return Ok(self.ended); }
+        match coreq::process::identity(self.identity.pid) {
+            Ok(identity) if identity.as_ref()!=Some(&self.identity) => { self.ended=Some(-1); return Ok(self.ended); },
+            Ok(_) => {},
+            Err(_) if self.direct => {}, // An unreaped owned child cannot reuse its PID, including while zombie.
+            Err(e) => return Err(format!("process identity unreadable: {e}; native reconciliation required")),
+        }
+        let pid=self.identity.pid as i32;
         let mut st = 0;
-        let r = unsafe { libc::waitpid(self.0, &mut st, libc::WNOHANG) };
+        let r = unsafe { libc::waitpid(pid, &mut st, libc::WNOHANG) };
         match r {
-            0 => Ok(None),
-            r if r == self.0 && libc::WIFEXITED(st) => Ok(Some(libc::WEXITSTATUS(st))),
-            r if r == self.0 => Ok(Some(-1)),
-            _ => {
-                let e = std::io::Error::last_os_error();
-                // not waitable: only an observed missing pid proves the exit
-                if unsafe { libc::kill(self.0, 0) } != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
-                    Ok(Some(-1))
-                } else {
-                    Err(format!("waitpid {}: {e}", self.0))
-                }
-            }
+            0 => { self.direct=true; Ok(None) },
+            r if r == pid => { self.ended=Some(if libc::WIFEXITED(st) {libc::WEXITSTATUS(st)} else {-1}); Ok(self.ended) },
+            _ if std::io::Error::last_os_error().raw_os_error()==Some(libc::ECHILD) => { self.direct=false; Ok(None) },
+            _ => Err(format!("waitpid {pid}: {}; direct-child ownership unconfirmed",std::io::Error::last_os_error())),
         }
     }
     fn kill(&mut self) -> Result<(), String> {
         if self.exited()?.is_some() { return Ok(()); }
-        if unsafe { libc::kill(self.0, libc::SIGKILL) } != 0 {
+        if !self.direct { return coreq::process::terminate(&self.identity).map_err(|e|format!("recovered process stop unconfirmed: {e}; verify termination on its host")); }
+        if unsafe { libc::kill(self.identity.pid as i32, libc::SIGKILL) } != 0 {
             return Err(format!("adopted process stop unconfirmed: {}", std::io::Error::last_os_error()));
         }
         Ok(())
     }
     fn id(&self) -> u32 {
-        self.0 as u32
+        self.identity.pid
     }
+}
+
+/// The saved execution scope, rather than a vanished launcher's PID, decides whether it remains live.
+pub fn execution_live(row:&crate::data::KidLine)->Result<bool,String> {
+    #[cfg(windows)] if row.runtime=="codex" {
+        let key=row.job.as_deref().ok_or("legacy Windows execution has no native job scope; reconcile descendants before release")?;
+        return windows_process::Execution::recover(row.process.clone(),key)?.exited().map(|ended|ended.is_none());
+    }
+    if row.job.is_some() {return Err("native job scope belongs to another adapter/platform; preserve record".into());}
+    coreq::process::identity(row.process.pid).map(|id|id.as_ref()==Some(&row.process)).map_err(|e|e.to_string())
+}
+
+/// Cleanup may use an already-attributable board Exit; an absent native scope cannot create that proof.
+pub fn released_execution_live(row:&crate::data::KidLine)->Result<bool,String> {
+    #[cfg(windows)] if row.runtime=="codex" {
+        let key=row.job.as_deref().ok_or("legacy Windows execution has no native job scope; reconcile before cleanup")?;
+        return match windows_process::Execution::open(row.process.clone(),key)? {Some(mut scope)=>scope.exited().map(|ended|ended.is_none()),None=>Ok(false)};
+    }
+    execution_live(row)
 }
 
 /// A random UUID v4 for the pre-launch Claude identity and qualification fixtures.
@@ -259,30 +286,69 @@ pub struct CliTurn {
     pub log: PathBuf,
     /// Log bytes already read: a resume appends to the log of earlier turns.
     pub pos: u64,
+    pub start: u64,
     pub stopping: bool,
+    pub accepted: bool,
+    pub read_error: Option<String>,
+    pub native: Option<coreq::process::Identity>,
+    pub recovery: Option<Recovery>,
+}
+
+pub struct Recovery {
+    install:PathBuf, root:PathBuf, task:u64, attempt:u64, execution:u64,
 }
 
 impl CliTurn {
-    fn ended(&mut self) -> bool {
+    fn persist(&mut self)->Result<(),String> {
+        let Some(r)=&self.recovery else { return Ok(()) };
+        let row=crate::data::KidLine {task:r.task,attempt:r.attempt,runtime:"codex".into(),process:self.native_identity()?,execution:r.execution,offset:self.input_offset()?,job:self.proc.job()};
+        crate::checkpoint_kid(&r.install,&r.root,row).map_err(|e|format!("native recovery checkpoint failed: {e}"))?;
+        self.recovery=None;
+        Ok(())
+    }
+    fn ended(&mut self) -> Result<bool,String> {
         use std::io::{Read, Seek, SeekFrom};
         let mut rest = vec![];
-        let Ok(mut f) = File::open(&self.log) else { return false };
-        if f.seek(SeekFrom::Start(self.pos)).and_then(|_| f.read_to_end(&mut rest)).is_err() { return false; }
-        let Some(end) = rest.iter().rposition(|b| *b == b'\n') else { return false };
+        let mut f = File::open(&self.log).map_err(|e|format!("native input log unreadable: {e}"))?;
+        if f.metadata().map_err(|e|e.to_string())?.len() < self.pos { return Err("native input log truncated; input boundary unknown".into()); }
+        f.seek(SeekFrom::Start(self.pos)).and_then(|_| f.read_to_end(&mut rest)).map_err(|e|format!("native input log read failed: {e}"))?;
+        let Some(end) = rest.iter().rposition(|b| *b == b'\n') else { return Ok(false) };
         self.pos += end as u64 + 1;
-        String::from_utf8_lossy(&rest[..end]).lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-            .any(|v| matches!(v["type"].as_str(), Some("turn.completed" | "turn.failed" | "result")))
+        let mut ended = false;
+        for v in String::from_utf8_lossy(&rest[..end]).lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()) {
+            self.accepted |= matches!(v["type"].as_str(), Some("turn.started" | "assistant"));
+            ended |= matches!(v["type"].as_str(), Some("turn.completed" | "turn.failed" | "result"));
+        }
+        Ok(ended)
     }
 }
 
 impl Proc for CliTurn {
+    fn job(&self)->Option<String> {self.proc.job()}
+    fn checkpoint(&mut self,cfg:&crate::service::Config,l:&Launch,execution:u64)->Result<(),String> {
+        if l.rt!="codex" { return Ok(()) }
+        self.recovery=Some(Recovery {install:cfg.install.clone(),root:cfg.root.clone(),task:l.task,attempt:l.attempt,execution});
+        self.persist()
+    }
+    fn native_identity(&self)->Result<coreq::process::Identity,String> { self.native.clone().ok_or("native process identity was not observed at spawn".into()) }
+    fn input_offset(&self)->Result<u64,String> {
+        if std::fs::metadata(&self.log).map_err(|e|e.to_string())?.len() < self.pos { return Err("native input log truncated; handover refused".into()); }
+        Ok(self.start)
+    }
+    fn accepted(&mut self) -> Result<bool, String> {
+        if !self.accepted { if let Some(e)=&self.read_error { return Err(e.clone()); } }
+        Ok(self.accepted)
+    }
     fn exited(&mut self) -> Result<Option<i32>, String> {
+        let checkpoint=self.persist();
+        let ended = self.ended();
+        self.read_error=ended.as_ref().err().cloned();
         if let Some(code) = self.proc.exited()? { return Ok(Some(code)); }
-        if !self.stopping && self.ended() {
+        if !self.stopping && ended? {
             self.stopping = true;
             log!("{}: turn ended; stopping its lingering process", self.log.display());
         }
-        if self.stopping { stop(self.proc.as_mut()).map(Some) } else { Ok(None) }
+        if self.stopping { self.proc.kill()?; self.proc.exited() } else { checkpoint?; Ok(None) }
     }
     fn kill(&mut self) -> Result<(), String> { self.stopping = true; self.proc.kill() }
     fn id(&self) -> u32 { self.proc.id() }
@@ -309,6 +375,37 @@ pub fn which(name: &str) -> PathBuf {
         }
     }
     PathBuf::from(name)
+}
+
+/// An npm launcher is not the executor: SIGKILL cannot reach the native child through Node.
+fn codex_native(bin: PathBuf) -> Result<PathBuf,String> {
+    if cfg!(windows) || !bin.exists() { return Ok(bin); }
+    let bin=bin.canonicalize().map_err(|e|format!("Codex executable unavailable: {e}"))?;
+    let native=|path:&Path|->Result<bool,String> {
+        let mut magic=[0;4];
+        File::open(path).and_then(|mut f|f.read_exact(&mut magic)).map_err(|e|format!("Codex executable unreadable: {e}"))?;
+        Ok(matches!(magic,[0x7f,b'E',b'L',b'F']|[0xcf,0xfa,0xed,0xfe]|[0xfe,0xed,0xfa,0xcf]|[0xce,0xfa,0xed,0xfe]|[0xfe,0xed,0xfa,0xce]|[0xca,0xfe,0xba,0xbe]|[0xbe,0xba,0xfe,0xca]))
+    };
+    if native(&bin)? { return Ok(bin); }
+    let package=bin.parent().filter(|p|p.file_name().is_some_and(|n|n=="bin")).and_then(Path::parent)
+        .filter(|_|bin.file_name().is_some_and(|n|n=="codex.js"))
+        .ok_or("Codex launcher ownership unsupported; select a native Codex executable")?;
+    let metadata:serde_json::Value=serde_json::from_reader(File::open(package.join("package.json")).map_err(|e|format!("Codex package unavailable: {e}"))?.take(64*1024))
+        .map_err(|e|format!("Codex package invalid: {e}"))?;
+    if metadata["name"]!="@openai/codex" { return Err("Codex launcher package identity differs".into()); }
+    let (platform,target)=match (std::env::consts::OS,std::env::consts::ARCH) {
+        ("macos","aarch64")=>("darwin-arm64","aarch64-apple-darwin"),
+        ("macos","x86_64")=>("darwin-x64","x86_64-apple-darwin"),
+        ("linux","aarch64")=>("linux-arm64","aarch64-unknown-linux-musl"),
+        ("linux","x86_64")=>("linux-x64","x86_64-unknown-linux-musl"),
+        _=>return Err("Codex native package unsupported on this platform".into()),
+    };
+    // Match Node's package lookup along the entrypoint's ancestors; never scan other installations.
+    let installed=package.ancestors().map(|p|p.join(format!("node_modules/@openai/codex-{platform}")))
+        .find(|p|p.join("package.json").is_file()).unwrap_or_else(||package.to_path_buf());
+    let executable=installed.join(format!("vendor/{target}/bin/codex"));
+    if !native(&executable)? { return Err("Codex package executor is not a native binary".into()); }
+    executable.canonicalize().map_err(|e|format!("Codex native executable unavailable: {e}"))
 }
 
 pub struct Env<'a> {
@@ -343,7 +440,8 @@ fn executable(bin: PathBuf, access: &crate::policy::Effective, env: &Env) -> Res
 }
 
 pub fn command(env: &Env, l: &Launch, access: &crate::policy::Effective) -> Result<Command, String> {
-    let mut c = executable(which(if l.rt == "claude" { "claude" } else { "codex" }), access, env)?;
+    let bin=if l.rt=="claude" {which("claude")} else {codex_native(which("codex"))?};
+    let mut c = executable(bin, access, env)?;
     crate::platform::quiet(&mut c);
     let codex = access.codex.as_deref().unwrap_or(env.codex);
     let mode = access.claude.as_deref().unwrap_or(env.permission_mode);
@@ -477,7 +575,7 @@ pub fn brief(env: &Env, l: &Launch) -> String {
             push = if env.publish == "direct" { "push the branch" } else { "push the branch and open one PR/MR into main" }
         )
     };
-    format!("{head}Changing an existing test or golden trace while preserving every assertion is a repair, named in --text with the defect it fixes; weakening or deleting an assertion needs a changed rule in the same diff and is named in --text (section 7 step 4).\n{body}Then stop. Everything written through taskq is public: no secrets or paths outside the repository.\n")
+    format!("{head}Test changes follow specq engineering/testing.md: name the defect and retained risk protection in --text; change a rule only when accepted behavior or protection changes (section 7 step 4).\n{body}Then stop. Everything written through taskq is public: no secrets or paths outside the repository.\n")
 }
 
 #[cfg(test)]
@@ -521,7 +619,7 @@ fn specq_dir(root: &Path, revision: &str) -> PathBuf {
 }
 
 fn refused(what: &str, e: impl std::fmt::Display) -> StartError {
-    StartError { message: format!("rules {what}: {e}"), reportable: false }
+    StartError { message: format!("rules {what}: {e}"), reportable: false, no_start: true }
 }
 
 fn revision_id(text: &str) -> bool {
@@ -775,28 +873,113 @@ pub fn instructions(root: &Path, task: &str, resume: bool) -> Result<String, Sta
 }
 
 // Claude --bg forwards stdin as child argv; send only a file reference.
-fn claude_input(root: &Path, text: &str) -> Result<(String, crate::data::InputLock), String> {
-    let (path, file) = turn_input(root, text)?;
-    Ok((format!("Before any work, use Read to read {} in full. It contains this turn's TaskQ rules and task. Apply those rules and carry out that task. If Read truncates the file, read the remaining parts before proceeding.", serde_json::to_string(&path.to_string_lossy()).map_err(|e| e.to_string())?), file))
+fn claude_reference(path:&Path)->Result<String,String> {
+    Ok(format!("Before any work, use Read to read {} in full. It contains this turn's TaskQ rules and task. Apply those rules and carry out that task. If Read truncates the file, read the remaining parts before proceeding.", serde_json::to_string(&path.to_string_lossy()).map_err(|e| e.to_string())?))
 }
 
-fn app_input(root: &Path, text: &str) -> Result<(String, crate::data::InputLock), String> {
-    let (path, file) = turn_input(root, text)?;
-    Ok((format!("Before any work, read {} in full using your file tools. It contains this turn's TaskQ rules and task. Apply those rules and carry out that task. Read all remaining parts if a tool truncates the file. If the file cannot be read completely, report the failure and do not proceed with the task.", serde_json::to_string(&path.to_string_lossy()).map_err(|e| e.to_string())?), file))
+fn app_reference(path:&Path)->Result<String,String> {
+    Ok(format!("Before any work, read {} in full using your file tools. It contains this turn's TaskQ rules and task. Apply those rules and carry out that task. Read all remaining parts if a tool truncates the file. If the file cannot be read completely, report the failure and do not proceed with the task.", serde_json::to_string(&path.to_string_lossy()).map_err(|e| e.to_string())?))
 }
 
-fn turn_input(root: &Path, text: &str) -> Result<(PathBuf, crate::data::InputLock), String> {
+fn claude_input(root:&Path,text:&str,launch:Option<&Launch>)->Result<(String,crate::data::InputLock,PathBuf),String> {
+    let (path,file)=turn_input(root,text,launch)?;
+    Ok((claude_reference(&path)?,file,path))
+}
+
+fn app_input(root:&Path,text:&str,launch:Option<&Launch>)->Result<(String,crate::data::InputLock,PathBuf),String> {
+    let (path,file)=turn_input(root,text,launch)?;
+    Ok((app_reference(&path)?,file,path))
+}
+
+fn execution_input(root:&Path,task:u64,attempt:u64,execution:u64)->Result<PathBuf,String> {
+    if task==0 || attempt==0 || execution<attempt {return Err("invalid execution identity for native input".into());}
+    Ok(root.canonicalize().map_err(|e|e.to_string())?.join(".taskq/inputs").join(format!("execution-{task}-{attempt}-{execution}.txt")))
+}
+
+fn turn_input(root: &Path, text: &str, launch:Option<&Launch>) -> Result<(PathBuf, crate::data::InputLock), String> {
     let dir = root.join(".taskq/inputs");
+    let path=match launch.filter(|l|l.task>0) {
+        Some(l)=>execution_input(root,l.task,l.attempt,l.execution.ok_or("exact execution intent missing before native input creation")?)?,
+        None=>dir.join(format!("{}.txt",uuid())),
+    };
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let path = dir.join(format!("{}.txt", uuid()));
     let mut options = File::options();
     options.read(true).write(true).create_new(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
     let mut file = options.open(&path).map_err(|e| e.to_string())?;
     file.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
+    file.sync_all().map_err(|e| e.to_string())?;
     let file = crate::data::InputLock::new(file).map_err(|e| e.to_string())?;
     Ok((path, file))
+}
+
+fn record_input(log:&Path,record:&serde_json::Value)->Result<(),String> {
+    let mut file=File::options().create(true).append(true).open(log).map_err(|e|e.to_string())?;
+    writeln!(file,"{record}").and_then(|_|file.sync_all()).map_err(|e|format!("native input binding not persisted: {e}"))
+}
+
+/// Recovery locator only: neither a before-call marker nor its presence proves submission or no-start.
+fn bind_input(log:&Path,l:&Launch,path:&Path,input:&str,native:serde_json::Value)->Result<serde_json::Value,String> {
+    let execution=if l.task==0 {0} else {l.execution.filter(|id|l.attempt>0 && *id>=l.attempt).ok_or("exact execution intent missing before native input submission")?};
+    let record=serde_json::json!({"type":"taskq.input","task":l.task,"attempt":l.attempt,"execution":execution,"runtime":l.rt,
+        "path":path.to_str().ok_or("native input path is not UTF-8")?,"input":input,"native":native});
+    record_input(log,&record)?;
+    Ok(record)
+}
+
+/// The log supplies native lookup hints; the board-derived input reference is the identity boundary.
+fn recovery_binding(root:&Path,task:u64,x:&crate::core::Execution)->Result<(PathBuf,serde_json::Value,crate::data::InputLock),String> {
+    let path=execution_input(root,task,x.attempt,x.id)?;
+    if !std::fs::symlink_metadata(&path).map_err(|_|"original execution input unavailable; inspect legacy or missing native binding")?.is_file() {
+        return Err("original execution input is not a regular file".into());
+    }
+    let input=match x.runtime.as_str() {"claude"=>claude_reference(&path)?,"codex-app"=>app_reference(&path)?,_=>return Err("native input recovery unsupported for this runtime".into())};
+    let worker=attempt_log(root,"worker",task,x.attempt);let reviewer=attempt_log(root,"reviewer",task,x.attempt);
+    let log=match (worker.is_file(),reviewer.is_file()) {(true,false)=>worker,(false,true)=>reviewer,_=>return Err("native attempt log missing or ambiguous; preserve the execution".into())};
+    let mut binding=None;let mut reader=NativeHistory::default();
+    let until=std::time::Instant::now()+std::time::Duration::from_secs(5);
+    loop {
+        let complete=reader.lines(&log,|line| {
+            if !line.trim_start().starts_with('{') {return Ok(());}
+            let v:serde_json::Value=serde_json::from_str(line).map_err(|_|"native attempt record incomplete or invalid")?;
+            if v["type"]!="taskq.input" || v["execution"].as_u64()!=Some(x.id) {return Ok(());}
+            if v["task"].as_u64()!=Some(task) || v["attempt"].as_u64()!=Some(x.attempt) || v["runtime"]!=x.runtime || v["path"].as_str()!=path.to_str() || v["input"]!=input || !v["native"].is_object() {
+                return Err("native input binding differs from the board execution; inspect original submission".into());
+            }
+            binding=Some(v);Ok(())
+        })?;
+        if complete {break;}
+        if std::time::Instant::now()>=until {return Err("native input binding scan exceeded 5 seconds; original execution retained".into());}
+    }
+    let binding=binding.ok_or("exact execution input binding missing; inspect original submission")?;
+    let file=File::open(&path).map_err(|e|e.to_string())?;
+    let lock=crate::data::InputLock::new(file).map_err(|e|e.to_string())?;
+    Ok((log,binding,lock))
+}
+
+/// Reconnect observation only. This path cannot submit a prompt, queue a turn or change access.
+pub fn recover(root:&Path,install:&Path,task:u64,x:&crate::core::Execution)->Result<Box<dyn Proc>,String> {
+    if x.release.is_some() {return Err("released execution cannot be recovered as live".into());}
+    let root=root.canonicalize().map_err(|e|e.to_string())?;
+    let saved=crate::kids_file(install,&root)?.into_iter().find(|k|k.task==task);
+    if saved.as_ref().is_some_and(|k|k.execution!=x.id || k.attempt!=x.attempt || k.runtime!=x.runtime) {
+        return Err("protected native recovery identity differs from board execution; preserve the record".into());
+    }
+    let (log,binding,input_file)=recovery_binding(&root,task,x)?;
+    let input=binding["input"].as_str().ok_or("native recovery input missing")?.to_owned();
+    match x.runtime.as_str() {
+        "claude"=>Ok(Box::new(ClaudeTurn {root:root.clone(),log,session:if x.id==x.attempt {String::new()} else {binding["native"]["session"].as_str().unwrap_or_default().to_owned()},
+            id:String::new(),announced:false,accepted:false,history:ClaudeHistory::default(),before:0,mode:"unknown: recovered observer".into(),input,_input_file:input_file,pid:0,done:false,failure:None,
+            native:saved.map(|k|k.process),recovery:Some(Recovery {install:install.into(),root:root.clone(),task,attempt:x.attempt,execution:x.id}),
+            launch_error:Some("recovered execution; original native input acceptance pending".into())})),
+        "codex-app"=>{
+            let thread=binding["native"]["thread"].as_str().filter(|s|s.len()>1 && s.bytes().all(|b|b.is_ascii_alphanumeric() || b==b'-')).ok_or("native App thread identity missing; inspect original handshake, never requeue")?.to_owned();
+            Ok(Box::new(AppTurn {root,history:AppHistory::default(),hand:None,log,text:input,_input:Some(input_file),binding:Some(binding),thread,done:0,rollout:None,running:app_running,control:app_cancel,cancelled:false,
+                queue_error:Some("recovered execution; original App input acceptance pending".into()),accepted:false}))
+        },
+        _=>Err("native input recovery unsupported for this runtime".into()),
+    }
 }
 
 fn turn_text(env: &Env, l: &Launch, fetch: impl FnMut(&str) -> Result<String, String>) -> Result<String, StartError> {
@@ -810,6 +993,7 @@ fn turn_text(env: &Env, l: &Launch, fetch: impl FnMut(&str) -> Result<String, St
 pub struct StartError {
     message: String,
     pub reportable: bool,
+    pub no_start: bool,
 }
 
 impl StartError {
@@ -817,21 +1001,31 @@ impl StartError {
         use std::io::ErrorKind;
         let reportable = matches!(error.kind(), ErrorKind::Other | ErrorKind::InvalidData | ErrorKind::UnexpectedEof | ErrorKind::BrokenPipe);
         let message = runtime.map_or_else(|| error.to_string(), |rt| format!("{rt}: {error}"));
-        Self { message, reportable }
+        Self { message, reportable, no_start: true }
     }
 }
+
+impl From<String> for StartError {
+    fn from(message: String) -> Self { Self { message, reportable: false, no_start: true } }
+}
+impl From<&str> for StartError {
+    fn from(message: &str) -> Self { message.to_string().into() }
+}
+impl std::error::Error for StartError {}
 
 impl std::fmt::Display for StartError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { self.message.fmt(f) }
 }
 
 /// Prepare stdin before spawn: a child that never reads cannot block its execution owner.
-pub fn start_command(command: &mut Command, root: &Path, text: &str) -> Result<Child, StartError> {
+pub fn start_command(command: &mut Command, root: &Path, text: &str) -> Result<Box<dyn Proc>, StartError> {
     coreq::telemetry::capture::operation("runtime.launch", || {
-        let (path, _input) = turn_input(root, text).map_err(|message| StartError { message, reportable: false })?;
+        let (path, _input) = turn_input(root, text, None).map_err(|message| StartError { message, reportable: false, no_start: true })?;
         let input = File::open(path).map_err(|e| StartError::io(e, None))?;
         coreq::telemetry::capture::inherit_context(command);
-        command.stdin(input).spawn().map_err(|e| StartError::io(e, None))
+        command.stdin(input);
+        #[cfg(windows)] {windows_process::Execution::spawn(command).map(|child|Box::new(child) as Box<dyn Proc>)}
+        #[cfg(not(windows))] {command.spawn().map(|child|Box::new(child) as Box<dyn Proc>).map_err(|e|StartError::io(e,None))}
     }, |_| "launch")
 }
 
@@ -840,7 +1034,7 @@ pub fn access(env: &Env, rt: &str) -> Result<crate::policy::Effective, StartErro
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from).unwrap_or_default();
     let a = crate::policy::resolve(&crate::policy::load(env.install), &crate::policy::Host::here(env.install, env.root, &home), rt, env.permission_mode, env.codex);
     match &a.refused {
-        Some(r) => Err(StartError { message: format!("access refused: {r}"), reportable: false }),
+        Some(r) => Err(StartError { message: format!("access refused: {r}"), reportable: false, no_start: true }),
         None => Ok(a),
     }
 }
@@ -859,22 +1053,27 @@ fn spawn_inner(env: &Env, l: &Launch) -> Result<Box<dyn Proc>, StartError> {
     let log = log_path(env.root, l);
     rules_line(&log, phase, &text).map_err(|e| StartError::io(e, None))?;
     if l.rt == "codex-app" {
-        let (text, input_file) = app_input(env.root, &text).map_err(|message| StartError { message, reportable: false })?;
-        let mut turn = AppTurn { hand: None, log, text, _input: Some(input_file), thread: l.session.clone(), done: 0, rollout: None, running: app_running, cancelled: false };
+        let (text, input_file, path) = app_input(env.root, &text, Some(l)).map_err(|message| StartError { message, reportable: false, no_start: true })?;
+        let binding=bind_input(&log,l,&path,&text,serde_json::json!({"thread":l.session}))?;
+        let mut turn = AppTurn { root: env.root.canonicalize().map_err(|e| StartError::io(e,None))?, history:AppHistory::default(), hand: None, log, text, _input: Some(input_file), binding:Some(binding), thread: l.session.clone(), done: 0, rollout: None, running: app_running, control:app_cancel, cancelled: false, queue_error: None, accepted: false };
         match &l.resume {
             Some(_) => {
-                turn.queue().map_err(|message| StartError { message, reportable: false })?;
+                if let Err(message) = turn.queue() { turn.queue_error = Some(format!("{message}; submission outcome unknown")); }
             }
-            None => turn.hand = Some(Box::new(start(env, l, &turn.log, HANDSHAKE, &access)?)),
+            None => turn.hand = Some(start(env, l, &turn.log, HANDSHAKE, &access)?),
         }
         return Ok(Box::new(turn));
     }
-    if l.rt == "claude" && (l.resume.is_none() || claude_background(env.root, &l.session).map_err(|message| StartError { message, reportable: false })?) {
-        return ClaudeTurn::start(env, l, &log, &text, &access).map(|p| Box::new(p) as Box<dyn Proc>).map_err(|message| StartError { message, reportable: false });
+    if l.rt == "claude" && (l.resume.is_none() || claude_background(env.root, &l.session).map_err(|message| StartError { message, reportable: false, no_start: true })?) {
+        return ClaudeTurn::start(env, l, &log, &text, &access).map(|p| Box::new(p) as Box<dyn Proc>);
     }
     let pos = std::fs::metadata(&log).map_or(0, |m| m.len());
     let child = start(env, l, &log, &text, &access)?;
-    Ok(Box::new(CliTurn { proc: Box::new(child), log, pos, stopping: false }))
+    let native=match child.native_identity() {
+        Ok(identity)=>Some(identity),
+        Err(e)=>{log!("#{} process recovery identity unknown: {e}",l.task);None}
+    };
+    Ok(Box::new(CliTurn { proc: child, log, pos, start: pos, stopping: false, accepted: false, read_error: None, native, recovery: None }))
 }
 
 /// The attempt log's evidence of § 8 Rule delivery: the injected header and part counts, one JSON line.
@@ -889,11 +1088,11 @@ pub fn rules_line(log: &Path, phase: &str, text: &str) -> std::io::Result<()> {
     writeln!(File::options().create(true).append(true).open(log)?, "{line}")
 }
 
-fn start(env: &Env, l: &Launch, log: &Path, text: &str, access: &crate::policy::Effective) -> Result<Child, StartError> {
+fn start(env: &Env, l: &Launch, log: &Path, text: &str, access: &crate::policy::Effective) -> Result<Box<dyn Proc>, StartError> {
     std::fs::create_dir_all(log.parent().unwrap()).map_err(|e| StartError::io(e, None))?;
     let out = File::options().create(true).append(true).open(log).map_err(|e| StartError::io(e, None))?;
     let err = out.try_clone().map_err(|e| StartError::io(e, None))?;
-    let mut c = command(env, l, access).map_err(|message| StartError { message, reportable: false })?;
+    let mut c = command(env, l, access).map_err(|message| StartError { message, reportable: false, no_start: true })?;
     start_command(c.stdout(out).stderr(err), env.root, text)
 }
 
@@ -905,14 +1104,18 @@ pub struct ClaudeTurn {
     session: String,
     id: String,
     announced: bool,
-    copied: usize,
+    accepted: bool,
+    history: ClaudeHistory,
     before: usize,
     mode: String,
     input: String,
     _input_file: crate::data::InputLock,
     pid: u32,
+    native: Option<coreq::process::Identity>,
+    recovery: Option<Recovery>,
     done: bool,
     failure: Option<&'static str>,
+    launch_error: Option<String>,
 }
 
 fn claude_agents(root: &Path) -> Result<Vec<serde_json::Value>, String> {
@@ -939,25 +1142,129 @@ pub(crate) fn claude_failure(row: &serde_json::Value, root: &Path, id: &str, hom
 }
 
 fn claude_transcript(session: &str) -> Option<PathBuf> {
-    if session.is_empty() || !session.chars().all(|c| c.is_ascii_hexdigit() || c == '-') { return None; }
-    let home = claude_home()?;
-    std::fs::read_dir(home.join("projects")).ok()?.flatten().find_map(|d| {
-        let p = d.path().join(format!("{session}.jsonl"));
-        p.is_file().then_some(p)
-    })
+    claude_transcript_in(&claude_home()?,session).ok()
 }
 
-fn claude_stop(root: &Path, id: &str, known_pid: u32) -> Result<(), String> {
+fn claude_transcript_in(home:&Path,session:&str)->Result<PathBuf,String> {
+    if session.len()!=36 || !native_job_id(session) {return Err("Claude session identity invalid".into());}
+    let mut found=None;
+    for (i,entry) in std::fs::read_dir(home.join("projects")).map_err(|e|e.to_string())?.enumerate() {
+        if i>=4096 {return Err("Claude transcript directory scan exceeds 4096 entries".into());}
+        let directory=entry.map_err(|e|e.to_string())?.path();
+        match std::fs::metadata(&directory) {
+            Ok(meta) if !meta.is_dir()=>continue,
+            Ok(_)=>{},
+            Err(e) if e.kind()==std::io::ErrorKind::NotFound=>continue,
+            Err(e)=>return Err(format!("Claude transcript directory unreadable: {e}")),
+        }
+        let path=directory.join(format!("{session}.jsonl"));
+        match std::fs::metadata(&path) {
+            Ok(meta) if meta.is_file()=>{
+                if found.is_some() {return Err("Claude session has multiple transcript paths; inspect native history".into());}
+                found=Some(path);
+            }
+            Ok(_)=>return Err("Claude transcript is not a regular file".into()),
+            Err(e) if e.kind()==std::io::ErrorKind::NotFound=>{},
+            Err(e)=>return Err(format!("Claude transcript lookup failed: {e}")),
+        }
+    }
+    found.ok_or_else(||"Claude transcript unavailable; completion unknown".into())
+}
+
+fn native_job_id(id:&str)->bool {
+    (id.len()==8 && id.bytes().all(|b|b.is_ascii_hexdigit())) ||
+        (id.len()==36 && id.bytes().enumerate().all(|(i,b)|if [8,13,18,23].contains(&i) {b==b'-'} else {b.is_ascii_hexdigit()}))
+}
+
+fn claude_input_event(event:&serde_json::Value,input:&str)->bool {
+    if event["type"]!="user" {return false;}
+    let content=&event["message"]["content"];
+    content.as_str().or_else(||content.as_array().filter(|a|a.len()==1 && a[0]["type"]=="text")
+        .and_then(|a|a[0]["text"].as_str())).is_some_and(|s|s.trim()==input)
+}
+
+/// One pre-submission permission/baseline read, using the same bounded native decoder.
+fn claude_history(path:&Path,before:usize,mut visit:impl FnMut(serde_json::Value))->Result<usize,String> {
+    let mut reader=NativeHistory::default();let mut count=0;
+    let until=std::time::Instant::now()+std::time::Duration::from_secs(5);
+    loop {
+        let complete=reader.read(path,|v| {if count>=before {visit(v);}count+=1;Ok(())})?;
+        if complete {
+            if count<before {return Err("Claude history truncated before input boundary".into());}
+            return Ok(count);
+        }
+        if std::time::Instant::now()>=until {return Err("Claude baseline scan exceeded 5 seconds; no input submitted".into());}
+    }
+}
+
+#[derive(Default)]
+struct ClaudeHistory {
+    reader: NativeHistory,
+    count: usize,
+    found: bool,
+    ended: bool,
+    answer: Option<String>,
+}
+
+impl ClaudeHistory {
+    fn read(&mut self,path:&Path,before:usize,input:&str,log:&Path)->Result<bool,String> {
+        let mut output=File::options().create(true).append(true).open(log).map_err(|e|e.to_string())?;
+        let Self {reader,count,found,ended,answer}=self;
+        let complete=reader.read(path,|v| {
+            let starts=*count>=before && claude_input_event(&v,input);
+            if starts && *found {return Err("Claude original input appears in multiple turns; inspect native submissions".into());}
+            if (*found || starts) && !*ended {
+                writeln!(output,"{v}").map_err(|e|format!("Claude native observation log failed: {e}"))?;
+                if v["type"]=="assistant" {
+                    if let Some(text)=v["message"]["content"].as_array().and_then(|blocks|blocks.iter().rev().find_map(|b|(b["type"]=="text").then(||b["text"].as_str()).flatten())) {
+                        *answer=Some(text.to_owned());
+                    }
+                }
+                *ended=v["type"]=="system" && v["subtype"]=="turn_duration";
+            }
+            *found|=starts;*count+=1;
+            Ok(())
+        })?;
+        if !complete {return Err("Claude native history scan pending; retry observation without submission".into());}
+        if *count<before {return Err("Claude history truncated before submitted input boundary".into());}
+        Ok(*found)
+    }
+}
+
+/// Native intent locates a candidate; only its user-message readback can establish acceptance.
+fn claude_job_input(home:&Path,id:&str,session:&str,root:&Path,input:&str,budget:&mut u64)->Result<bool,String> {
+    #[derive(serde::Deserialize)]
+    struct Input {cwd:String,#[serde(rename="sessionId")] session:String,intent:Option<String>}
+    let path=home.join("jobs").join(id).join("state.json");
+    let meta=std::fs::metadata(&path).map_err(|_|"Claude native input locator unavailable; inspect original job")?;
+    if !meta.is_file() || meta.len()>1024*1024 {return Err("Claude native input locator is nonregular or exceeds 1 MiB".into());}
+    let mut reader=File::open(path).map_err(|_|"Claude native input locator unreadable")?.take(budget.saturating_add(1));
+    let limit=reader.limit();
+    // Deserialize only locator fields; provider environment and other payloads are never retained or logged.
+    let value:Result<Input,_>=serde_json::from_reader(&mut reader);
+    *budget=budget.checked_sub(limit-reader.limit()).ok_or("Claude recovery scan exceeds 8 MiB; original submission remains unknown")?;
+    let value=value.map_err(|_|"Claude native input locator invalid")?;
+    if value.session!=session || Path::new(&value.cwd).canonicalize().map_err(|_|"Claude native input locator project unavailable")?!=root {
+        return Err("Claude native input locator identity differs from native job list".into());
+    }
+    Ok(value.intent.as_deref().is_some_and(|text|text.trim()==input))
+}
+
+fn claude_stop(root: &Path, id: &str, known: Option<&coreq::process::Identity>) -> Result<(), String> {
+    if !native_job_id(id) {return Err("Claude native job identity unavailable; reconcile the original input before stopping".into());}
     let rows = claude_agents(root)?;
     let row = rows.iter().find(|v| v["id"] == id).ok_or("Claude stop identity unavailable")?;
-    let pid = claude_pid(row)?.unwrap_or(known_pid);
-    if claude_stopped(row, pid)? { return Ok(()); }
+    if let (Some(pid),Some(saved))=(claude_pid(row)?,known) {
+        if pid!=saved.pid {return Err("Claude native process changed; preserve the execution for reconciliation".into());}
+    }
+    // An unknown outcome must not prevent requesting native cancellation of the known job.
+    if matches!(claude_stopped(row, known),Ok(true)) { return Ok(()); }
     let (ok, out) = probe("runtime.stop", &which("claude"), &["stop", id]).ok_or("Claude stop unavailable or timed out; state unknown")?;
     if !ok { return Err(format!("claude stop: {out}")); }
     // Native stop acknowledges the request first; the service owns later retries/readback.
     let rows = claude_agents(root)?;
     let row = rows.iter().find(|v| v["id"] == id).ok_or("stopped Claude session disappeared; state unknown")?;
-    if claude_stopped(row, pid)? { Ok(()) } else { Err("Claude stop still pending; do not launch another turn".into()) }
+    if claude_stopped(row, known)? { Ok(()) } else { Err("Claude stop still pending; do not launch another turn".into()) }
 }
 
 fn claude_pid(row: &serde_json::Value) -> Result<Option<u32>, String> {
@@ -965,14 +1272,49 @@ fn claude_pid(row: &serde_json::Value) -> Result<Option<u32>, String> {
     row["pid"].as_u64().and_then(|n| u32::try_from(n).ok()).filter(|n| *n > 0).map(Some).ok_or_else(|| "Claude process identity invalid".into())
 }
 
-fn claude_stopped(row: &serde_json::Value, known_pid: u32) -> Result<bool, String> {
+fn claude_stopped(row: &serde_json::Value, known: Option<&coreq::process::Identity>) -> Result<bool, String> {
     let state = row["state"].as_str().ok_or("Claude state unavailable; stop unknown")?;
-    if claude_pid(row)?.is_some() || state == "working" { return Ok(false); }
-    if known_pid == 0 { Ok(true) } else { liveness(known_pid).map(|live| !live) }
+    let pid=claude_pid(row)?;
+    if !matches!(state,"working"|"idle"|"done"|"blocked"|"failed"|"crashed"|"stopped") {
+        return Err(format!("Claude state {state:?} unsupported; inspect native lifecycle before release"));
+    }
+    if matches!(state,"working"|"idle") || pid.is_some() { return Ok(false); }
+    // Native stop may retain done; work state alone never establishes process exit.
+    let known=known.ok_or("Claude process exit evidence unavailable; inspect the original native job before release")?;
+    coreq::process::identity(known.pid).map(|current|current.as_ref()!=Some(known)).map_err(|e|format!("Claude process identity unreadable: {e}"))
 }
 
 impl ClaudeTurn {
-    pub fn start(env: &Env, l: &Launch, log: &Path, text: &str, access: &crate::policy::Effective) -> Result<Self, String> {
+    fn recover_job(&mut self,rows:&[serde_json::Value],home:Option<&Path>)->Result<(),String> {
+        if self.accepted || (!self.id.is_empty() && self.launch_error.is_none()) {return Ok(());}
+        let home=home.ok_or("Claude native home unavailable; original submission remains unknown")?;
+        let mut budget=8*1024*1024;
+        let mut matched=None;
+        for row in rows {
+            if row["kind"]=="interactive" {continue;}
+            if row["kind"]!="background" {return Err("Claude recovery job kind unknown".into());}
+            let root=row["cwd"].as_str().ok_or("Claude recovery project unknown")?;
+            // Native --cwd includes descendants; TaskQ submits the exact canonical project root.
+            if Path::new(root)!=self.root {continue;}
+            let session=row["sessionId"].as_str().filter(|s|s.len()==36 && native_job_id(s)).ok_or("Claude recovery session unknown")?;
+            let id=row["id"].as_str().filter(|id|native_job_id(id)).ok_or("Claude native job identity unavailable during recovery")?;
+            if session!=self.session && !claude_job_input(home,id,session,&self.root,&self.input,&mut budget)? {continue;}
+            if matched.is_some() {return Err("Claude original input matches multiple native candidates; inspect them before release".into());}
+            matched=Some((id.to_owned(),session.to_owned()));
+        }
+        let (id,session)=matched.ok_or("Claude original input not found; submission remains unknown; retry native observation")?;
+        if !self.session.is_empty() && session!=self.session {return Err(format!("Claude original input found in copied job {id}; conversation identity differs; inspect native state"));}
+        let before=if session==self.session {self.before} else {0};
+        if !self.history.read(&claude_transcript_in(home,&session)?,before,&self.input,&self.log)? {
+            return Err("Claude original input not found; submission remains unknown; retry native observation".into());
+        }
+        self.id=id;
+        self.session=session;
+        self.accepted=true;
+        Ok(())
+    }
+
+    pub fn start(env: &Env, l: &Launch, log: &Path, text: &str, access: &crate::policy::Effective) -> Result<Self, StartError> {
         let permission_mode = access.claude.as_deref().unwrap_or(env.permission_mode);
         let root = env.root.canonicalize().map_err(|e| e.to_string())?;
         let mut expected_id = None;
@@ -980,71 +1322,135 @@ impl ClaudeTurn {
         if l.resume.is_some() {
             let rows = claude_agents(&root)?;
             let row = rows.iter().find(|v| v["sessionId"] == l.session).ok_or("Claude background session unavailable; no replacement")?;
-            if row["pid"].as_u64().is_some() { return Err("Claude session is still running; no copy started".into()); }
+            // The caller releases the previous execution before continuation; reject contradictory native liveness.
+            if claude_pid(row)?.is_some() { return Err("Claude session is still running; no copy started".into()); }
             expected_id = Some(row["id"].as_str().ok_or("Claude background ID missing")?.to_string());
             let path = claude_transcript(&l.session).ok_or("Claude saved permissions unavailable")?;
-            let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-            before = text.lines().count();
-            let mode = text.lines().rev().filter_map(|s| serde_json::from_str::<serde_json::Value>(s).ok())
-                .find_map(|v| v["permissionMode"].as_str().map(String::from)).ok_or("Claude saved permission mode unknown")?;
+            let mut mode=None;
+            before=claude_history(&path,0,|v|{if let Some(m)=v["permissionMode"].as_str() {mode=Some(m.to_owned());}})?;
+            let mode=mode.ok_or("Claude saved permission mode unknown")?;
             if mode != permission_mode { return Err("Claude saved permission mode differs; a new attempt is required".into()); }
         }
         std::fs::create_dir_all(log.parent().ok_or("missing log directory")?).map_err(|e| e.to_string())?;
-        let mut file = File::options().create(true).append(true).open(log).map_err(|e| e.to_string())?;
         let mut c = executable(which("claude"), access, env)?;
         environment(env, l, &mut c);
-        let (input, input_file) = claude_input(&root, text)?;
+        let (input, input_file, path) = claude_input(&root, text, Some(l))?;
+        bind_input(log,l,&path,&input,serde_json::json!({"session":l.session,"job":expected_id,"before":before,"permission_mode":permission_mode}))?;
         c.current_dir(&root).arg("--bg");
         if l.resume.is_some() { c.args(["--resume", &l.session]); }
         else { c.args(["--settings", &compact_settings(&root, l), "--remote-control", &l.title, "--permission-mode", permission_mode]); }
         if l.role == "operator" { for k in ["TASKQ_TASK", "TASKQ_ATTEMPT", "TASKQ_ROLE"] { c.env_remove(k); } }
-        let mut child = crate::platform::quiet(&mut c).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| e.to_string())?;
-        if let Err(e) = child.stdin.take().unwrap().write_all(input.as_bytes()) {
-            return Err(format!("Claude background input: {e}; launch outcome unknown"));
-        }
-        let out = child.wait_with_output().map_err(|e| e.to_string())?;
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        writeln!(file, "{}", serde_json::json!({"type":"claude.launch", "stdout":stdout, "stderr":stderr})).map_err(|e| e.to_string())?;
-        if !out.status.success() { return Err(format!("Claude background launch failed: {stderr}")); }
-        let id = stdout.lines().find_map(|line| line.strip_prefix("backgrounded · ").and_then(|s| s.split_whitespace().next())).ok_or("Claude returned no background ID; launch outcome unknown")?;
-        if expected_id.as_deref().is_some_and(|expected| expected != id) {
-            claude_stop(&root, id, 0)?;
-            return Err("Claude created a copy; stopped owned copy, original conversation preserved".into());
-        }
-        Ok(Self { root, log: log.into(), session: if l.resume.is_some() { l.session.clone() } else { String::new() }, id: id.into(),
-            announced: false, copied: 0, before, mode: permission_mode.into(), input, _input_file: input_file, pid: 0, done: false, failure: None })
+        let mut turn=Self { root, log: log.into(), session: if l.resume.is_some() { l.session.clone() } else { String::new() }, id: expected_id.unwrap_or_default(),
+            announced: false, accepted:false, history:ClaudeHistory::default(), before, mode: permission_mode.into(), input, _input_file: input_file, pid: 0, native:None, recovery:None, done: false, failure: None, launch_error:None };
+        let out=coreq::process::exchange("runtime.claude-launch", &mut c, turn.input.as_bytes(), std::time::Duration::from_secs(30));
+        turn.finish_launch(out)?;
+        Ok(turn)
+    }
+
+    fn finish_launch(&mut self,out:Result<std::process::Output,coreq::process::Failure>)->Result<(),StartError> {
+        let out=match out {
+            Ok(out)|Err(coreq::process::Failure::Exit(out))=>out,
+            Err(e)=>{
+                use coreq::process::Failure;
+                if matches!(e,Failure::InvalidDeadline|Failure::Capacity|Failure::Owner(_)|Failure::Spawn(_)|Failure::InputLimit) {
+                    return Err(StartError {message:format!("Claude background launch: {e}"),reportable:false,no_start:true});
+                }
+                self.launch_error=Some(format!("Claude background launch outcome unknown: {e}; reconcile the original input"));
+                return Ok(());
+            }
+        };
+        let stdout=String::from_utf8_lossy(&out.stdout);
+        let stderr=String::from_utf8_lossy(&out.stderr);
+        let returned=stdout.lines().find_map(|line|line.strip_prefix("backgrounded · ").and_then(|s|s.split_whitespace().next())).filter(|id|native_job_id(id));
+        if let Some(id)=returned {
+            if !self.id.is_empty() && self.id!=id {self.launch_error=Some("Claude returned a different background job; reconcile the original input and session".into());}
+            self.id=id.into();
+        } else {self.launch_error=Some("Claude returned no valid background ID; launch outcome unknown; reconcile the original input".into());}
+        if !out.status.success() {self.launch_error.get_or_insert_with(||format!("Claude launch response failed: {stderr}; submission outcome unknown"));}
+        let recorded=File::options().append(true).open(&self.log).and_then(|mut file|
+            writeln!(file,"{}",serde_json::json!({"type":"claude.launch","stdout":stdout,"stderr":stderr})));
+        if let Err(e)=recorded {self.launch_error.get_or_insert_with(||format!("Claude launch observation not recorded: {e}; native handle retained"));}
+        Ok(())
     }
 }
 
 impl Proc for ClaudeTurn {
+    fn checkpoint(&mut self,cfg:&crate::service::Config,l:&Launch,execution:u64)->Result<(),String> {
+        self.recovery=Some(Recovery {install:cfg.install.clone(),root:cfg.root.clone(),task:l.task,attempt:l.attempt,execution});
+        let rows=claude_agents(&self.root)?;
+        self.recover_job(&rows,claude_home().as_deref())?;
+        let row=rows.iter().find(|v|v["id"]==self.id).ok_or("Claude checkpoint job unavailable; preserve original input")?;
+        self.capture_identity(row)?;
+        self.persist()
+    }
+    fn native_identity(&self)->Result<coreq::process::Identity,String> {self.native.clone().ok_or("Claude original process identity unavailable".into())}
+    fn input_offset(&self)->Result<u64,String> {Ok(0)}
+    fn accepted(&mut self) -> Result<bool, String> {
+        if self.accepted {Ok(true)} else if let Some(e)=&self.launch_error {Err(e.clone())} else {Ok(false)}
+    }
     fn exited(&mut self) -> Result<Option<i32>, String> {
         if self.done { return Ok(Some(0)); }
         let rows = claude_agents(&self.root)?;
+        self.recover_job(&rows,claude_home().as_deref())?;
         let row = rows.iter().find(|v| v["id"] == self.id).ok_or("Claude session unavailable; state unknown")?;
-        self.observe(row)
+        let observed=self.observe(row);
+        if self.accepted {self.launch_error=None;}
+        if matches!(observed,Ok(None)) && self.launch_error.is_some() {return Err(self.launch_error.clone().unwrap());}
+        observed
     }
     fn exit_error(&self) -> Option<&'static str> { self.failure }
     fn kill(&mut self) -> Result<(), String> {
-        claude_stop(&self.root, &self.id, self.pid)?;
+        let rows=claude_agents(&self.root)?;
+        self.recover_job(&rows,claude_home().as_deref())?;
+        let row=rows.iter().find(|v|v["id"]==self.id).ok_or("Claude stop identity unavailable")?;
+        self.capture_identity(row)?;
+        if let Err(e)=self.persist() {log!("Claude recovery checkpoint failed before stop: {e}");}
+        claude_stop(&self.root, &self.id, self.native.as_ref())?;
         self.done = true;
         Ok(())
     }
-    fn id(&self) -> u32 { self.pid }
+    fn id(&self) -> u32 { self.native.as_ref().map_or(self.pid,|n|n.pid) }
 }
 
 impl ClaudeTurn {
+    fn capture_identity(&mut self,row:&serde_json::Value)->Result<(),String> {
+        if row["id"]!=self.id || !self.session.is_empty() && row["sessionId"]!=self.session {
+            return Err("Claude process locator differs from the original native job".into());
+        }
+        if let Some(pid)=claude_pid(row)? {
+            if self.native.as_ref().is_some_and(|n|n.pid!=pid) {return Err("Claude native process changed; reconcile original execution".into());}
+            let current=coreq::process::identity(pid).map_err(|e|format!("Claude process identity unreadable: {e}"))?.ok_or("Claude reported process absent; retry native readback")?;
+            if self.native.as_ref().is_some_and(|n|*n!=current) {return Err("Claude PID incarnation changed; original identity retained".into());}
+            self.native=Some(current);
+            self.pid=pid;
+        }
+        Ok(())
+    }
+    fn persist(&mut self)->Result<(),String> {
+        let Some(r)=&self.recovery else {return Ok(())};
+        let row=crate::data::KidLine {task:r.task,attempt:r.attempt,runtime:"claude".into(),process:self.native_identity()?,execution:r.execution,offset:0,job:None};
+        crate::checkpoint_kid(&r.install,&r.root,row).map_err(|e|format!("Claude native recovery checkpoint failed: {e}"))?;
+        self.recovery=None;
+        Ok(())
+    }
     fn observe(&mut self, row: &serde_json::Value) -> Result<Option<i32>, String> {
-        // Failed background launches can have neither status nor a transcript (#1208).
+        // Job outcome and process exit are separate native observations.
         let state = row["state"].as_str().ok_or("Claude job state unavailable; state unknown")?;
+        if !matches!(state,"working"|"idle"|"done"|"blocked"|"failed"|"crashed"|"stopped") {
+            return Err(format!("Claude state {state:?} unsupported; inspect native lifecycle before release"));
+        }
+        self.capture_identity(row)?;
+        self.persist()?;
         if !matches!(state, "working" | "idle" | "done" | "blocked") {
-            if !claude_stopped(row, self.pid)? { return Err("Claude reports terminal state with a live process; exit unconfirmed".into()); }
+            if !self.accepted && (self.launch_error.is_some() || self.before>0) {
+                return Err(format!("Claude job {state}; current input acceptance unconfirmed, reconcile the original submission"));
+            }
+            if !claude_stopped(row, self.native.as_ref())? { return Err(format!("Claude job {state}; native process exit unconfirmed; inspect the original job")); }
             self.failure = Some(claude_failure(row, &self.root, &self.id, claude_home().as_deref()));
             return Ok(Some(-1));
         }
         // On Windows a waking session briefly publishes a different UUID before restore.
         if !self.announced {
-            if row["status"].as_str().is_none() { return Ok(None); }
             let session = row["sessionId"].as_str().ok_or("Claude session ID unknown")?;
             if !self.session.is_empty() && self.session != session { return Err("Claude resumed another conversation; identity unknown".into()); }
             self.session = session.into();
@@ -1054,20 +1460,13 @@ impl ClaudeTurn {
         }
         self.pid = claude_pid(row)?.unwrap_or(self.pid);
         let path = claude_transcript(&self.session).ok_or("Claude transcript unavailable; completion unknown")?;
-        let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-        let events: Vec<serde_json::Value> = content.lines().skip(self.before).filter_map(|line| serde_json::from_str(line).ok()).collect();
-        let Some(start) = events.iter().rposition(|v| v["type"] == "user" && v["message"]["content"].as_str().is_some_and(|s| s.trim() == self.input)) else { return Ok(None); };
-        let turn = &events[start..];
-        let mut log = File::options().append(true).open(&self.log).map_err(|e| e.to_string())?;
-        for event in turn.iter().skip(self.copied) { writeln!(log, "{event}").map_err(|e| e.to_string())?; }
-        self.copied = turn.len();
-        if row["status"] != "idle" && row["state"] != "done" && row["state"] != "blocked" {
-            return Ok(None);
-        }
-        if !turn.iter().any(|v| v["type"] == "system" && v["subtype"] == "turn_duration") { return Ok(None); }
-        let answer = turn.iter().rev().filter(|v| v["type"] == "assistant").find_map(|v|
-            v["message"]["content"].as_array()?.iter().rev().find_map(|b| (b["type"] == "text").then(|| b["text"].as_str()).flatten())).ok_or("Claude completed without final text; inspect native logs")?;
-        if self.pid != 0 { claude_stop(&self.root, &self.id, self.pid)?; }
+        if !self.history.read(&path,self.before,&self.input,&self.log)? {return Ok(None);}
+        self.accepted=true;
+        if row["status"]!="idle" && row["state"]!="done" && row["state"]!="blocked" {return Ok(None);}
+        if !self.history.ended {return Ok(None);}
+        let answer=self.history.answer.as_deref().ok_or("Claude completed without final text; inspect native logs")?;
+        let mut log=File::options().append(true).open(&self.log).map_err(|e|e.to_string())?;
+        claude_stop(&self.root, &self.id, self.native.as_ref())?;
         writeln!(log, "{}", serde_json::json!({"type":"result", "session_id":self.session, "result":answer})).map_err(|e| e.to_string())?;
         self.done = true;
         Ok(Some(0))
@@ -1094,20 +1493,25 @@ pub fn claude_background(root: &Path, session: &str) -> Result<bool, String> {
 
 const HANDSHAKE: &str = "taskq handshake: reply OK and do nothing else. The task follows in this thread.\n";
 
-/// A `codex-app` attempt (§ 3 app lease): the handshake child, then the turn queued into the Codex app, live until
-/// the thread's rollout has a new `task_complete` or the app stops running.
+/// A `codex-app` attempt stays owned until its exact native input and turn completion are observed.
 pub struct AppTurn {
+    root: PathBuf,
+    history: AppHistory,
     hand: Option<Box<dyn Proc>>,
     log: PathBuf,
     /// The brief, or the resume text, to queue.
     text: String,
     _input: Option<crate::data::InputLock>,
+    binding: Option<serde_json::Value>,
     thread: String,
     /// `task_complete` events of the thread before the queued text.
     done: usize,
     rollout: Option<PathBuf>,
     running: fn() -> Result<bool, String>,
+    control: fn(&str,&str)->Result<(),String>,
     cancelled: bool,
+    queue_error: Option<String>,
+    accepted: bool,
 }
 
 impl AppTurn {
@@ -1118,9 +1522,12 @@ impl AppTurn {
         }
         self.rollout = rollout(&self.thread);
         self.done = completes(self.rollout.as_ref().ok_or("Codex rollout unavailable; turn baseline unknown")?)?;
-        let ok = |c: &mut Command| crate::platform::quiet(c).status().is_ok_and(|s| s.success());
+        if let Some(binding)=&mut self.binding {
+            binding["native"]=serde_json::json!({"thread":self.thread,"baseline":self.done});
+            record_input(&self.log,binding)?;
+        }
+        let ok = |c: &mut Command| coreq::process::output("runtime.app-submit", c, std::time::Duration::from_secs(10)).is_ok();
         let url = format!("codex://threads/{}", self.thread);
-        // ponytail: `open` and `queue` block the pass for a moment; a thread per turn if they ever hang
         let opened = if cfg!(windows) { ok(Command::new("cmd").args(["/C", "start", "", &url])) } else { ok(Command::new("open").arg(&url)) };
         if !opened || !ok(codex_direct().args(["queue", "--thread", &self.thread, "--message", &self.text])) {
             return Err(format!("codex queue failed for thread {}", self.thread));
@@ -1146,34 +1553,39 @@ fn codex_direct() -> Command {
 }
 
 impl Proc for AppTurn {
+    fn accepted(&mut self) -> Result<bool, String> { Ok(self.accepted) }
     fn exited(&mut self) -> Result<Option<i32>, String> {
         if let Some(h) = &mut self.hand {
             let Some(code) = h.exited()? else { return Ok(None) };
             self.hand = None;
             if self.cancelled { return Ok(Some(code)); }
             self.thread = codex_thread(&self.log).unwrap_or_default();
-            if self.thread.is_empty() || self.queue().is_err() {
-                return Ok(Some(if code == 0 { -1 } else { code }));
+            if self.thread.is_empty() { return Ok(Some(if code == 0 { -1 } else { code })); }
+            if let Err(e) = self.queue() {
+                self.queue_error = Some(format!("{e}; submission outcome unknown"));
+                return Err(self.queue_error.clone().unwrap());
             }
             return Ok(None);
         }
-        if !(self.running)()? {
-            return Ok(Some(-1));
-        }
+        if !(self.running)()? { return Err("Codex app unavailable; submitted turn termination unconfirmed".into()); }
         if self.rollout.is_none() {
             self.rollout = rollout(&self.thread);
         }
-        let count = completes(self.rollout.as_ref().ok_or("Codex rollout unavailable; completion unknown")?)?;
-        if count < self.done { return Err("Codex rollout truncated; completion unknown".into()); }
-        Ok((count > self.done).then_some(0))
+        let (accepted, ended) = self.history.read(self.rollout.as_ref().ok_or("Codex rollout unavailable; completion unknown")?, self.done, &self.text, &self.root, &self.thread)?;
+        self.accepted |= accepted;
+        if self.accepted {self.queue_error=None;}
+        if ended { return Ok(Some(if self.history.aborted {-1} else {0})); }
+        if let Some(e) = &self.queue_error { return Err(e.clone()); }
+        Ok(None)
     }
     fn kill(&mut self) -> Result<(), String> {
-        self.cancelled = true;
-        // the app turn itself cannot be stopped from outside: it runs on, fenced (§ 3 app lease)
         if let Some(h) = &mut self.hand {
-            h.kill()?;
+            self.cancelled = true;
+            return h.kill();
         }
-        Ok(())
+        if self.exited()?.is_some() { return Ok(()); }
+        let turn=self.history.owned.as_deref().ok_or("Codex App input acceptance unknown; cancellation cannot target a native turn")?;
+        (self.control)(&self.thread,turn)
     }
     fn id(&self) -> u32 {
         self.hand.as_ref().map(|h| h.id()).unwrap_or(0)
@@ -1235,20 +1647,141 @@ pub(crate) fn rollout(thread: &str) -> Option<PathBuf> {
     find(&home.join("sessions"), &format!("{thread}.jsonl"))
 }
 
+/// Volatile cursor over the native append-only history; restart rebuilds it without replaying work.
+#[derive(Default)]
+struct NativeHistory {
+    path: Option<PathBuf>,
+    metadata: Option<std::fs::Metadata>,
+    offset: u64,
+    boundary: Vec<u8>,
+}
+
+impl NativeHistory {
+    fn read(&mut self,path:&Path,mut visit:impl FnMut(serde_json::Value)->Result<(),String>)->Result<bool,String> {
+        self.lines(path,|line| {
+            let event:serde_json::Value=serde_json::from_str(line).map_err(|_|"native history record invalid")?;
+            if event["type"].as_str().is_none() {return Err("native history record shape invalid".into());}
+            visit(event)
+        })
+    }
+    fn lines(&mut self,path:&Path,mut visit:impl FnMut(&str)->Result<(),String>)->Result<bool,String> {
+        use std::io::{Seek,SeekFrom};
+        const LIMIT:u64=8*1024*1024;
+        let mut file=File::open(path).map_err(|e|format!("native history unavailable: {e}"))?;
+        let meta=file.metadata().map_err(|e|e.to_string())?;
+        if !meta.is_file() {return Err("native history is not a regular file".into());}
+        if let Some(old)=&self.metadata {
+            #[cfg(unix)]
+            {use std::os::unix::fs::MetadataExt;
+                if (old.dev(),old.ino())!=(meta.dev(),meta.ino()) {return Err("native history file replaced; reconcile original input".into());}
+            }
+            if self.path.as_deref()!=Some(path) || old.created().ok()!=meta.created().ok() {
+                return Err("native history identity changed; reconcile original input".into());
+            }
+            if meta.len()<self.offset || meta.len()<old.len() {return Err("native history truncated; completion unknown".into());}
+            if meta.len()==old.len() && meta.modified().ok()!=old.modified().ok() {return Err("native history rewritten; completion unknown".into());}
+        }
+        if !self.boundary.is_empty() {
+            file.seek(SeekFrom::Start(self.offset-self.boundary.len() as u64)).map_err(|e|e.to_string())?;
+            let mut bytes=vec![0;self.boundary.len()];file.read_exact(&mut bytes).map_err(|e|e.to_string())?;
+            if bytes!=self.boundary {return Err("native history boundary changed; completion unknown".into());}
+        }
+        self.path=Some(path.into());self.metadata=Some(meta);
+        file.seek(SeekFrom::Start(self.offset)).map_err(|e|e.to_string())?;
+        let mut reader=BufReader::new(file.take(LIMIT+1));
+        let (mut line,mut consumed)=(String::new(),0u64);
+        loop {
+            line.clear();
+            let size=reader.read_line(&mut line).map_err(|e|format!("native history read failed: {e}"))? as u64;
+            if size==0 {break;}
+            if size>LIMIT {return Err("native history record exceeds 8 MiB; completion unknown".into());}
+            if consumed+size>LIMIT {return Ok(false);}
+            if !line.ends_with('\n') {return Err("native history record incomplete; retry observation".into());}
+            visit(&line)?;
+            self.offset+=size;consumed+=size;
+            self.boundary=line.as_bytes()[line.len().saturating_sub(64)..].to_vec();
+        }
+        let length=reader.get_ref().get_ref().metadata().map_err(|e|e.to_string())?.len();
+        if length<self.offset {return Err("native history truncated while reading".into());}
+        Ok(length==self.offset)
+    }
+}
+
+#[derive(Default)]
+struct AppHistory {
+    reader: NativeHistory,
+    count: usize,
+    current: Option<String>,
+    owned: Option<String>,
+    ended: bool,
+    aborted: bool,
+    identity: bool,
+}
+
+/// Match this submission and its native turn id; another user turn cannot release its fence.
+impl AppHistory {
+    fn read(&mut self,path:&Path,baseline:usize,input:&str,root:&Path,thread:&str)->Result<(bool,bool),String> {
+        let Self {reader,count,current,owned,ended,aborted,identity}=self;
+        let complete=reader.read(path,|v| {
+            if v["type"] == "event_msg" && !v["payload"].is_object() {return Err("Codex rollout record shape invalid".into());}
+            if v["type"] == "session_meta" {
+                let meta=&v["payload"];
+                if *identity || meta["id"]!=thread || meta["cwd"].as_str().and_then(|p|Path::new(p).canonicalize().ok()).as_deref()!=Some(root)
+                    || !meta["forked_from_id"].is_null() {
+                    return Err("Codex native session identity differs or is copied; inspect the original submission".into());
+                }
+                *identity=true;
+            }
+            if v["type"] != "event_msg" {return Ok(());}
+            if !*identity {return Err("Codex native session identity missing before turn events".into());}
+            let p=&v["payload"];
+            if *count>=baseline {
+                match p["type"].as_str() {
+                    Some("task_started")=>*current=p["turn_id"].as_str().map(String::from),
+                    Some(kind) if (kind=="user_message" && p["message"].as_str()==Some(input))
+                        || (kind=="item_completed" && p["item"]["type"]=="UserMessage"
+                            && p["item"]["content"].as_array().is_some_and(|parts|parts.len()==1 && parts[0]["type"]=="text" && parts[0]["text"].as_str().is_some_and(|text|text==input || text.strip_suffix('\n')==Some(input))))=>{
+                        let id=current.clone().ok_or("Codex submitted input has no native turn identity")?;
+                        if kind=="item_completed" && (p["thread_id"]!=thread || p["turn_id"].as_str()!=Some(id.as_str())) {
+                            return Err("Codex submitted user item has conflicting native thread/turn identity".into());
+                        }
+                        if p["turn_id"].as_str().is_some_and(|turn|turn!=id) {return Err("Codex submitted input has conflicting native turn identity".into());}
+                        if owned.is_some() {return Err("Codex submitted input matches multiple native messages".into());}
+                        *owned=Some(id);
+                    },
+                    Some(kind @ ("task_complete"|"turn_aborted")) if owned.is_some() && p["turn_id"].as_str()==owned.as_deref()=>{
+                        let cancelled=kind=="turn_aborted";
+                        if *ended && *aborted!=cancelled {return Err("Codex native terminal outcomes conflict; reconcile original turn".into());}
+                        *ended=true;*aborted=cancelled;
+                    },
+                    _=>{},
+                }
+            }
+            if p["type"]=="task_complete" {*count+=1;*current=None;}
+            if p["type"]=="turn_aborted" && p["turn_id"].as_str()==current.as_deref() {*current=None;}
+            Ok(())
+        })?;
+        if !complete {return Err("Codex native history scan pending; retry observation without queueing".into());}
+        if !*identity {return Err("Codex native session identity unavailable".into());}
+        if *count<baseline {return Err("Codex rollout truncated; completion unknown".into());}
+        Ok((owned.is_some(),*ended))
+    }
+}
+
 /// Finished turns in a rollout: its `task_complete` events.
 fn completes(rollout: &Path) -> Result<usize, String> {
     coreq::telemetry::capture::operation("runtime.turn-readback", || {
-    let f = File::open(rollout).map_err(|_| "Codex rollout unreadable; completion unknown")?;
-    let mut count = 0;
-    for line in BufReader::new(f).lines() {
-        let line = line.map_err(|_| "Codex rollout read failed; completion unknown")?;
-        let v: serde_json::Value = serde_json::from_str(&line).map_err(|_| "Codex rollout record incomplete or invalid; completion unknown")?;
-        if v["type"].as_str().is_none() || v["type"] == "event_msg" && !v["payload"].is_object() {
-            return Err("Codex rollout record shape invalid; completion unknown".into());
+        let mut reader=NativeHistory::default();let mut count=0;
+        let until=std::time::Instant::now()+std::time::Duration::from_secs(5);
+        loop {
+            let complete=reader.read(rollout,|v| {
+                if v["type"]=="event_msg" && !v["payload"].is_object() {return Err("Codex rollout record shape invalid".into());}
+                count+=usize::from(v["type"]=="event_msg" && v["payload"]["type"]=="task_complete");
+                Ok(())
+            })?;
+            if complete {return Ok(count);}
+            if std::time::Instant::now()>=until {return Err("Codex baseline scan exceeded 5 seconds; no input queued".into());}
         }
-        count += usize::from(v["type"] == "event_msg" && v["payload"]["type"] == "task_complete");
-    }
-    Ok(count)
     }, |_| "readback")
 }
 
@@ -1334,7 +1867,168 @@ pub fn agent_text(r: &serde_json::Value) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::process::Stdio;
     use super::*;
+
+    // Chain: installed npm entrypoint -> exact native executable -> owned process identity.
+    // Risk: tracking a launcher lets its child survive cancellation and falsely releases capacity.
+    #[cfg(unix)]
+    #[test]
+    fn codex_launch_resolves_native_package_without_wrapper_fallback() {
+        let root=std::env::temp_dir().join(format!("taskq-codex-package-{}",uuid()));
+        let package=root.join("node_modules/@openai/codex");let bin=package.join("bin/codex.js");
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();std::fs::write(&bin,"#!/usr/bin/env node\n").unwrap();
+        std::fs::write(package.join("package.json"),r#"{"name":"@openai/codex"}"#).unwrap();
+        assert!(codex_native(bin.clone()).is_err(),"a missing native package must not run the launcher");
+        for target in ["aarch64-apple-darwin","x86_64-apple-darwin","aarch64-unknown-linux-musl","x86_64-unknown-linux-musl"] {
+            let path=package.join(format!("vendor/{target}/bin/codex"));std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path,b"\x7fELFfixture").unwrap();
+        }
+        let native=codex_native(bin.clone()).unwrap();
+        assert_ne!(native,bin);assert_eq!(codex_native(native.clone()).unwrap(),native);
+        std::fs::write(&native,"#!/bin/sh\n").unwrap();assert!(codex_native(bin.clone()).is_err());
+        std::fs::write(&native,b"\x7fELFfixture").unwrap();
+        std::fs::write(package.join("package.json"),r#"{"name":"foreign"}"#).unwrap();
+        assert!(codex_native(bin).unwrap_err().contains("identity differs"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // Chain: actual installed Codex entrypoint -> native PID -> stop -> observed exit.
+    // No prompt is sent; EOF cleans up even if an assertion fails before cancellation.
+    #[cfg(any(unix,windows))]
+    #[test]
+    #[ignore="owned installed CLI packaging probe; no model or prompt"]
+    fn native_codex_executable_stop_without_model() {
+        let entry=which("codex");let native=codex_native(entry.clone()).unwrap();
+        let version=coreq::process::output("qualification.codex-version",Command::new(&native).arg("--version"),std::time::Duration::from_secs(5)).unwrap();
+        let mut child=Command::new(&native).args(["exec","--json","-"])
+            .env_remove("CODEX_THREAD_ID").env_remove("CLAUDE_CODE_SESSION_ID")
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        let identity=coreq::process::identity(child.id()).unwrap().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(child.try_wait().unwrap(),None);
+        assert_eq!(coreq::process::identity(child.id()).unwrap(),Some(identity.clone()));
+        coreq::process::terminate(&identity).unwrap();child.wait().unwrap();
+        assert_eq!(coreq::process::identity(identity.pid).unwrap(),None);
+        let output=child.wait_with_output().unwrap();assert!(output.stdout.is_empty(),"no native turn should start without input");
+        println!("{}entry={} native={} pid={} native exit confirmed; no model dispatched",String::from_utf8_lossy(&version.stdout),entry.display(),native.display(),identity.pid);
+    }
+
+    // Chain: actual native Codex -> owner crash -> cold adoption -> cancellation/exit receipt.
+    // The controller holds stdin open; no prompt, model, tools or live board are involved.
+    #[cfg(any(target_os="macos",windows))]
+    #[test]
+    #[ignore="owned installed CLI cold-recovery probe; no model or prompt"]
+    fn native_codex_cold_owner_restart() {
+        let only=std::env::var("TASKQ_NATIVE_OWNER_ONLY").ok();
+        assert!(only.as_deref().is_none_or(|phase|matches!(phase,"cancel"|"ended")),"invalid native fixture selector");
+        for phase in ["cancel","ended"] {
+            if only.as_deref().is_some_and(|selected|selected!=phase) {continue;}
+
+            let root=std::env::temp_dir().join(format!("taskq-native-owner-{phase}-{}",uuid()));
+            std::fs::create_dir_all(&root).unwrap();let root=root.canonicalize().unwrap();
+            let mut command=Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact","runtime::tests::native_codex_owner_child","--ignored","--nocapture"])
+                .env("TASKQ_NATIVE_OWNER_ROOT",&root).env("TASKQ_NATIVE_OWNER_CASE",phase);
+            let mut old=command.env("TASKQ_NATIVE_OWNER_PHASE","before").stdin(Stdio::piped())
+                .stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+            let mut input=Some(old.stdin.take().unwrap());
+            let until=std::time::Instant::now()+std::time::Duration::from_secs(5);
+            while !root.join("ready").exists() {
+                assert!(old.try_wait().unwrap().is_none(),"owner exited before checkpoint");
+                assert!(std::time::Instant::now()<until,"native checkpoint timed out");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let saved:serde_json::Value=serde_json::from_slice(&std::fs::read(root.join("ready")).unwrap()).unwrap();
+            let identity=coreq::process::Identity {pid:saved["pid"].as_u64().unwrap() as u32,started:saved["started"].as_str().unwrap().into()};
+            old.kill().unwrap();old.wait().unwrap();
+            assert_eq!(coreq::process::identity(identity.pid).unwrap(),Some(identity.clone()),"the native executor must survive its owner for this case");
+            if phase=="ended" {
+                drop(input.take());
+                while !coreq::process::identity(identity.pid).is_ok_and(|p|p.is_none()) {
+                    assert!(std::time::Instant::now()<until,"native exit after EOF timed out");
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+            let result=coreq::process::output("qualification.native-cold-owner",command.env("TASKQ_NATIVE_OWNER_PHASE","after")
+                .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()),std::time::Duration::from_secs(10));
+            drop(input);
+            assert!(result.is_ok(),"{phase}: {result:?}");
+            let output=result.unwrap();
+            for line in String::from_utf8_lossy(&output.stdout).lines().filter(|l|l.starts_with("intermediate native readback")) {println!("{phase}: {line}");}
+            assert_eq!(coreq::process::identity(identity.pid).unwrap(),None);
+            let expected=if cfg!(windows) && phase=="ended" {"missing native scope; explicit unknown; evidence retained; no release or replay"}
+                else {"same native execution; acceptance unknown; exit read back; no replay"};
+            assert_eq!(std::fs::read_to_string(root.join("verified")).unwrap(),expected);
+            println!("{phase}: native pid={} survived owner crash; {expected}; no model dispatched",identity.pid);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[cfg(any(target_os="macos",windows))]
+    #[test]
+    #[ignore="native CLI owner process fixture"]
+    fn native_codex_owner_child() {
+        use crate::board::Board;
+        let root=PathBuf::from(std::env::var_os("TASKQ_NATIVE_OWNER_ROOT").unwrap());
+        let b=crate::board::Fake::default();let task=b.create("native fixture","",&[crate::service::TASK_LABEL.into()]).unwrap();
+        let attempt=b.comment(task,"taskq: spawn worker codex:fixture mac").unwrap();
+        let cfg=crate::service::Config {root:root.clone(),install:root.join("install"),..crate::tests::cfg()};
+        let mut service=crate::service::Service::new(&b,&cfg,"native-fixture",Box::new(|_|panic!("native recovery must not dispatch")));
+        if std::env::var("TASKQ_NATIVE_OWNER_PHASE").unwrap()=="before" {
+            let log=attempt_log(&root,"worker",task,attempt);std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+            let output=File::create(&log).unwrap();
+            let mut command=Command::new(codex_native(which("codex")).unwrap());
+            command.args(["exec","--json","-"]).current_dir(&root).env_remove("CODEX_THREAD_ID").env_remove("CLAUDE_CODE_SESSION_ID")
+                .stdin(Stdio::inherit()).stderr(output.try_clone().unwrap()).stdout(output);
+            #[cfg(windows)] let child:Box<dyn Proc>=Box::new(windows_process::Execution::spawn(&mut command).unwrap());
+            #[cfg(not(windows))] let child:Box<dyn Proc>=Box::new(command.spawn().unwrap());
+            let native=child.native_identity().unwrap();
+            let launch=Launch {execution:Some(attempt),task,title:String::new(),attempt,role:"worker".into(),rt:"codex".into(),session:"fixture".into(),url:String::new(),resume:None};
+            let mut proc=CliTurn {proc:child,log,pos:0,start:0,stopping:false,accepted:false,read_error:None,native:Some(native.clone()),recovery:None};
+            proc.checkpoint(&cfg,&launch,attempt).unwrap();
+            service.kids.push(crate::service::Kid {task,attempt,execution:attempt,rt:"codex".into(),proc:Box::new(proc)});
+            crate::data::kids(&std::fs::read_to_string(crate::kids_path(&cfg.install,&root).unwrap()).unwrap()).unwrap();
+            coreq::write_durable(&root.join("ready"),&serde_json::json!({"pid":native.pid,"started":native.started}).to_string()).unwrap();
+            let until=std::time::Instant::now()+std::time::Duration::from_secs(10);
+            loop {assert!(std::time::Instant::now()<until,"controller did not kill the owner");std::thread::sleep(std::time::Duration::from_millis(10));}
+        }
+        #[cfg(windows)]
+        if std::env::var("TASKQ_NATIVE_OWNER_CASE").unwrap()=="ended" {
+            let error=crate::adopt(&mut service,&cfg.install,&root).unwrap_err();
+            assert!(error.contains("native reconciliation"),"{error}");
+            assert!(service.kids.is_empty());assert_eq!(crate::kids_file(&cfg.install,&root).unwrap().len(),1);
+            assert_eq!(crate::core::executions(task,&crate::board::entries(&b,task).unwrap())[0].release,None);
+            std::fs::write(root.join("verified"),"missing native scope; explicit unknown; evidence retained; no release or replay").unwrap();
+            return;
+        }
+        crate::adopt(&mut service,&cfg.install,&root).unwrap();
+        assert_eq!(service.kids.len(),1);assert_eq!(service.kids[0].execution,attempt);
+        if std::env::var("TASKQ_NATIVE_OWNER_CASE").unwrap()=="cancel" {
+            service.reap_owned();assert_eq!(service.kids.len(),1,"a live executor cannot release on owner restart");
+            assert!(!crate::core::executions(task,&crate::board::entries(&b,task).unwrap())[0].accepted);
+            service.kids[0].proc.kill().unwrap();
+        }
+        let until=std::time::Instant::now()+std::time::Duration::from_secs(5);
+        let mut unknown=std::collections::BTreeSet::new();
+        loop {
+            match service.kids[0].proc.exited() {
+                Ok(Some(_))=>break,
+                Err(error)=>{unknown.insert(error);},
+                Ok(None)=>{},
+            }
+            assert!(std::time::Instant::now()<until,"native stop did not finish: {unknown:?}");std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        println!("intermediate native readback errors (never terminal): {unknown:?}");
+        b.state.borrow_mut().fail_comments=1;
+        service.reap_owned();assert_eq!(service.kids.len(),1,"lost exit receipt must retain ownership");
+        assert_eq!(crate::kids_file(&cfg.install,&root).unwrap().len(),1);
+        service.reap_owned();assert!(service.kids.is_empty());
+        let x=crate::core::executions(task,&crate::board::entries(&b,task).unwrap()).remove(0);
+        assert!(!x.accepted);assert_eq!(x.release,Some(crate::core::Release::Exit));
+        assert!(crate::kids_file(&cfg.install,&root).unwrap().is_empty());
+        std::fs::write(root.join("verified"),"same native execution; acceptance unknown; exit read back; no replay").unwrap();
+    }
 
     // Chain: prepared brief -> native stdin -> consumer or non-reading child, with no blocking producer.
     #[test]
@@ -1356,18 +2050,18 @@ mod tests {
                 { use std::os::unix::fs::PermissionsExt; assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600); }
                 std::fs::remove_file(path).unwrap();
             }
-            if mode == "blocked" { let _pending = stop(&mut child); }
+            if mode == "blocked" { let _pending = stop(child.as_mut()); }
             else { std::fs::write(&go, "read now").unwrap(); }
             let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
             let status = loop {
-                if let Some(status) = child.try_wait().unwrap() { break status; }
+                if let Some(status) = child.exited().unwrap() { break status; }
                 if std::time::Instant::now() >= until {
-                    let cleanup = stop(&mut child);
+                    let cleanup = stop(child.as_mut());
                     panic!("input fixture did not finish; cleanup: {cleanup:?}");
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
             };
-            if mode == "read" { assert!(status.success(), "child could not read the original bytes after cache unlink"); }
+            if mode == "read" { assert!(status==0, "child could not read the original bytes after cache unlink"); }
         }
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -1402,9 +2096,95 @@ mod tests {
         #[cfg(unix)]
         {
             let child = spawn(); let pid = child.id(); drop(child);
-            check(&mut Adopted(pid as i32));
+            check(&mut Adopted::new(coreq::process::identity(pid).unwrap().unwrap()));
             assert_eq!(liveness(pid), Ok(false));
         }
+    }
+
+    // Chain: production stdin launch -> launcher exits -> exact known descendant remains live.
+    // Risk: root exit releases the execution while an owned tool is still running.
+    #[cfg(windows)]
+    #[test]
+    #[ignore="owned Windows process-tree qualification; no model or board"]
+    fn native_cli_owner_exit_does_not_release_live_descendant() {
+        use crate::board::Board;
+        for cold in [false,true] {
+            let root=std::env::temp_dir().join(format!("taskq-native-tree-{}",uuid()));std::fs::create_dir_all(&root).unwrap();
+            let board=crate::board::Fake::default();let task=board.create("native scope fixture","",&[crate::service::TASK_LABEL.into()]).unwrap();
+            let attempt=board.comment(task,"taskq: spawn worker codex:fixture mac").unwrap();
+            let cfg=crate::service::Config {root:root.clone(),install:root.join("install"),..crate::tests::cfg()};
+            let log=attempt_log(&root,"worker",task,attempt);std::fs::create_dir_all(log.parent().unwrap()).unwrap();std::fs::write(&log,"").unwrap();
+            let mut command=Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact","runtime::tests::windows_tree_owner_child","--ignored"])
+                .env("TASKQ_TREE_OWNER_ROOT",&root).stdout(Stdio::null()).stderr(Stdio::null());
+            let child=start_command(&mut command,&root,"").unwrap();let native=child.native_identity().unwrap();
+            let mut turn=CliTurn {proc:child,log,pos:0,start:0,stopping:false,accepted:false,read_error:None,native:Some(native.clone()),recovery:None};
+            let launch=Launch {execution:Some(attempt),task,title:String::new(),attempt,role:"worker".into(),rt:"codex".into(),session:"fixture".into(),url:String::new(),resume:None};
+            turn.checkpoint(&cfg,&launch,attempt).unwrap();
+            let saved=crate::kids_file(&cfg.install,&root).unwrap();assert_eq!(saved.len(),1);assert!(saved[0].job.is_some());
+            let mut legacy=saved[0].clone();legacy.job=None;
+            assert!(execution_live(&legacy).unwrap_err().contains("legacy"));
+            let until=std::time::Instant::now()+std::time::Duration::from_secs(10);
+            while !root.join("descendant.json").exists() {
+                assert!(std::time::Instant::now()<until,"owned fixture did not announce its descendant");std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let row:serde_json::Value=serde_json::from_slice(&std::fs::read(root.join("descendant.json")).unwrap()).unwrap();
+            let descendant=coreq::process::Identity {pid:row["pid"].as_u64().unwrap() as u32,started:row["started"].as_str().unwrap().into()};
+            let mut unrelated=Command::new(std::env::current_exe().unwrap());
+            unrelated.args(["--exact","runtime::tests::stop_child","--ignored"]).stdout(Stdio::null()).stderr(Stdio::null());
+            let mut sentinel=start_command(&mut unrelated,&root,"").unwrap();
+            assert!(windows_process::Execution::recover(native.clone(),&sentinel.job().unwrap()).err().unwrap().contains("does not belong"));
+            assert_eq!(turn.exited(),Ok(None));std::fs::write(root.join("exit-owner"),"").unwrap();
+            while coreq::process::identity(native.pid).unwrap().as_ref()==Some(&native) {
+                assert!(std::time::Instant::now()<until,"fixture launcher did not exit");std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert_eq!(coreq::process::identity(descendant.pid).unwrap(),Some(descendant.clone()));
+            assert!(execution_live(&saved[0]).unwrap(),"scope-aware readback cannot retire surviving descendants");
+            let mut service=crate::service::Service::new(&board,&cfg,"native-fixture",Box::new(|_|panic!("native reconstruction must not dispatch")));
+            let mut proc:Box<dyn Proc>=if cold {
+                drop(turn);
+                let error=crate::adopt(&mut service,&cfg.install,&root).unwrap_err();
+                assert!(error.contains("native reconciliation"),"{error}");
+                assert!(service.kids.is_empty());assert_eq!(crate::kids_file(&cfg.install,&root).unwrap().len(),1);
+                assert_eq!(crate::core::executions(task,&crate::board::entries(&board,task).unwrap())[0].release,None);
+                assert_eq!(coreq::process::identity(descendant.pid).unwrap(),Some(descendant.clone()),"unknown recovery cannot stop or release work");
+                // The fixture knows this exact descendant; product recovery has no such surviving observation.
+                coreq::process::terminate(&descendant).unwrap();
+                while coreq::process::identity(descendant.pid).unwrap().as_ref()==Some(&descendant) {assert!(std::time::Instant::now()<until,"fixture descendant cleanup timed out");std::thread::sleep(std::time::Duration::from_millis(10));}
+                assert_eq!(sentinel.exited(),Ok(None));sentinel.kill().unwrap();
+                while sentinel.exited().unwrap().is_none() {assert!(std::time::Instant::now()<until,"sentinel cleanup not confirmed");std::thread::sleep(std::time::Duration::from_millis(10));}
+                drop(service);drop(sentinel);std::fs::remove_dir_all(root).unwrap();
+                println!("cold=true: native scope unavailable; explicit unknown; protected evidence retained; no replay/release; exact fixture cleanup confirmed");
+                continue;
+            } else {Box::new(turn)};
+            assert_eq!(proc.exited(),Ok(None),"launcher exit cannot release a live descendant");
+            proc.kill().unwrap();
+            while proc.exited().unwrap().is_none() {assert!(std::time::Instant::now()<until,"native job cancellation did not finish");std::thread::sleep(std::time::Duration::from_millis(10));}
+            assert_ne!(coreq::process::identity(descendant.pid).unwrap(),Some(descendant.clone()));
+            assert!(!execution_live(&saved[0]).unwrap());assert_eq!(sentinel.exited(),Ok(None),"another execution's job must remain live");
+            sentinel.kill().unwrap();
+            while sentinel.exited().unwrap().is_none() {assert!(std::time::Instant::now()<until,"sentinel cleanup not confirmed");std::thread::sleep(std::time::Duration::from_millis(10));}
+            service.kids.push(crate::service::Kid {task,attempt,execution:attempt,rt:"codex".into(),proc});
+            board.state.borrow_mut().fail_comments=1;service.reap_owned();assert_eq!(service.kids.len(),1,"failed terminal receipt retains ownership");
+            service.reap_owned();assert!(service.kids.is_empty());assert!(crate::kids_file(&cfg.install,&root).unwrap().is_empty());
+            assert_eq!(crate::core::executions(task,&crate::board::entries(&board,task).unwrap())[0].release,Some(crate::core::Release::Exit));
+            drop(service);drop(sentinel);std::fs::remove_dir_all(root).unwrap();
+            println!("cold={cold}: launcher exit held while descendant lived; native job cancelled; unrelated job preserved; terminal receipt retried; protected record retired");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore="owned Windows tree launcher fixture"]
+    fn windows_tree_owner_child() {
+        let root=PathBuf::from(std::env::var_os("TASKQ_TREE_OWNER_ROOT").unwrap());
+        let child=Command::new(std::env::current_exe().unwrap()).args(["--exact","runtime::tests::stop_child","--ignored"])
+            .env_remove("TASKQ_TREE_OWNER_ROOT").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+        let identity=coreq::process::identity(child.id()).unwrap().unwrap();
+        coreq::write_durable(&root.join("descendant.json"),&serde_json::json!({"pid":identity.pid,"started":identity.started}).to_string()).unwrap();
+        let until=std::time::Instant::now()+std::time::Duration::from_secs(10);
+        while !root.join("exit-owner").exists() {assert!(std::time::Instant::now()<until,"controller did not release fixture launcher");std::thread::sleep(std::time::Duration::from_millis(10));}
+        drop(child);
     }
 
     #[test]
@@ -1431,13 +2211,14 @@ mod tests {
             std::fs::write(&log, "{\"type\":\"turn.completed\"}\n").unwrap();
             let exit = Rc::new(Cell::new(false)); let kills = Rc::new(Cell::new(0));
             let make = || Box::new(Pending { exit: exit.clone(), kills: kills.clone() }) as Box<dyn Proc>;
-            let mut cli = CliTurn { proc: make(), log: log.clone(), pos: 0, stopping: false };
-            assert!(cli.exited().is_err()); assert!(cli.exited().is_err());
+            let mut cli = CliTurn { proc: make(), log: log.clone(), pos: 0, start: 0, stopping: false, accepted: false, read_error: None, native: None, recovery: None };
+            assert_eq!(cli.exited(),Ok(None)); assert_eq!(cli.exited(),Ok(None),"acknowledged stop awaiting exit is pending, not a failed observation");
+            assert_eq!(cli.accepted(),Ok(false),"terminal alone is not exact-input acceptance");
             assert_eq!(kills.get(), 2, "terminal state must survive a pending stop");
             exit.set(true); assert_eq!(cli.exited(), Ok(Some(-9)));
             exit.set(false);
-            let mut app = AppTurn { hand: Some(make()), log, text: String::new(), _input: None, thread: String::new(), done: 0,
-                rollout: None, running: || Ok(true), cancelled: false };
+            let mut app = AppTurn { root: std::env::temp_dir(), history:AppHistory::default(), hand: Some(make()), log, text: String::new(), _input: None, binding:None, thread: String::new(), done: 0,
+                rollout: None, running: || Ok(true), control:|_,_|Err("fixture native cancellation unavailable".into()), cancelled: false, queue_error: None, accepted: false };
             assert!(stop(&mut app).is_err());
             assert!(app.hand.is_some());
             exit.set(true); assert_eq!(app.exited(), Ok(Some(-9)));
@@ -1522,11 +2303,40 @@ mod tests {
         assert_eq!(agent_text(&row("unknown", serde_json::Value::Null)), "codex 0.1 · login unknown");
     }
 
+    // Chain: CLI input boundary -> native stream -> acceptance. Risk: an old turn or a process exit consumes new input.
+    #[test]
+    fn cli_acceptance_uses_only_native_events_after_its_input_boundary() {
+        struct Exited;
+        impl Proc for Exited {
+            fn exited(&mut self) -> Result<Option<i32>,String> { Ok(Some(0)) }
+            fn kill(&mut self) -> Result<(),String> { Ok(()) }
+            fn id(&self) -> u32 { 0 }
+        }
+        let dir = std::env::temp_dir().join(format!("taskq-cli-accept-{}",uuid()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path=dir.join("turn.log");
+        let old="{\"type\":\"turn.started\"}\n{\"type\":\"turn.completed\"}\n";
+        for native in ["", "{\"type\":\"turn.started\"}\n", "{\"type\":\"assistant\",\"message\":{}}\n"] {
+            std::fs::write(&path,format!("{old}{native}{{\"type\":\"turn.completed\"}}\n")).unwrap();
+            let mut turn=CliTurn { proc:Box::new(Exited),log:path.clone(),pos:old.len() as u64,start:old.len() as u64,stopping:false,accepted:false,read_error:None,native:None,recovery:None };
+            assert_eq!(turn.accepted(),Ok(false));
+            assert_eq!(turn.exited(),Ok(Some(0)));
+            assert_eq!(turn.accepted(),Ok(!native.is_empty()));
+            assert_eq!(turn.exited(),Ok(Some(0)));
+            assert_eq!(turn.accepted(),Ok(!native.is_empty()),"proof survives repeated polls");
+        }
+        let mut truncated=CliTurn {proc:Box::new(Exited),log:path.clone(),pos:1000,start:1000,stopping:false,accepted:false,read_error:None,native:None,recovery:None};
+        assert_eq!(truncated.exited(),Ok(Some(0)),"native exit remains independently observable");
+        assert!(truncated.accepted().unwrap_err().contains("truncated"));
+        assert!(truncated.input_offset().is_err(),"a lost native input boundary cannot be handed over");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     // Chain: § 8 codex-app turn end. Risk: a turn ends early or never ends.
     #[test]
     fn app_turn_keeps_unreadable_completion_unknown() {
         let p = std::env::temp_dir().join(format!("taskq-rollout-unknown-{}.jsonl", std::process::id()));
-        let mut t = AppTurn { hand: None, log: p.clone(), text: String::new(), _input: None, thread: "th".into(), done: 1, rollout: Some(p.clone()), running: || Ok(true), cancelled: false };
+        let mut t = AppTurn { root: p.parent().unwrap().canonicalize().unwrap(), history:AppHistory::default(), hand: None, log: p.clone(), text: String::new(), _input: None, binding:None, thread: "th".into(), done: 1, rollout: Some(p.clone()), running: || Ok(true), control:|_,_|Err("fixture native cancellation unavailable".into()), cancelled: false, queue_error: None, accepted: false };
         let _ = std::fs::remove_file(&p);
         assert!(t.exited().is_err(), "missing history must retain an explicit unknown reason");
         std::fs::write(&p, "{\"type\":\"event_msg\"").unwrap();
@@ -1549,20 +2359,399 @@ mod tests {
 
     // Chain: § 8 codex-app turn end. Risk: a turn ends early or never ends.
     #[test]
-    fn app_turn_ends_on_a_new_task_complete_or_a_closed_app() {
+    fn app_turn_requires_its_input_and_matching_native_completion() {
         let p = std::env::temp_dir().join(format!("taskq-rollout-{}.jsonl", std::process::id()));
-        let done = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"}}\n";
-        std::fs::write(&p, format!("{done}{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"user_message\"}}}}\n")).unwrap();
-        let mut t = AppTurn { hand: None, log: p.clone(), text: String::new(), _input: None, thread: "th".into(), done: completes(&p).unwrap(), rollout: Some(p.clone()), running: || Ok(true), cancelled: false };
-        assert_eq!((t.done, t.exited()), (1, Ok(None)), "the handshake's task_complete does not end the turn");
-        std::fs::OpenOptions::new().append(true).open(&p).unwrap().write_all(done.as_bytes()).unwrap();
-        assert_eq!(t.exited(), Ok(Some(0)));
-        t.done = 2;
+        let event = |kind: &str, id: &str, message: &str| serde_json::json!({"type":"event_msg", "payload":{"type":kind,"turn_id":id,"message":message}}).to_string() + "\n";
+        let meta=serde_json::json!({"type":"session_meta","payload":{"id":"th","cwd":p.parent().unwrap().canonicalize().unwrap()}});
+        let mut history = meta.to_string()+"\n"+&event("task_complete", "old", "");
+        std::fs::write(&p, &history).unwrap();
+        let mut t = AppTurn { root: p.parent().unwrap().canonicalize().unwrap(), history:AppHistory::default(), hand: None, log: p.clone(), text: "owned input".into(), _input: None, binding:None, thread: "th".into(), done: 1,
+            rollout: Some(p.clone()), running: || Ok(true), control:|_,_|Err("fixture native cancellation unavailable".into()), cancelled: false, queue_error: None, accepted: false };
+        assert_eq!(t.exited(), Ok(None));
+        assert_eq!(t.accepted(),Ok(false));
+        for (id, input, completion, expected) in [("other", "unrelated input", "other", false), ("owned", "owned input", "wrong", false)] {
+            history += &event("task_started", id, ""); history += &event("user_message", id, input); history += &event("task_complete", completion, "");
+            std::fs::write(&p, &history).unwrap();
+            assert_eq!(t.exited(), Ok(expected.then_some(0)), "unrelated completion cannot release ownership");
+            assert_eq!(t.accepted(),Ok(id == "owned"),"acceptance belongs to the exact input and native turn");
+        }
+        t.done = 0; t.history=AppHistory::default(); // cold observer has no volatile completion baseline
+        t.queue_error = Some("submission response lost".into());
+        assert_eq!(t.exited(), Ok(None), "native input acceptance resolves the lost submission response");
+        assert!(stop(&mut t).unwrap_err().contains("native cancellation unavailable"), "a live App turn needs an explicit unsupported-control reason");
+        assert_eq!(t.exited(), Ok(None), "refused cancellation retains the exact execution observer");
+        t.control=|thread,turn|{assert_eq!((thread,turn),("th","owned"));Ok(())};
+        assert_eq!(t.kill(),Ok(()));
+        assert_eq!(t.exited(),Ok(None),"acknowledged interrupt is not native terminal evidence");
+        history += &event("task_complete", "owned", "");
+        std::fs::write(&p, &history).unwrap();
+        assert_eq!(t.exited(), Ok(Some(0)), "later exact proof resolves an uncertain submission without replay");
+        assert_eq!(stop(&mut t), Ok(0), "observed native completion resolves stop even when cancellation is unsupported");
         t.running = || Ok(false);
-        assert_eq!(t.exited(), Ok(Some(-1)), "a closed app is a child exit");
+        assert!(t.exited().unwrap_err().contains("termination unconfirmed"));
+        t.running = || Ok(true);
+        for change in ["root","thread","copied","missing","duplicate"] {
+            let mut wrong=meta.clone();
+            match change {
+                "root"=>wrong["payload"]["cwd"]="/nonexistent/taskq".into(),
+                "thread"=>wrong["payload"]["id"]="foreign".into(),
+                "copied"=>wrong["payload"]["forked_from_id"]="original".into(),
+                _=>{},
+            }
+            let (_,events)=history.split_once('\n').unwrap();
+            let text=match change {"missing"=>events.to_owned(),"duplicate"=>meta.to_string()+"\n"+&history,_=>wrong.to_string()+"\n"+events};
+            std::fs::write(&p,text).unwrap();
+            t.history=AppHistory::default();
+            assert!(t.exited().is_err(),"{change} cannot prove native completion");
+        }
+        // Installed desktop emits UserMessage items instead of legacy user_message events.
+        let native=serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","thread_id":"th","turn_id":"owned",
+            "item":{"type":"UserMessage","id":"native-input","content":[{"type":"text","text":"owned input","text_elements":[]}]}}});
+        for change in ["valid","transport-lf","extra-lf","space","aborted","foreign-abort","conflicting-terminal","thread","turn","missing-turn","content","duplicate","duplicate-lf"] {
+            let mut item=native.clone();
+            match change {
+                "thread"=>item["payload"]["thread_id"]="foreign".into(),
+                "turn"=>item["payload"]["turn_id"]="foreign".into(),
+                "missing-turn"=>{item["payload"].as_object_mut().unwrap().remove("turn_id");},
+                "content"=>item["payload"]["item"]["content"][0]["text"]="unrelated".into(),
+                "transport-lf"|"duplicate-lf"=>item["payload"]["item"]["content"][0]["text"]="owned input\n".into(),
+                "extra-lf"=>item["payload"]["item"]["content"][0]["text"]="owned input\n\n".into(),
+                "space"=>item["payload"]["item"]["content"][0]["text"]="owned input ".into(),
+                _=>{},
+            }
+            let mut text=meta.to_string()+"\n"+&event("task_started","owned","")+&item.to_string()+"\n";
+            if matches!(change,"duplicate"|"duplicate-lf") {text+=&(native.to_string()+"\n");}
+            if matches!(change,"aborted"|"foreign-abort"|"conflicting-terminal") {text+=&event("turn_aborted",if change=="foreign-abort" {"foreign"} else {"owned"},"");}
+            if change!="aborted" && change!="foreign-abort" {text+=&event("task_complete","owned","");}
+            std::fs::write(&p,text).unwrap();t.history=AppHistory::default();t.accepted=false;
+            let outcome=t.exited();
+            match change {
+                "valid"|"transport-lf"=>{assert_eq!(outcome,Ok(Some(0)));assert_eq!(t.accepted(),Ok(true));},
+                "aborted"=>{assert_eq!(outcome,Ok(Some(-1)));assert_eq!(t.accepted(),Ok(true));},
+                "foreign-abort"=>{assert_eq!(outcome,Ok(None));assert_eq!(t.accepted(),Ok(true));},
+                "content"|"extra-lf"|"space"=>{assert_eq!(outcome,Ok(None));assert_eq!(t.accepted(),Ok(false));},
+                _=>assert!(outcome.is_err(),"{change} cannot establish input acceptance"),
+            }
+        }
         t.thread = "x & calc".into();
-        assert!(t.queue().is_err(), "a thread id that is not plain never reaches the shell");
-        let _ = std::fs::remove_file(p);
+        assert!(t.queue().is_err());
+        std::fs::remove_file(p).unwrap();
+    }
+
+    // Chain: native queued input -> lost-response cold observer -> exact native completion.
+    // Read-only qualification of an already-completed dedicated probe; no dispatch or control.
+    #[test]
+    #[ignore = "owned native probe; TASKQ_APP_READBACK selects captured lifecycle evidence"]
+    fn native_app_lost_reply_readback() {
+        let evidence=PathBuf::from(std::env::var("TASKQ_APP_READBACK").expect("TASKQ_APP_READBACK"));
+        let read=|file:&str|serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(evidence.join(file)).unwrap()).unwrap();
+        let manifest=read("manifest.json");
+        for (file,code) in [("queue-command.json",0),("interrupt-queue.json",-1)] {
+        let queued=read(file);
+        let root=PathBuf::from(manifest["root"].as_str().unwrap()).canonicalize().unwrap();
+        let thread=manifest["thread"].as_str().unwrap().to_owned();let text=queued["input"].as_str().unwrap().to_owned();
+        let mut turn=AppTurn {root,history:AppHistory::default(),hand:None,log:evidence.join("handshake.jsonl"),text,_input:None,binding:None,
+            rollout:rollout(&thread),thread,done:0,running:app_running,control:app_cancel,cancelled:false,queue_error:Some("fixture: submission response lost".into()),accepted:false};
+        assert_eq!(turn.exited(),Ok(Some(code)));assert_eq!(turn.accepted(),Ok(true));assert!(turn.queue_error.is_none());
+        assert_eq!(turn.exited(),Ok(Some(code)),"repeated observation cannot replay the submitted input");
+        println!("native App exact input and terminal {code} recovered without submission: {}",turn.thread);
+        }
+    }
+
+    // Chain: owned native input -> production IPC cancellation -> matching native abort.
+    #[cfg(any(target_os="macos",windows))]
+    #[test]
+    #[ignore = "dedicated active native probe; TASKQ_APP_READBACK selects its evidence"]
+    fn native_app_cancels_exact_owned_turn() {
+        let evidence=PathBuf::from(std::env::var("TASKQ_APP_READBACK").expect("TASKQ_APP_READBACK"));
+        let read=|file:&str|serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(evidence.join(file)).unwrap()).unwrap();
+        let manifest=read("manifest.json");let queued=read("source-cancel-queue.json");
+        let root=PathBuf::from(manifest["root"].as_str().unwrap()).canonicalize().unwrap();
+        let thread=manifest["thread"].as_str().unwrap().to_owned();let text=queued["input"].as_str().unwrap().to_owned();
+        let mut turn=AppTurn {root,history:AppHistory::default(),hand:None,log:evidence.join("handshake.jsonl"),text,_input:None,binding:None,
+            rollout:rollout(&thread),thread,done:0,running:app_running,control:app_cancel,cancelled:false,queue_error:Some("fixture: submission response lost".into()),accepted:false};
+        let until=std::time::Instant::now()+std::time::Duration::from_secs(30);
+        while !turn.accepted {
+            let observed=turn.exited();assert!(!matches!(observed,Ok(Some(_))),"native probe must still be active before cancellation");
+            assert!(std::time::Instant::now()<until,"input acceptance unavailable: {observed:?}");std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let owned=turn.history.owned.clone().unwrap();turn.kill().expect("exact owner/turn interrupt request");
+        std::fs::write(evidence.join("source-cancel-receipt.json"),serde_json::json!({"thread":turn.thread,"turn":owned,"request_acknowledged":true}).to_string()).unwrap();
+        loop {
+            let observed=turn.exited();
+            if let Ok(Some(code))=observed {assert_eq!(code,-1);break;}
+            assert!(std::time::Instant::now()<until,"interrupt request is not terminal: {observed:?}");std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert_eq!(turn.history.owned,Some(owned.clone()));assert_eq!(turn.accepted(),Ok(true));
+        println!("production App IPC cancelled exact native turn {owned}; native abort observed; no resubmission");
+    }
+
+    // Chain: long native App history -> bounded cold scan -> exact completion -> appended observations.
+    // Risk: a total-size ceiling stalls long sessions, or a partial scan/rewritten history releases work early.
+    #[test]
+    fn app_history_progresses_in_bounded_passes_without_early_completion() {
+        let root=std::env::temp_dir().join(format!("taskq-app-history-{}",uuid()));std::fs::create_dir_all(&root).unwrap();
+        let root=root.canonicalize().unwrap();let path=root.join("rollout.jsonl");
+        let event=|kind:&str,message:&str|serde_json::json!({"type":"event_msg","payload":{"type":kind,"turn_id":"owned","message":message}}).to_string()+"\n";
+        let header=serde_json::json!({"type":"session_meta","payload":{"id":"thread","cwd":root}}).to_string()+"\n";
+        let prefix=header+&event("task_started","")+&event("user_message","exact input")+&event("task_complete","");
+        for duplicate in [false,true] {
+            let mut file=File::create(&path).unwrap();file.write_all(prefix.as_bytes()).unwrap();
+            let padding=serde_json::json!({"type":"response_item","payload":"x".repeat(1024*1024)}).to_string()+"\n";
+            for _ in 0..18 {file.write_all(padding.as_bytes()).unwrap();}
+            if duplicate {file.write_all(event("task_started","").as_bytes()).unwrap();file.write_all(event("user_message","exact input").as_bytes()).unwrap();}
+            file.sync_all().unwrap();drop(file);
+            let baseline_began=std::time::Instant::now();
+            assert_eq!(completes(&path).unwrap(),1);
+            let baseline_time=baseline_began.elapsed();
+            let mut history=AppHistory::default();let mut passes=0;
+            loop {
+                passes+=1;let before=history.reader.offset;
+                let result=history.read(&path,0,"exact input",&root,"thread");
+                assert!(history.reader.offset-before<=8*1024*1024);
+                match result {
+                    Err(e) if e.contains("scan pending")=>{assert!(history.reader.offset>before);assert!(passes<5);},
+                    Err(e)=>{assert!(duplicate && e.contains("multiple native messages"),"{e}");break;},
+                    Ok(outcome)=>{assert!(!duplicate);assert_eq!(outcome,(true,true));assert!(passes>=3);break;},
+                }
+            }
+            if duplicate {continue;}
+            let end=history.reader.offset;
+            assert_eq!(history.read(&path,0,"exact input",&root,"thread"),Ok((true,true)));
+            assert_eq!(history.reader.offset,end);
+            let idle=std::time::Instant::now();
+            for _ in 0..100 {assert_eq!(history.read(&path,0,"exact input",&root,"thread"),Ok((true,true)));}
+            eprintln!("App native history: {} bytes, {passes} bounded passes; baseline {:?}; 100 unchanged reads {:?}",end,baseline_time,idle.elapsed());
+            let extra=event("agent_message","later native diagnostic");
+            let split=extra.len()/2;
+            File::options().append(true).open(&path).unwrap().write_all(&extra.as_bytes()[..split]).unwrap();
+            assert!(history.read(&path,0,"exact input",&root,"thread").unwrap_err().contains("incomplete"));
+            assert_eq!(history.reader.offset,end,"a partial record is not consumed");
+            File::options().append(true).open(&path).unwrap().write_all(&extra.as_bytes()[split..]).unwrap();
+            assert_eq!(history.read(&path,0,"exact input",&root,"thread"),Ok((true,true)));
+            assert_eq!(history.reader.offset,end+extra.len() as u64);
+            // A replacement with the same bytes must not inherit the old cursor.
+            let replacement=root.join("replacement.jsonl");std::fs::copy(&path,&replacement).unwrap();
+            std::fs::remove_file(&path).unwrap();std::fs::rename(replacement,&path).unwrap();
+            assert!(history.read(&path,0,"exact input",&root,"thread").is_err());
+        }
+        std::fs::write(&path,&prefix).unwrap();let mut history=AppHistory::default();
+        assert_eq!(history.read(&path,0,"exact input",&root,"thread"),Ok((true,true)));
+        std::fs::write(&path,"{}\n").unwrap();
+        assert!(history.read(&path,0,"exact input",&root,"thread").unwrap_err().contains("truncated"));
+        std::fs::write(&path,&prefix).unwrap();let mut history=AppHistory::default();history.read(&path,0,"exact input",&root,"thread").unwrap();
+        let changed=prefix.replace("task_complete","task_conflict")+&event("agent_message","growth cannot hide a rewritten boundary");
+        std::fs::write(&path,changed).unwrap();
+        assert!(history.read(&path,0,"exact input",&root,"thread").unwrap_err().contains("boundary changed"));
+        std::fs::write(&path,"x".repeat(8*1024*1024+1)).unwrap();
+        assert!(AppHistory::default().read(&path,0,"exact input",&root,"thread").unwrap_err().contains("exceeds 8 MiB"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // Chain: board intent -> native input -> cold observer. Risk: restart substitutes input, replays work or drops its lock.
+    #[test]
+    fn cold_input_recovery_preserves_the_exact_execution() {
+        let root=std::env::temp_dir().join(format!("taskq-cold-input-{}",uuid()));
+        std::fs::create_dir_all(&root).unwrap();
+        for rt in ["claude","codex-app"] {
+            let l=Launch {execution:Some(44),task:7,title:String::new(),attempt:42,role:"worker".into(),rt:rt.into(),session:uuid(),url:String::new(),resume:Some("continue".into())};
+            let x=crate::core::Execution {id:44,attempt:42,through:43,host:"mac".into(),runtime:rt.into(),accepted:false,release:None};
+            let log=log_path(&root,&l);
+            let (path,lock)=turn_input(&root,"original task",Some(&l)).unwrap();
+            assert_eq!(path,root.canonicalize().unwrap().join(".taskq/inputs/execution-7-42-44.txt"));
+            assert!(turn_input(&root,"replacement task",Some(&l)).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(),"original task");
+            let input=if rt=="claude" {claude_reference(&path)} else {app_reference(&path)}.unwrap();
+            let binding=bind_input(&log,&l,&path,&input,serde_json::json!({"thread":"native-thread","session":l.session})).unwrap();
+            drop(lock);
+            let mut large_log=File::options().append(true).open(&log).unwrap();
+            let row=serde_json::json!({"type":"fixture","padding":"x".repeat(1024*1024)}).to_string()+"\n";
+            for _ in 0..10 {large_log.write_all(row.as_bytes()).unwrap();}
+            drop(large_log);
+            let mut observer=recover(&root,&root.join("install"),7,&x).unwrap();
+            assert_eq!(observer.id(),0);
+            assert!(!matches!(observer.accepted(),Ok(true)),"binding is not native acceptance");
+            let file=File::options().read(true).write(true).open(&path).unwrap();
+            assert!(matches!(file.try_lock(),Err(std::fs::TryLockError::WouldBlock)));
+            drop(observer);
+            file.try_lock().unwrap();file.unlock().unwrap();
+            for case in ["foreign-task","foreign-execution","foreign-runtime","input","path","legacy","missing","partial","oversized","ambiguous","released"] {
+                let mut b=binding.clone();
+                let mut execution=x.clone();
+                let reviewer=attempt_log(&root,"reviewer",7,42);
+                match case {
+                    "foreign-task"=>b["task"]=8.into(),
+                    "foreign-execution"=>b["execution"]=45.into(),
+                    "foreign-runtime"=>b["runtime"]="other".into(),
+                    "input"=>b["input"]="unrelated input".into(),
+                    "path"=>b["path"]="/unrelated/input.txt".into(),
+                    "legacy"=>{std::fs::rename(&path,root.join("legacy.txt")).unwrap();},
+                    "ambiguous"=>std::fs::write(&reviewer,"{}").unwrap(),
+                    "released"=>execution.release=Some(crate::core::Release::Exit),
+                    _=>{},
+                }
+                std::fs::write(&log,match case {"missing"=>String::new(),"partial"=>"{incomplete".into(),"oversized"=>"x".repeat(8*1024*1024+1),_=>b.to_string()+"\n"}).unwrap();
+                assert!(recover(&root,&root.join("install"),7,&execution).is_err(),"{rt}: {case}");
+                if case=="legacy" {std::fs::rename(root.join("legacy.txt"),&path).unwrap();}
+                if case=="ambiguous" {std::fs::remove_file(reviewer).unwrap();}
+            }
+            std::fs::remove_file(path).unwrap();std::fs::remove_file(log).unwrap();
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // Chain: exact execution input binding -> uncertain native launch -> retained observation and input lock.
+    // Risk: a timeout or unreadable launch response drops the only recovery token and invites resubmission.
+    #[test]
+    fn uncertain_background_launch_retains_its_bound_input() {
+        #[cfg(unix)] use std::os::unix::process::ExitStatusExt;
+        #[cfg(windows)] use std::os::windows::process::ExitStatusExt;
+        let root=std::env::temp_dir().join(format!("taskq-uncertain-input-{}",uuid()));
+        std::fs::create_dir_all(&root).unwrap();
+        let candidate="c37eb75a";
+        for case in ["timeout","response","exit","log","copy","no-start"] {
+            let log=root.join(format!("{case}.log"));
+            let mut l=Launch {execution:Some(44),task:7,title:String::new(),attempt:42,role:"worker".into(),rt:"claude".into(),session:uuid(),url:String::new(),resume:Some("continue".into())};
+            let (input,lock,path)=claude_input(&root,"private task body",None).unwrap();
+            for execution in [None,Some(41)] {
+                l.execution=execution;
+                assert!(bind_input(&log,&l,&path,&input,serde_json::json!({})).is_err());
+                assert!(!log.exists(),"invalid intent must refuse before native submission");
+            }
+            l.execution=Some(44);
+            assert!(bind_input(&root,&l,&path,&input,serde_json::json!({})).is_err(),"unwritable binding must refuse before native submission");
+            bind_input(&log,&l,&path,&input,serde_json::json!({"before":10,"session":l.session})).unwrap();
+            let written=std::fs::read_to_string(&log).unwrap();
+            let record:serde_json::Value=serde_json::from_str(written.trim()).unwrap();
+            assert_eq!((record["task"].as_u64(),record["attempt"].as_u64(),record["execution"].as_u64()),(Some(7),Some(42),Some(44)));
+            assert_eq!(record["input"],input);assert!(!written.contains("private task body"));
+            let mut turn=ClaudeTurn {root:root.clone(),log:log.clone(),session:l.session.clone(),id:if case=="copy" {uuid()} else {String::new()},
+                announced:false,accepted:false,history:ClaudeHistory::default(),before:10,mode:"dontAsk".into(),input:input.clone(),_input_file:lock,pid:0,native:None,recovery:None,done:false,failure:None,launch_error:None};
+            if case=="log" {std::fs::remove_file(&log).unwrap();std::fs::create_dir(&log).unwrap();}
+            let output=match case {
+                "timeout"=>Err(coreq::process::Failure::Timeout),
+                "no-start"=>Err(coreq::process::Failure::Spawn(std::io::Error::new(std::io::ErrorKind::NotFound,"fixture missing launcher"))),
+                "exit"=>Err(coreq::process::Failure::Exit(std::process::Output {status:std::process::ExitStatus::from_raw(256),stdout:vec![],stderr:b"native launch failed".to_vec()})),
+                _=>Ok(std::process::Output {status:std::process::ExitStatus::from_raw(0),stdout:if case=="response" {b"lost response".to_vec()} else {format!("backgrounded · {candidate}\n").into_bytes()},stderr:vec![]}),
+            };
+            let result=turn.finish_launch(output);
+            if case=="no-start" {assert!(result.unwrap_err().no_start);}
+            else {
+                assert!(result.is_ok(),"{case}: uncertain native side effect must retain its handle");
+                assert!(turn.launch_error.is_some());
+                assert_eq!(turn.input,input);
+                assert!(turn.observe(&serde_json::json!({"id":turn.id,"sessionId":turn.session,"state":"failed","pid":null})).unwrap_err().contains("current input acceptance unconfirmed"),"old job status cannot settle the current submission");
+                if matches!(case,"log"|"copy") {assert_eq!(turn.id,candidate,"returned native identity survives a subsequent failure");}
+                let probe=File::options().read(true).write(true).open(&path).unwrap();
+                assert!(matches!(probe.try_lock(),Err(std::fs::TryLockError::WouldBlock)),"uncertain turn keeps its original input");
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // Chain: lost launch reply -> exact native input lookup -> resumed observation without resubmission.
+    // Risk: a missing identity stays orphaned, or unrelated/ambiguous history is adopted as this execution.
+    #[test]
+    fn claude_lost_reply_recovers_only_its_unique_input() {
+        let root=std::env::temp_dir().join(format!("taskq-claude-lookup-{}",uuid()));
+        std::fs::create_dir_all(&root).unwrap();
+        let root=root.canonicalize().unwrap();
+        let session=uuid();let other=uuid();
+        std::fs::create_dir_all(root.join("projects/a")).unwrap();
+        #[cfg(unix)] std::os::unix::fs::symlink(root.join("missing-native-directory"),root.join("projects/missing")).unwrap();
+        for id in ["c37eb75a","eaff90e7"] {std::fs::create_dir_all(root.join("jobs").join(id)).unwrap();}
+        for case in ["match","known","blocks","absent","two-jobs","two-inputs","partial","invalid","oversize","missing","foreign","resume","old","copied","large-unrelated","locator-only","bad-locator","foreign-locator","large-locator","long-history"] {
+            let (input,lock,path)=claude_input(&root,"fixture task body",None).unwrap();
+            let event=serde_json::json!({"type":"user","message":{"content":if case=="blocks" {serde_json::json!([{"type":"text","text":input}])} else {serde_json::json!(input)}}}).to_string()+"\n";
+            let a=root.join("projects/a").join(format!("{session}.jsonl"));let b=root.join("projects/a").join(format!("{other}.jsonl"));
+            let content=match case {
+                "absent"=>serde_json::json!({"type":"user","message":{"content":"unrelated input"}}).to_string()+"\n",
+                "two-inputs"=>event.repeat(2),
+                "partial"=>event.clone()+"{",
+                "invalid"=>event.clone()+"{}\n",
+                "oversize"=>"x".repeat(8*1024*1024+1),
+                "long-history"=>(serde_json::json!({"type":"system","padding":"x".repeat(1024*1024)}).to_string()+"\n").repeat(18)+&event
+                    +&serde_json::json!({"type":"assistant","message":{"content":[{"type":"text","text":"owned final"}]}}).to_string()+"\n"
+                    +&serde_json::json!({"type":"system","subtype":"turn_duration"}).to_string()+"\n"
+                    +&serde_json::json!({"type":"user","message":{"content":"another turn"}}).to_string()+"\n"
+                    +&serde_json::json!({"type":"assistant","message":{"content":[{"type":"text","text":"foreign final"}]}}).to_string()+"\n",
+                "resume"=>serde_json::json!({"type":"system"}).to_string()+"\n"+&event,
+                _=>event.clone(),
+            };
+            std::fs::write(&a,content).unwrap();std::fs::write(&b,&event).unwrap();
+            for (id,sid) in [("c37eb75a",&session),("eaff90e7",&other)] {
+                let intent=if case=="locator-only" || case=="resume" || (case=="large-unrelated" && id=="eaff90e7") {"unrelated original input"} else {&input};
+                let locator=serde_json::json!({"cwd":root,"sessionId":sid,"intent":intent,"providerEnv":{"FIXTURE":"not retained or printed"}});
+                std::fs::write(root.join("jobs").join(id).join("state.json"),locator.to_string()).unwrap();
+            }
+            let locator=root.join("jobs/c37eb75a/state.json");
+            if case=="bad-locator" {std::fs::write(&locator,"{").unwrap();}
+            if case=="foreign-locator" {std::fs::write(&locator,serde_json::json!({"cwd":root,"sessionId":other,"intent":input}).to_string()).unwrap();}
+            if case=="large-locator" {std::fs::write(&locator,"x".repeat(1024*1024+1)).unwrap();}
+            if case=="large-unrelated" {std::fs::write(&b,"x".repeat(8*1024*1024+1)).unwrap();}
+            let mut turn=ClaudeTurn {root:root.clone(),log:root.join("attempt.log"),session:if matches!(case,"resume"|"old") {session.clone()} else if case=="copied" {other.clone()} else {String::new()},id:if matches!(case,"known"|"two-jobs"|"resume") {"c37eb75a".into()} else {String::new()},
+                announced:false,accepted:false,history:ClaudeHistory::default(),before:usize::from(matches!(case,"resume"|"old")),mode:"dontAsk".into(),input:input.clone(),_input_file:lock,pid:0,native:None,recovery:None,done:false,failure:None,launch_error:Some("launch response lost".into())};
+            let mut rows=vec![serde_json::json!({"id":"c37eb75a","kind":"background","sessionId":session,"cwd":if case=="foreign" {root.parent().unwrap()} else {&root},"state":"working"})];
+            if matches!(case,"two-jobs"|"large-unrelated") {rows.push(serde_json::json!({"id":"eaff90e7","kind":"background","sessionId":other,"cwd":root,"state":"working"}));}
+            rows.push(serde_json::json!({"id":"abcdef12","kind":"background","cwd":root.join("deleted-worktree"),"state":"done"}));
+            if case=="missing" {std::fs::remove_file(&a).unwrap();}
+            let original_id=turn.id.clone();
+            let mut result=turn.recover_job(&rows,Some(&root));
+            if case=="long-history" {
+                let mut passes=1;
+                while result.as_ref().is_err_and(|e|e.contains("scan pending")) {
+                    assert!(!turn.accepted);assert_eq!(turn.id,original_id);assert!(passes<5);
+                    result=turn.recover_job(&rows,Some(&root));passes+=1;
+                }
+                assert!(passes>=3);
+                assert!(turn.history.ended);assert_eq!(turn.history.answer.as_deref(),Some("owned final"));
+                assert!(!std::fs::read_to_string(&turn.log).unwrap().contains("foreign final"));
+                assert_eq!(claude_history(&a,0,|_|{}).unwrap(),23,"pre-submission scan supports the same large history");
+            }
+            if matches!(case,"match"|"known"|"blocks"|"resume"|"large-unrelated"|"long-history") {
+                result.unwrap();assert_eq!(turn.id,"c37eb75a");assert_eq!(turn.session,session);
+                assert_eq!(turn.accepted(),Ok(true));assert!(!turn.done,"input acceptance is not native exit");
+                turn.recover_job(&rows,None).unwrap();
+            } else {
+                assert!(result.is_err(),"{case} must remain unknown");assert_eq!(turn.id,original_id);assert!(!turn.accepted);
+            }
+            assert_eq!(turn.input,input);assert!(path.exists());
+            let file=File::options().read(true).write(true).open(path).unwrap();
+            assert!(matches!(file.try_lock(),Err(std::fs::TryLockError::WouldBlock)),"recovery retains the original input lock");
+        }
+        let projects=root.join("projects");
+        std::fs::create_dir_all(projects.join("a")).unwrap();
+        std::fs::create_dir_all(projects.join("b")).unwrap();
+        std::fs::write(projects.join("unrelated-file"),"").unwrap();
+        let native=projects.join("a").join(format!("{session}.jsonl"));
+        std::fs::write(&native,"{}\n").unwrap();
+        assert_eq!(claude_transcript_in(&root,&session).unwrap(),native);
+        std::fs::write(projects.join("b").join(format!("{session}.jsonl")),"{}\n").unwrap();
+        assert!(claude_transcript_in(&root,&session).unwrap_err().contains("multiple transcript paths"));
+        assert!(claude_transcript_in(&root,"../other").is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // Chain: an owned native probe loses its launch reply -> candidate recovers input and observes exit.
+    // Reuses an already-stopped probe; never dispatches another model turn.
+    #[test]
+    #[ignore = "owned native probe; TASKQ_CLAUDE_READBACK selects its captured lifecycle evidence"]
+    fn native_claude_lost_reply_readback() {
+        let evidence=PathBuf::from(std::env::var("TASKQ_CLAUDE_READBACK").expect("TASKQ_CLAUDE_READBACK"));
+        let read=|file:&str|serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(evidence.join(file)).unwrap()).unwrap();
+        let manifest=read("manifest.json");let result=read("stop-result.json");let identity=read("identity-before.json");
+        let pid=u32::try_from(identity["pid"].as_u64().unwrap()).unwrap();
+        assert_eq!(coreq::process::identity(pid).unwrap(),None,"probe must already have exited");
+        assert_eq!(result["stop"]["exit_code"],0);
+        let root=PathBuf::from(manifest["native_root"].as_str().unwrap()).canonicalize().unwrap();
+        let input_path=evidence.join("input.txt");let input=std::fs::read_to_string(&input_path).unwrap();
+        let log=evidence.join("candidate-readback.log");File::create(&log).unwrap();
+        let mut turn=ClaudeTurn {root,log,session:String::new(),id:String::new(),announced:false,accepted:false,history:ClaudeHistory::default(),before:0,
+            mode:"inherited-probe".into(),input,_input_file:crate::data::InputLock::new(File::open(input_path).unwrap()).unwrap(),pid,native:Some(coreq::process::Identity {pid,started:identity["started"].as_str().unwrap().into()}),recovery:None,done:false,failure:None,launch_error:Some("fixture: launch reply lost".into())};
+        assert_eq!(turn.exited(),Ok(Some(0)));
+        assert_eq!(turn.accepted(),Ok(true));assert_eq!(turn.id,result["job"].as_str().unwrap());
+        assert_eq!(turn.session,result["session"].as_str().unwrap());
+        assert_eq!(coreq::process::identity(pid).unwrap(),None);
     }
 
     // Chain: § 8 Access adapter on the host OS (A3, A4). Risk: a Full grant keeps the runtime's own permission or
@@ -1576,7 +2765,7 @@ mod tests {
         let root = std::env::temp_dir();
         let env = Env { root: &root, exe: Path::new("/i/taskq"), install: &install, permission_mode: "dontAsk", codex: &codex, publish: "pr", board_env: &[] };
         let args = |c: &Command| c.get_args().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>().join(" ");
-        let mut l = Launch { task: 7, title: "T".into(), attempt: 42, role: "worker".into(), rt: "claude".into(), session: "s".into(), url: "https://b/7".into(), resume: None };
+        let mut l = Launch { execution: None, task: 7, title: "T".into(), attempt: 42, role: "worker".into(), rt: "claude".into(), session: "s".into(), url: "https://b/7".into(), resume: None };
         crate::policy::grant(&install, "claude", "full", None, "op", 1).unwrap();
         crate::policy::grant(&install, "codex", "full", None, "op", 1).unwrap();
         for resume in [None, Some("answer".to_string())] {
@@ -1598,29 +2787,82 @@ mod tests {
         let _ = std::fs::remove_dir_all(&install);
     }
 
-    // Chain: service failed reviewer launch -> exit -> gone (the service reviewer test covers the pass).
-    // Risk: missing status/transcript masks a terminal native job and renews its lease forever.
+    // Chain: native identity -> failed/retried protected checkpoint -> cold observer -> exact process exit.
+    // Risk: cold Claude recovery recaptures a reused PID, or failed persistence drops the only original identity.
     #[test]
-    fn claude_failed_launch_exits_without_status_or_transcript() {
-        let mut t = ClaudeTurn { root: PathBuf::new(), log: PathBuf::new(), session: String::new(),
-            id: "invented-job".into(), announced: false, copied: 0, before: 0, mode: "dontAsk".into(),
-            input: "invented input".into(), _input_file: crate::data::InputLock::new(File::open(std::env::current_exe().unwrap()).unwrap()).unwrap(), pid: 0, done: false, failure: None };
+    fn claude_cold_identity_survives_checkpoint_failure_and_process_exit() {
+        let root=std::env::temp_dir().join(format!("taskq-claude-cold-{}",uuid()));
+        let install=root.join("install");std::fs::create_dir_all(&install).unwrap();
+        let l=Launch {execution:Some(42),task:7,title:String::new(),attempt:42,role:"worker".into(),rt:"claude".into(),session:uuid(),url:String::new(),resume:None};
+        let log=log_path(&root,&l);
+        let (input,lock,path)=claude_input(&root,"controlled process fixture",Some(&l)).unwrap();
+        bind_input(&log,&l,&path,&input,serde_json::json!({"session":l.session})).unwrap();
+        let mut child=Command::new(std::env::current_exe().unwrap()).args(["--exact","runtime::tests::stop_child","--ignored"])
+            .stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+        let mut t=ClaudeTurn {root:root.clone(),log,session:l.session.clone(),id:"c37eb75a".into(),announced:false,accepted:true,history:ClaudeHistory::default(),before:0,mode:"fixture".into(),input,
+            _input_file:lock,pid:0,native:None,recovery:Some(Recovery {root:root.clone(),install:install.clone(),task:7,attempt:42,execution:42}),done:false,failure:None,launch_error:None};
+        let row=serde_json::json!({"id":t.id,"sessionId":t.session,"pid":child.id(),"state":"working"});
+        t.capture_identity(&row).unwrap();let original=t.native_identity().unwrap();
+        std::fs::write(install.join("native"),"fixture: unavailable recovery directory").unwrap();
+        assert!(t.persist().unwrap_err().contains("checkpoint failed"));
+        assert_eq!(t.native_identity(),Ok(original.clone()));assert!(t.recovery.is_some());
+        std::fs::remove_file(install.join("native")).unwrap();t.persist().unwrap();
+        assert!(t.recovery.is_none());
+        let saved=crate::kids_file(&install,&root).unwrap();assert_eq!(saved.len(),1);
+        assert_eq!(saved[0].process,original);assert_eq!(saved[0].runtime,"claude");assert_eq!(saved[0].offset,0);
+        let mut conflicting=row.clone();conflicting["pid"]=std::process::id().into();
+        assert!(t.capture_identity(&conflicting).is_err());assert_eq!(t.native_identity(),Ok(original.clone()));
+        let x=crate::core::Execution {id:42,attempt:42,through:42,host:"mac".into(),runtime:"claude".into(),accepted:true,release:None};
+        drop(t);
+        let restored=recover(&root,&install,7,&x).unwrap();
+        assert_eq!(restored.native_identity(),Ok(original.clone()));
+        assert_eq!(claude_stopped(&serde_json::json!({"state":"done"}),Some(&original)),Ok(false));
+        child.kill().unwrap();child.wait().unwrap();
+        assert_eq!(claude_stopped(&serde_json::json!({"state":"done"}),Some(&original)),Ok(true));
+        drop(restored);
+        let after_exit=recover(&root,&install,7,&x).unwrap();
+        assert_eq!(after_exit.native_identity(),Ok(original),"cold recovery does not recapture an absent/reused PID");
+        let mut other=x.clone();other.id=43;
+        assert!(recover(&root,&install,7,&other).is_err());
+        let protected=crate::kids_path(&install,&root).unwrap();std::fs::write(&protected,"corrupt").unwrap();
+        assert!(recover(&root,&install,7,&x).is_err());assert_eq!(std::fs::read_to_string(protected).unwrap(),"corrupt");
+        drop(after_exit);std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // Chain: native job schema -> observation -> release fence.
+    // Risk: missing optional fields or a new state fabricate exit or hide observation failures.
+    #[test]
+    fn claude_native_state_requires_exit_evidence() {
+        let root=std::env::temp_dir().join(format!("taskq-claude-state-{}",uuid()));
+        std::fs::create_dir_all(&root).unwrap();
+        let log=root.join("attempt.log");
+        File::create(&log).unwrap();
+        let mut t = ClaudeTurn { root:root.clone(), log, session:uuid(),
+            id: "c37eb75a".into(), announced: false, accepted:false, history:ClaudeHistory::default(), before: 0, mode: "dontAsk".into(),
+            input: "invented input".into(), _input_file: crate::data::InputLock::new(File::open(std::env::current_exe().unwrap()).unwrap()).unwrap(), pid: 0, native:None, recovery:None, done: false, failure: None, launch_error:None };
+        assert!(native_job_id(&t.id));
+        assert!(native_job_id(&uuid()));
+        for id in ["--all","../c37eb75a","c37eb75a --all","invented-job",""] {assert!(!native_job_id(id));}
         for state in ["failed", "stopped", "crashed", "unexpected"] {
-            assert_eq!(t.observe(&serde_json::json!({"state":state})), Ok(Some(-1)));
-            t.announced = true;
-            assert_eq!(t.observe(&serde_json::json!({"state":state,"status":"working"})), Ok(Some(-1)));
-            t.announced = false;
+            assert!(t.observe(&serde_json::json!({"state":state})).is_err(),"{state} without process proof must not release");
         }
-        assert!(t.observe(&serde_json::json!({})).is_err());
-        assert!(t.observe(&serde_json::json!({"state":null})).is_err());
-        assert_eq!(t.observe(&serde_json::json!({"state":"working"})), Ok(None));
-        assert_eq!(t.observe(&serde_json::json!({"state":"failed", "detail":"ENAMETOOLONG: name too long, uv_spawn"})), Ok(Some(-1)));
-        assert_eq!(t.exit_error(), Some("argument-too-long"));
-        assert_eq!(t.observe(&serde_json::json!({"state":"failed", "detail":"permission denied"})), Ok(Some(-1)));
-        assert_eq!(t.exit_error(), Some("permission"));
-        for pid in [serde_json::json!(0), serde_json::json!(u64::MAX), serde_json::json!("unknown"), serde_json::json!(std::process::id())] {
-            assert!(t.observe(&serde_json::json!({"state":"failed", "pid":pid})).is_err(), "native terminal state cannot hide a present or invalid pid");
+        for state in ["done","blocked","failed","crashed","unexpected"] {
+            assert_ne!(claude_stopped(&serde_json::json!({"state":state}),None),Ok(true),"{state} is not a process exit receipt");
         }
+        assert!(claude_stopped(&serde_json::json!({"state":"stopped"}),None).is_err());
+        assert_eq!(claude_stopped(&serde_json::json!({"state":"stopped"}),coreq::process::identity(std::process::id()).unwrap().as_ref()),Ok(false));
+        assert_eq!(claude_stopped(&serde_json::json!({"state":"done"}),coreq::process::identity(std::process::id()).unwrap().as_ref()),Ok(false));
+        let mut child=Command::new(std::env::current_exe().unwrap()).args(["--exact","runtime::tests::stop_child","--ignored"]).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+        let identity=coreq::process::identity(child.id()).unwrap().unwrap();child.kill().unwrap();child.wait().unwrap();
+        assert_eq!(claude_stopped(&serde_json::json!({"state":"done"}),Some(&identity)),Ok(true),"native stop can preserve done after observed process exit");
+        for pid in [serde_json::json!(0), serde_json::json!(u64::MAX), serde_json::json!("unknown")] {
+            assert!(claude_stopped(&serde_json::json!({"state":"stopped","pid":pid}),None).is_err());
+        }
+        for row in [serde_json::json!({}),serde_json::json!({"state":null})] {assert!(t.observe(&row).is_err());}
+        let row=serde_json::json!({"id":t.id,"state":"working","sessionId":t.session});
+        assert!(t.observe(&row).unwrap_err().contains("transcript unavailable"),"no status field must not suppress the real observation error");
+        assert!(t.announced);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     // Chain: § 8 codex-app handshake -> open thread -> queue -> one new `task_complete` on this host's app.
@@ -1633,11 +2875,11 @@ mod tests {
         std::fs::create_dir_all(&install).unwrap();
         crate::policy::grant(&install, "codex-app", "full", None, "op", 1).unwrap();
         let env = Env { root: &root, exe: Path::new("taskq"), install: &install, permission_mode: "dontAsk", codex: &[], publish: "pr", board_env: &[] };
-        let l = Launch { task: 0, title: "live".into(), attempt: 0, role: "worker".into(), rt: "codex-app".into(), session: "-".into(), url: String::new(), resume: None };
+        let l = Launch { execution: None, task: 0, title: "live".into(), attempt: 0, role: "worker".into(), rt: "codex-app".into(), session: "-".into(), url: String::new(), resume: None };
         let log = root.join("app-turn.log");
-        let (text, input) = app_input(&root, &format!("{}Reply with the single word QUEUED and do nothing else.", "A taskq test line; ignore it.\n".repeat(700))).unwrap();
-        let mut t = AppTurn { hand: None, log: log.clone(), text, _input: Some(input), thread: String::new(), done: 0, rollout: None, running: app_running, cancelled: false };
-        t.hand = Some(Box::new(start(&env, &l, &log, HANDSHAKE, &access(&env, "codex-app").unwrap()).unwrap()));
+        let (text, input, _path) = app_input(&root, &format!("{}Reply with the single word QUEUED and do nothing else.", "A taskq test line; ignore it.\n".repeat(700)),None).unwrap();
+        let mut t = AppTurn { root: root.canonicalize().unwrap(), history:AppHistory::default(), hand: None, log: log.clone(), text, _input: Some(input), binding:None, thread: String::new(), done: 0, rollout: None, running: app_running, control:app_cancel, cancelled: false, queue_error: None, accepted: false };
+        t.hand = Some(start(&env, &l, &log, HANDSHAKE, &access(&env, "codex-app").unwrap()).unwrap());
         let code = (0..600).find_map(|_| { std::thread::sleep(std::time::Duration::from_secs(1)); t.exited().unwrap() });
         eprintln!("thread {} rollout {:?} completes {} exit {code:?}", t.thread, t.rollout, t.rollout.as_ref().map_or(0, |p| completes(p).unwrap()));
         let _ = std::fs::remove_dir_all(&install);
@@ -1652,7 +2894,7 @@ mod tests {
         let root = Path::new("C:\\project's $cash; folder");
         let exe = Path::new("C:\\tool's $cash; folder\\taskq.exe");
         let env = Env { root, exe, install: Path::new("C:\\install"), permission_mode: "dontAsk", codex: &[], publish: "pr", board_env: &[] };
-        let l = Launch { task: 7, title: "T".into(), attempt: 42, role: "worker's $cash; role".into(), rt: "codex-app".into(), session: "s".into(), url: "https://b/7".into(), resume: None };
+        let l = Launch { execution: None, task: 7, title: "T".into(), attempt: 42, role: "worker's $cash; role".into(), rt: "codex-app".into(), session: "s".into(), url: "https://b/7".into(), resume: None };
         let text = brief(&env, &l);
         let command = text.split("your inbox: `").nth(1).unwrap().split('`').next().unwrap();
         let prefix = command.split("; & ").next().unwrap();
@@ -1662,14 +2904,6 @@ mod tests {
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         let values: Vec<String> = serde_json::from_slice(&out.stdout).unwrap();
         assert_eq!(values, vec!["7", "42", &l.role, &root.display().to_string(), &exe.display().to_string()]);
-    }
-
-    // Chain: § 7 sandbox-blocked host checks. Risk: a worker requeues a sandbox limit or claims a local PASS.
-    #[test]
-    fn worker_brief_keeps_sandbox_blocked_checks_at_exact_sha_ci() {
-        assert!(SANDBOX_CHECKS.contains("sandbox-blocked") && SANDBOX_CHECKS.contains("Checks"));
-        assert!(SANDBOX_CHECKS.contains("never as PASS") && SANDBOX_CHECKS.contains("do not requeue"));
-        assert!(SANDBOX_CHECKS.contains("green CI on the exact result SHA"));
     }
 
     fn rules_root(name: &str) -> PathBuf {
@@ -1691,7 +2925,7 @@ mod tests {
         let mut inputs = Vec::new();
         for (turn, app) in [("start",false),("resume",false),("concurrent operator",false),("app start",true),("app resume",true),("app concurrent",true)] {
             let brief = format!("{text}{turn}");
-            let (input, _file) = if app {app_input(&root,&brief)} else {claude_input(&root, &brief)}.unwrap();
+            let (input, _file, _path) = if app {app_input(&root,&brief,None)} else {claude_input(&root, &brief,None)}.unwrap();
             assert!(input.len() < 8192 && !input.contains("invented padding"));
             assert!(input.contains("in full"));
             if app { assert!(input.contains("do not proceed")); } else { assert!(input.contains("use Read")); }
@@ -1861,7 +3095,7 @@ mod tests {
         for rt in ["claude", "codex", "codex-app"] {
             for role in ["worker", "reviewer"] {
                 for resume in [None, Some("Owner answer: preserve current work.\nLiteral $HOME stays text.".into())] {
-                    let l = Launch { task: 7, title: "T".into(), attempt: 42, role: role.into(), rt: rt.into(), session: "same-session".into(), url: "https://b/7".into(), resume };
+                    let l = Launch { execution: None, task: 7, title: "T".into(), attempt: 42, role: role.into(), rt: rt.into(), session: "same-session".into(), url: "https://b/7".into(), resume };
                     let text = turn_text(&env, &l, rule).unwrap();
                     let (rules, task) = text.split_once("\nTaskQ task\n").unwrap();
                     // header: revision, cache path, contract path (this release's URL: the root has no taskq.md), precedence
@@ -1904,10 +3138,10 @@ mod tests {
     #[test]
     fn briefs_distinguish_test_repairs_from_weakened_checks() {
         let env = Env { root: Path::new("/project"), exe: Path::new("taskq"), install: Path::new("/i"), permission_mode: "dontAsk", codex: &[], publish: "pr", board_env: &[] };
-        let rule = "Changing an existing test or golden trace while preserving every assertion is a repair, named in --text with the defect it fixes; weakening or deleting an assertion needs a changed rule in the same diff and is named in --text (section 7 step 4).";
+        let rule = "Test changes follow specq engineering/testing.md: name the defect and retained risk protection in --text; change a rule only when accepted behavior or protection changes (section 7 step 4).";
         for rt in ["claude", "codex", "codex-app"] {
             for role in ["worker", "reviewer"] {
-                let l = Launch { task: 7, title: "Repair".into(), attempt: 42, role: role.into(), rt: rt.into(), session: "s".into(), url: "https://b/7".into(), resume: None };
+                let l = Launch { execution: None, task: 7, title: "Repair".into(), attempt: 42, role: role.into(), rt: rt.into(), session: "s".into(), url: "https://b/7".into(), resume: None };
                 let text = brief(&env, &l);
                 assert!(text.contains(rule), "{rt}: {role}");
                 assert!(!text.contains("a changed or deleted existing test is a gap unless"), "{rt}: {role}: obsolete ban");
@@ -1920,7 +3154,7 @@ mod tests {
     fn research_decision_requires_ask_before_result() {
         let env = Env { root: Path::new("/project"), exe: Path::new("taskq"), install: Path::new("/i"), permission_mode: "dontAsk", codex: &[], publish: "pr", board_env: &[] };
         for rt in ["claude", "codex", "codex-app"] {
-            let mut l = Launch { task: 7, title: "Proposal".into(), attempt: 42, role: "worker".into(), rt: rt.into(), session: "s".into(), url: "https://b/7".into(), resume: None };
+            let mut l = Launch { execution: None, task: 7, title: "Proposal".into(), attempt: 42, role: "worker".into(), rt: rt.into(), session: "s".into(), url: "https://b/7".into(), resume: None };
             assert!(brief(&env, &l).contains("Research or proposal tasks (type research, docs proposals) end with ask: options plus a recommendation; result only after the owner's answer."), "{rt}: worker");
             l.role = "reviewer".into();
             assert!(brief(&env, &l).contains("A research or proposal task without an ask and owner's answer before result/close is a task-fit gap"), "{rt}: reviewer");
@@ -1937,7 +3171,7 @@ mod tests {
         std::fs::create_dir_all(&install).unwrap();
         for rt in ["claude", "codex"] { crate::policy::grant(&install, rt, "full", None, "op", 1).unwrap(); }
         let env = Env { root: &root, exe: Path::new("/i/taskq"), install: &install, permission_mode: "dontAsk", codex: &[], publish: "pr", board_env: &[] };
-        let launch = |rt: &str| Launch { task: 7, title: "T".into(), attempt: 42, role: "worker".into(), rt: rt.into(), session: "s".into(), url: "https://b/7".into(), resume: None };
+        let launch = |rt: &str| Launch { execution: None, task: 7, title: "T".into(), attempt: 42, role: "worker".into(), rt: rt.into(), session: "s".into(), url: "https://b/7".into(), resume: None };
         let args = |rt: &str| command(&env, &launch(rt), &access(&env, rt).unwrap()).unwrap().get_args().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>();
         let l = launch("claude");
         let claude = args("claude");
@@ -1967,7 +3201,7 @@ mod tests {
     fn pm_hook_gets_the_worker_start_rules() {
         let root = rules_root("pm");
         let env = Env { root: &root, exe: Path::new("/i/taskq"), install: Path::new("/i"), permission_mode: "dontAsk", codex: &[], publish: "pr", board_env: &[] };
-        let l = Launch { task: 7, title: "T".into(), attempt: 42, role: "worker".into(), rt: "claude".into(), session: "s".into(), url: "https://b/7".into(), resume: None };
+        let l = Launch { execution: None, task: 7, title: "T".into(), attempt: 42, role: "worker".into(), rt: "claude".into(), session: "s".into(), url: "https://b/7".into(), resume: None };
         let start = turn_text(&env, &l, rule).unwrap();
         assert_eq!(pm_rules(&root, "start", rule).unwrap(), start.split("\nTaskQ task\n").next().unwrap());
         assert_eq!(pm_rules(&root, "compact", rule).unwrap(), rules(&root, true, rule).unwrap());

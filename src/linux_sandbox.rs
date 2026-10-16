@@ -126,7 +126,7 @@ mod tests {
         std::fs::write(root.join("AGENTS.md"), "Read taskq.md; disposable qualification only.\n").unwrap();
         let attempt = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() * 2;
         for (i, role) in ["worker", "reviewer"].iter().enumerate() {
-            let mut l = Launch { task: 1, title: "Owner-authorized isolated boundary qualification. Follow fixture taskq.md; no board or publication.".into(), attempt: attempt + i as u64, role: role.to_string(), rt: "codex".into(), session: crate::runtime::uuid(), url: "https://github.com/taskqorg/taskq".into(), resume: None };
+            let mut l = Launch { execution: None, task: 1, title: "Owner-authorized isolated boundary qualification. Follow fixture taskq.md; no board or publication.".into(), attempt: attempt + i as u64, role: role.to_string(), rt: "codex".into(), session: crate::runtime::uuid(), url: "https://github.com/taskqorg/taskq".into(), resume: None };
             for turn in 0..2 {
                 std::fs::write(root.join("stage"), turn.to_string()).unwrap();
                 std::fs::remove_file(root.join("proof.json")).ok();

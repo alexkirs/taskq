@@ -7,7 +7,8 @@ Status: design detail for the adopted host model in [taskq.md](../../taskq.md). 
 - One unit per host: `com.taskq.service` (launchd), `TaskQ` (Task Scheduler), `taskq.service` (systemd user). It runs `<install>/taskq service run` with `<install>` as working directory.
 - The process serves every root listed in `<install>/projects`, one project thread each.
 - Host-wide parts run once, in process: admission, the GitHub request budget and rate-limit pause, the update check and re-exec, the tray spawner, the profile appender, hourly request records and bounded log pruning.
-- Per-project parts stay per project: `taskq.json`, `<root>/.taskq/` (`status.json`, `events`, `focus`, `focus.paused`, `kids`, `poke`, `update`, `requests/`, `requests.log`, `incidents/`, attempt logs, `cli-errors.log`, `pm-cursor`, specq cache), worktrees, the project log `<install>/<project>.log` and one heartbeat issue per board.
+- Per-project parts stay per project: `taskq.json`, `<root>/.taskq/` (`status.json`, `events`, `focus`, `focus.paused`, legacy `kids`, `poke`, `update`, `requests/`, `requests.log`, `incidents/`, attempt logs, `cli-errors.log`, `pm-cursor`, specq cache), worktrees, the project log `<install>/<project>.log` and one heartbeat issue per board.
+- Native recovery records stay under protected `<install>/native/`, keyed only by canonical registered project roots; [handover contract](../runtime-qualification.md#adapter-recovery-matrix).
 - `service install` and `service uninstall` in a project edit `<install>/projects` and poke the process; they install or remove the host unit only when it is missing or no project remains.
 
 ## Proposed taskq.md diff
@@ -108,11 +109,11 @@ With:
 
 Replace:
 
-> 3. At step 7 an installed service older than `current` re-execs through the launcher; live CLI children pass over through `<root>/.taskq/kids`; an active Claude, codex-app or operator turn defers it. Detail: [runtime qualification](docs/runtime-qualification.md#contract-detail).
+> 3. At step 7 an installed service older than `current` re-execs through the launcher; live CLI children pass over through the protected native handover record; an active Claude, codex-app or operator turn defers it. Detail: [runtime qualification](docs/runtime-qualification.md#contract-detail).
 
 With:
 
-> 3. At step 7 an installed service older than `current` re-execs through the launcher, once for all projects; on Unix, live CLI children pass over through each `<root>/.taskq/kids` with the same pid; an active Claude, codex-app or operator turn of any project defers it. On Windows, all projects must have no live child or active turn before exit 75; the unit restarts with a new pid, with no child adoption. Detail: [runtime qualification](docs/runtime-qualification.md#contract-detail).
+> 3. At step 7 an installed service older than `current` re-execs through the launcher, once for all projects; on Unix, live CLI children pass over through each project's protected native handover record with the same pid; an active Claude, codex-app or operator turn of any project defers it. On Windows, all projects must have no live child or active turn before exit 75; the unit restarts with a new pid, with no child adoption. Detail: [runtime qualification](docs/runtime-qualification.md#contract-detail).
 
 ### § 8 step 5 (line 271)
 
@@ -171,7 +172,7 @@ After approval, save byte-for-byte originals and the chosen mapping in a bounded
 
 Owner approval of this drain handoff is required before implementation (R13); it replaces the no-drain promise only for the topology migration and its reverse. The first host-service release is N. Legacy services run N-1 or older. After approval of the design and resolved configuration mapping, migration needs no additional owner step on an automatically updating host; it runs once per host, idempotent, in any order across hosts.
 
-1. **Update.** A legacy service applies N through the existing update (§ 8 step 2) and re-execs at step 7 (§ 8 step 3). On Unix, eligible live CLI children pass over through `<root>/.taskq/kids` with the same pid; active Claude, codex-app and operator turns defer it. Windows waits for every child and active turn to finish, exits 75, and the legacy unit starts N with a new pid; Windows does not adopt children.
+1. **Update.** A legacy service applies N through the existing update (§ 8 step 2) and re-execs at step 7 (§ 8 step 3). On Unix, eligible live CLI children pass over through the protected native handover record with the same pid; active Claude, codex-app and operator turns defer it. Windows waits for every child and active turn to finish, exits 75, and the legacy unit starts N with a new pid; Windows does not adopt children.
 2. **Legacy mode.** N started by a per-project unit (working directory is a project root, unit name `com.taskq.<project>`, `TaskQ-<project>` or `taskq-<project>.service`) runs that project in legacy mode:
    - It adds the root to `<install>/projects` if missing, then writes and loads the host unit if missing.
    - It admits nothing new: capacity reason `handoff`. It keeps reaping, resuming answers of its own live attempts, beating and writing `status.json`, so no lease expires.

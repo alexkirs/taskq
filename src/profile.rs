@@ -517,13 +517,9 @@ fn append(path: &Path, r: &Record) -> std::io::Result<()> {
     append_line(path, &format!("{PREFIX}{}\n", serde_json::to_string(r)?))
 }
 
-/// One observation under the profile lock; prefixes retain the existing report/export schemas.
-pub fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
-    static WRITER: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _writer = WRITER.lock().map_err(|_| std::io::Error::other("profile writer poisoned"))?;
-    fs::create_dir_all(path.parent().unwrap())?;
-    let _lock = acquire_log_lock(path, true)?;
-    crate::telemetry::append(path.parent().unwrap(), line, now_ms().unwrap_or(0)).map_err(std::io::Error::other)
+/// Runtime capture owns the destination; the old path argument only preserves producer compatibility.
+pub fn append_line(_path: &Path, line: &str) -> std::io::Result<()> {
+    crate::telemetry::observe(line).map_err(std::io::Error::other)
 }
 
 /// Logical writer path after `init`; its parent owns SQLite and the legacy stream.
@@ -581,11 +577,9 @@ fn render(text: &str) -> Result<String, &'static str> {
     Ok(out)
 }
 
-/// Retained SQLite records plus transactionally imported legacy observations.
+/// Committed universal observations and the read-only historical archive.
 pub(crate) fn read_log(install: &Path) -> Result<String, String> {
-    fs::create_dir_all(install).map_err(|e| e.to_string())?;
-    let _lock = acquire_log_lock(&install.join("taskq.log"), true).map_err(|e| e.to_string())?;
-    crate::telemetry::read(install, now_ms().unwrap_or(0))
+    crate::telemetry::report_input(install)
 }
 
 /// Service-owned pruning uses the same writer boundary as profiling and legacy log rotation.
@@ -795,9 +789,17 @@ pub fn view(install: &Path, name: &str, since: Option<&str>) -> Result<String, S
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
+    pub(crate) fn collecting(dir:&Path)->(coreq::telemetry::capture::Capture,tracing::subscriber::DefaultGuard) {
+        use tracing_subscriber::prelude::*;
+        fs::create_dir_all(dir.join("telemetry.log")).unwrap();
+        let store=std::sync::Arc::new(coreq::telemetry::Store::open_bounded(&dir.join("telemetry.log/universal.sqlite3"),crate::telemetry::budget(dir,"telemetry.sqlite3").unwrap()).unwrap());
+        let capture=coreq::telemetry::capture::Capture::new(store,"taskq","test").unwrap();
+        let guard=tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
+        (capture,guard)
+    }
     #[test]
     fn guide_needs_no_store() {
         let missing = Path::new("/nonexistent/taskq-profile-guide");
@@ -813,14 +815,15 @@ mod tests {
     #[test]
     fn project_threads_keep_stage_identity_and_serialize_appends() {
         let dir = std::env::temp_dir().join(format!("taskq-profile-threads-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap(); let path = dir.join("taskq.log"); let _ = fs::remove_file(&path);
+        fs::create_dir_all(&dir).unwrap(); let (_capture,_guard)=collecting(&dir); let path = dir.join("taskq.log"); let _ = fs::remove_file(&path);
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let dispatch=tracing::dispatcher::get_default(Clone::clone);
         let joins: Vec<_> = ["invented/one", "invented/two"].into_iter().map(|repo| {
-            let (path, barrier) = (path.clone(), barrier.clone());
-            std::thread::spawn(move || {
+            let (path, barrier, dispatch) = (path.clone(), barrier.clone(), dispatch.clone());
+            std::thread::spawn(move || tracing::dispatcher::with_default(&dispatch,|| {
                 project(repo); host("invented-host"); barrier.wait();
                 stage_at(Some(&path), "start", 1, 7, "codex", Some(std::time::Duration::ZERO), "ok", "none", Usage::NoModel);
-            })
+            }))
         }).collect();
         for j in joins { j.join().unwrap(); }
         let text = read_log(&dir).unwrap();
@@ -829,7 +832,7 @@ mod tests {
             assert_eq!(r.host.as_deref(), Some("invented-host")); r.project.unwrap()
         }).collect();
         assert_eq!(projects, ["invented/one".to_string(), "invented/two".to_string()].into_iter().collect());
-        fs::remove_dir_all(dir).unwrap();
+        drop(dispatch);drop(_guard);drop(_capture);fs::remove_dir_all(dir).unwrap();
     }
     // Chain: §4 terminal report; completed owner waits must not erase hand-in evidence,
     // while a new build/review lifetime must expose a later vanished turn.
@@ -878,39 +881,24 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
-    // Chain: § 4 profiling append -> retained log; contention must not lose either appender's records.
+    // Chain: producers enqueue without file I/O; the shared budget lock serializes the eventual commit.
     #[test]
     fn concurrent_appenders_keep_records() {
         let dir = std::env::temp_dir().join(format!("taskq-append-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("taskq.log");
-        let held = log_lock(&path).unwrap();
+        let _=fs::remove_dir_all(&dir);
+        let (capture,_guard)=collecting(&dir);let path=dir.join("taskq.log");
+        let held=log_lock(&path).unwrap();
+        let dispatch=tracing::dispatcher::get_default(Clone::clone);
         std::thread::scope(|scope| {
-            let writers: Vec<_> = (0..2).map(|n| {
-                let path = &path;
-                scope.spawn(move || {
-                    for i in 0..100 { append_line(path, &format!("{n}:{i}\n")).unwrap(); }
-                })
-            }).collect();
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            drop(held);
-            for writer in writers { writer.join().unwrap(); }
+            for _ in 0..2 {let dispatch=&dispatch;let path=&path;scope.spawn(move ||tracing::dispatcher::with_default(dispatch,|| {
+                for _ in 0..100 {append_line(path,r#"taskq-profile {"op":"spawn","us":1,"error":"none","at_ms":1}"#).unwrap();}
+            }));}
         });
-        let text = read_log(&dir).unwrap();
-        assert_eq!(text.lines().count(), 200);
-        for n in 0..2 { for i in 0..100 { assert!(text.lines().any(|l| l == format!("{n}:{i}"))); } }
-        let held = log_lock(&path).unwrap();
-        let began = Instant::now();
-        let timeout = append_line(&path, "not written\n").unwrap_err();
-        assert_eq!(timeout.kind(), std::io::ErrorKind::TimedOut);
-        assert!(began.elapsed() >= std::time::Duration::from_secs(1));
-        assert_eq!(append_error(&timeout), "taskq-profile.lock timeout after 1 s");
-        drop(held);
-        fs::write(&path, "service text\n").unwrap();
-        append_line(&path, "still collected\n").unwrap();
-        assert!(read_log(&dir).unwrap().contains("still collected"));
-        assert!(append_error(&std::io::ErrorKind::PermissionDenied.into()).starts_with("telemetry append failed:"));
-        fs::remove_dir_all(dir).unwrap();
+        drop(held);capture.flush().unwrap();
+        assert_eq!(read_log(&dir).unwrap().lines().count(),200);
+        assert!(!dir.join("telemetry.log/telemetry.sqlite3").exists());
+        assert!(append_line(&path,"not metadata").is_err());
+        drop(dispatch);drop(_guard);drop(capture);fs::remove_dir_all(dir).unwrap();
     }
 
     // Chain: A2/A3 operation -> bounded log -> ranked report. Risk: lost failures, wrong ranks/quantiles,
@@ -920,7 +908,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("taskq-profile-{}", std::process::id()));
         // A failed run leaves its directory; a reused process id must not inherit that log.
         let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(&dir).unwrap(); let (_capture,_guard)=collecting(&dir);
         let path = dir.join("taskq.log");
         assert!(report(&dir).contains("unknown (no observations)"));
         fs::write(&path, "normal taskq diagnostic\n").unwrap();
@@ -971,21 +959,22 @@ mod tests {
         let before = read_log(&dir).unwrap().lines().filter(|l| l.starts_with(PREFIX)).count();
         // New telemetry no longer competes with service diagnostics or the legacy 4 MiB bound.
         OpenOptions::new().append(true).open(&path).unwrap().write_all("normal log\n".repeat(crate::data::LOG_MAX as usize / 11 + 1).as_bytes()).unwrap();
+        let dispatch=tracing::dispatcher::get_default(Clone::clone);
         std::thread::scope(|scope| {
-            for _ in 0..4 { scope.spawn(|| {
+            for _ in 0..4 { scope.spawn(|| tracing::dispatcher::with_default(&dispatch,|| {
                 for _ in 0..50 {
                     if append(&path, &Record { op: "spawn".into(), us: 1, error: "none".into(), at_ms: Some(1), trace: None }).is_ok() {
                         successful.fetch_add(1, Ordering::Relaxed);
                     }
                 }
-            }); }
+            })); }
             scope.spawn(|| { for _ in 0..50 { crate::data::trim_tail(&path, crate::data::LOG_MAX); } });
         });
         let records = read_log(&dir).unwrap().lines().filter(|l| l.starts_with(PREFIX)).count();
         assert_eq!(successful.load(Ordering::Relaxed), 200);
         assert_eq!(records, before + 200);
         assert!(!report(&dir).starts_with("Profile: unknown"));
-        fs::remove_dir_all(dir).unwrap();
+        drop(dispatch);drop(_guard);drop(_capture);fs::remove_dir_all(dir).unwrap();
     }
 
     // Chain: #1147 attempt stage -> runtime usage from the attempt log -> bounded log -> per-runtime report.
@@ -994,7 +983,7 @@ mod tests {
     fn attempt_stage_trace() {
         let dir = std::env::temp_dir().join(format!("taskq-stage-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(&dir).unwrap(); let (_capture,_guard)=collecting(&dir);
         let (path, attempt) = (dir.join("taskq.log"), dir.join("attempt.log"));
         assert!(report(&dir).contains("Attempt stages: unknown (no observations)"));
         let claude = r#"{"type":"assistant","message":{"id":"m1","usage":{"input_tokens":10,"cache_read_input_tokens":100,"cache_creation_input_tokens":5}}}"#;
@@ -1084,8 +1073,9 @@ Changed: x"))];
         assert!(text.contains("| claim | other | 1 | 3.000/3.000/3.000 | failed http5xx:1 | none (no model) | none (no model) |"), "{text}");
         assert!(text.contains("| review | codex | 1 | 6.000/6.000/6.000 | unknown left-board:1 |"), "{text}");
         fs::write(&path, format!("{log}{STAGE_PREFIX}{{\"stage\":\"lunch\"}}\n")).unwrap();
-        assert!(report(&dir).contains("Attempt stages: unknown (corrupt stage record; log kept)"));
-        fs::remove_dir_all(dir).unwrap();
+        assert!(report(&dir).contains("legacy telemetry awaits service import"));
+        assert_eq!(fs::read_to_string(&path).unwrap(),format!("{log}{STAGE_PREFIX}{{\"stage\":\"lunch\"}}\n"));
+        drop(_guard);drop(_capture);fs::remove_dir_all(dir).unwrap();
     }
     // Chain: #1174 retained records -> `profile export` (header, one row per observation) -> `profile tasks` and `profile board`.
     // Risk: a record lost or invented, columns drift for DashQ, one task number merged across projects, unknown shown as a number.

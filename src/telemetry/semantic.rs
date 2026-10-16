@@ -2,7 +2,6 @@
 use serde_json::{Value,json};
 
 type Res<T> = Result<T,String>;
-#[cfg(test)]
 pub(super) const KINDS:&[&str]=&["operation","stage","board","transition","requests"];
 
 fn canonical(line: &str) -> Res<Value> {
@@ -18,7 +17,6 @@ fn fields(kind: &str) -> Res<&'static [(&'static str,&'static str)]> {
         _ => return Err("unknown semantic kind".into()),
     })
 }
-#[cfg(test)]
 fn prefix(kind: &str) -> Res<&'static str> {
     match kind {"operation"=>Ok("taskq-profile"),"stage"=>Ok("taskq-stage"),"board"=>Ok("taskq-board"),"transition"=>Ok("taskq-transition"),"requests"=>Ok("taskq-requests"),_=>Err("unknown semantic kind".into())}
 }
@@ -53,7 +51,6 @@ pub(super) fn observation(line: &str) -> Res<Value> {
     Ok(value)
 }
 
-#[cfg(test)]
 pub(super) fn line(value: &Value) -> Res<String> {
     if value.get("group_id").is_some() {return Err("count summary needs complete assembly".into());}
     if value["product"]!="taskq" {return Err("foreign semantic product".into());}
@@ -83,8 +80,7 @@ pub(super) fn lines(values: &[Value]) -> Res<Vec<String>> {
 }
 
 /// Compatibility report input from bounded indexed pages, never a scan of generic method payloads.
-#[cfg(test)]
-pub(super) fn read(store: &coreq::telemetry::Store,kinds: &[&str]) -> Res<String> {
+pub(super) fn read(store: &coreq::telemetry::Reader,kinds: &[&str]) -> Res<String> {
     let mut reader=coreq::telemetry::Assembler::default();let mut text=String::new();let mut after=0;
     loop {
         let page=store.export_kinds(kinds,0,after,1024)?;
@@ -150,8 +146,8 @@ mod tests {
         let dir=std::env::temp_dir().join(format!("taskq-indexed-read-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));std::fs::create_dir(&dir).unwrap();let path=dir.join("db");let store=coreq::telemetry::Store::open(&path).unwrap();
         let generic=coreq::telemetry::Event::new(json!({"product":"taskq","version":"1","operation":"generic.method","kind":"method","trace":"trace","span":"span","started_ms":1,"outcome":"ok","error":"none"})).unwrap();store.append(&[generic]).unwrap();
         let stage=r#"taskq-stage {"stage":"claim","task":1,"attempt":2,"rt":"other","us":1,"outcome":"ok","error":"none","at_ms":1,"unknown":"no-model"}"#;store.append(&[coreq::telemetry::Event::new(observation(stage).unwrap()).unwrap()]).unwrap();
-        let text=read(&store,&["stage"]).unwrap();assert_eq!(text.lines().count(),1);assert_eq!(canonical(text.trim()).unwrap(),canonical(stage).unwrap());assert!(read(&store,&["board"]).unwrap().is_empty());
-        drop(store);std::fs::remove_dir_all(dir).unwrap();
+        let reader=coreq::telemetry::Reader::open(&path).unwrap();let text=read(&reader,&["stage"]).unwrap();assert_eq!(text.lines().count(),1);assert_eq!(canonical(text.trim()).unwrap(),canonical(stage).unwrap());assert!(read(&reader,&["board"]).unwrap().is_empty());
+        drop(reader);drop(store);std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
     fn unsupported_or_unsafe_source_metadata_is_refused() {

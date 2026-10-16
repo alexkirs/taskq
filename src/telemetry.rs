@@ -1,4 +1,4 @@
-//! Installation-local telemetry. Writers hold taskq-profile.lock; export owns read-only snapshots.
+//! Installation-local telemetry. All storage mutations share the installation budget lock; export is read-only.
 mod semantic;
 #[cfg(test)]
 mod source;
@@ -8,16 +8,25 @@ use std::path::Path;
 use std::io::Read;
 
 const APP: i64 = 0x5451544d;
-const PAGES: u64 = 7168; // 28 MiB database + at most 29 MiB WAL + 1 MiB SHM + 4 MiB legacy log < 64 MiB.
 const LINE_MAX: usize = 64 << 10;
 const WINDOW_MS: u64 = 30 * 86400 * 1000;
 const LEGACY_MAX: u64 = crate::data::LOG_MAX + LINE_MAX as u64;
+
+/// Reserve bounded text growth, peer SHM creation and fixed IPC/lock metadata; count existing files too.
+pub(crate) fn budget(install:&Path,peer:&str)->Result<coreq::telemetry::Budget,String> {
+    let install=std::path::absolute(install).map_err(|e|e.to_string())?;
+    let dir=install.join("telemetry.log");
+    Ok(coreq::telemetry::Budget {lock:install.join("taskq-profile.lock"),
+        peers:vec![dir.join(peer),dir.join(format!("{peer}-wal")),dir.join(format!("{peer}-shm")),install.join("taskq.log")],
+        total:64<<20,reserved:LEGACY_MAX+(2<<20)})
+}
 
 fn open(install: &Path) -> Result<Connection, String> {
     // Older release sweep keeps *.log entries, including directories; rollback must preserve DB and sidecars together.
     let dir = install.join("telemetry.log");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let path = dir.join("telemetry.sqlite3");
+    let ceiling=budget(install,"universal.sqlite3")?.check_files(&path)?;
     let exists = path.exists();
     let db = Connection::open(&path).map_err(|e| format!("telemetry SQLite: {e}"))?;
     db.busy_timeout(std::time::Duration::from_secs(1)).map_err(|e| e.to_string())?;
@@ -26,9 +35,12 @@ fn open(install: &Path) -> Result<Connection, String> {
     if exists && (app != APP || version != 1) {
         return Err("telemetry SQLite: foreign or unsupported schema; file kept".into());
     }
+    let page:i64=db.pragma_query_value(None,"page_size",|r|r.get(0)).map_err(|e|e.to_string())?;
+    let pages:i64=db.pragma_query_value(None,"page_count",|r|r.get(0)).map_err(|e|e.to_string())?;
+    if page<1024||pages>ceiling/page {return Err("telemetry installation budget exhausted; legacy archive preserved".into());}
     db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA temp_store=MEMORY; PRAGMA cache_spill=OFF; PRAGMA cache_size=-32768; PRAGMA wal_autocheckpoint=0;")
         .map_err(|e| e.to_string())?;
-    db.pragma_update(None, "max_page_count", PAGES as i64).map_err(|e| e.to_string())?;
+    db.pragma_update(None, "max_page_count", ceiling/page).map_err(|e| e.to_string())?;
     if !exists {
         db.execute_batch(&format!("BEGIN IMMEDIATE; PRAGMA application_id={APP}; PRAGMA user_version=1;
             CREATE TABLE records(seq INTEGER PRIMARY KEY, retained_ms INTEGER NOT NULL, line TEXT NOT NULL);
@@ -78,16 +90,16 @@ fn telemetry(line: &str) -> bool {
 }
 
 fn space(db: &Connection, bytes: usize) -> Result<(), String> {
-    let reserve = (bytes as u64).div_ceil(4096) * 2 + 32;
-    loop {
-        checkpoint(db)?;
-        let pages: i64 = db.query_row("PRAGMA page_count", [], |r| r.get(0)).map_err(|e| e.to_string())?;
-        let free: i64 = db.query_row("PRAGMA freelist_count", [], |r| r.get(0)).map_err(|e| e.to_string())?;
-        if (pages - free).max(0) as u64 + reserve < PAGES { return Ok(()); }
-        if db.execute("DELETE FROM records WHERE seq IN (SELECT seq FROM records ORDER BY seq LIMIT 256)", []).map_err(|e| e.to_string())? == 0 {
-            return Err("telemetry SQLite full; retained legacy checkpoint kept".into());
-        }
+    checkpoint(db)?;
+    let page:i64=db.pragma_query_value(None,"page_size",|r|r.get(0)).map_err(|e|e.to_string())?;
+    let ceiling:i64=db.pragma_query_value(None,"max_page_count",|r|r.get(0)).map_err(|e|e.to_string())?;
+    let pages:i64=db.pragma_query_value(None,"page_count",|r|r.get(0)).map_err(|e|e.to_string())?;
+    let free:i64=db.pragma_query_value(None,"freelist_count",|r|r.get(0)).map_err(|e|e.to_string())?;
+    let reserve=(bytes as u64).div_ceil(page as u64)*2+32;
+    if (pages-free).max(0) as u64+reserve>=ceiling as u64 {
+        return Err("legacy import full; source archive preserved; migration required".into());
     }
+    Ok(())
 }
 
 fn legacy_offset(db: &Connection, text: &str) -> Result<Option<usize>, String> {
@@ -128,6 +140,27 @@ fn import(db: &mut Connection, install: &Path, now: u64) -> Result<(), String> {
     checkpoint(db)
 }
 
+/// Metadata-only product records share the installed capture queue and its health.
+pub fn observe(line:&str)->Result<(),String> {
+    if line.len()>LINE_MAX {return Err("telemetry append exceeds 64 KiB".into());}
+    coreq::telemetry::capture::observe(semantic::observation(line.trim_end())?)
+}
+
+pub fn report_input(install:&Path)->Result<String,String> {
+    // Include this process's admitted records before taking the committed snapshot.
+    tracing::dispatcher::get_default(|d|d.downcast_ref::<coreq::telemetry::capture::Capture>().cloned()).map(|capture|capture.flush()).transpose()?;
+    tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(),|| {
+        let mut text=legacy_rows(install)?.into_iter().map(|(_,_,line)|line+"\n").collect::<String>();
+        let path=install.join("telemetry.log/universal.sqlite3");
+        if path.try_exists().map_err(|e|e.to_string())? {
+            let reader=coreq::telemetry::Reader::open(&path)?;
+            text.push_str(&semantic::read(&reader,semantic::KINDS)?);
+        }
+        Ok(text)
+    })
+}
+
+#[cfg(test)]
 pub fn append(install: &Path, line: &str, now: u64) -> Result<(), String> {
     if line.len() > LINE_MAX { return Err("telemetry append exceeds 64 KiB".into()); }
     let mut db = open(install)?;
@@ -141,6 +174,7 @@ pub fn append(install: &Path, line: &str, now: u64) -> Result<(), String> {
 }
 
 pub fn read(install: &Path, now: u64) -> Result<String, String> {
+    if !has_legacy(install)? {return Ok(String::new());}
     let mut db = open(install)?;
     import(&mut db, install, now)?;
     let mut statement = db.prepare("SELECT line FROM records ORDER BY seq").map_err(|e| e.to_string())?;
@@ -151,13 +185,12 @@ pub fn read(install: &Path, now: u64) -> Result<String, String> {
 }
 
 /// Transitional archive view; the service alone imports text and performs retention.
-fn legacy_export(install: &Path,since:Option<u64>) -> Result<(serde_json::Value,String),String> {
-    use serde_json::json;
+fn legacy_rows(install: &Path) -> Result<Vec<(i64,i64,String)>,String> {
     let path=install.join("telemetry.log/telemetry.sqlite3");
     match std::fs::metadata(&path) {
         Err(e) if e.kind()==std::io::ErrorKind::NotFound => {
             if legacy_text(install)?.lines().any(telemetry) {return Err("legacy telemetry awaits service import".into());}
-            return Ok((json!({"state":"absent","samples":0}),String::new()));
+            return Ok(Vec::new());
         }
         Err(e)=>return Err(e.to_string()),Ok(_)=>{}
     }
@@ -174,11 +207,22 @@ fn legacy_export(install: &Path,since:Option<u64>) -> Result<(serde_json::Value,
     let rows=statement.query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?))).map_err(|e|e.to_string())?
         .collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
     drop(statement);drop(db);drop(_lock);
+    if rows.iter().any(|(seq,received,line)|*seq<=0||*received<0||line.len()>LINE_MAX) {
+        return Err("legacy snapshot: invalid retained record".into());
+    }
+    Ok(rows)
+}
+
+fn legacy_export(install:&Path,since:Option<u64>)->Result<(serde_json::Value,String),String> {
+    use serde_json::json;
+    let rows=legacy_rows(install)?;
+    if !install.join("telemetry.log/telemetry.sqlite3").try_exists().map_err(|e|e.to_string())? {
+        return Ok((json!({"state":"absent","samples":0}),String::new()));
+    }
     let bounds=rows.first().zip(rows.last()).map(|(first,last)|[first.0,last.0]);
     let mut out=String::new();let mut samples=0;let mut unknown=0;
     let (mut first,mut last)=(None::<u64>,None::<u64>);
     for (seq,received,line) in rows {
-        if seq<=0||received<0||line.len()>LINE_MAX {return Err("legacy snapshot: invalid retained record".into());}
         let value=semantic::observation(&line)?;
         if let Some(time)=value["started_ms"].as_u64() {
             if time>i64::MAX as u64 {return Err("legacy snapshot: invalid source time".into());}
@@ -220,8 +264,14 @@ fn export_snapshot(install:&Path,since:Option<u64>) -> Result<String,String> {
     Ok(header.to_string()+"\n"+&out+&old)
 }
 
-/// Existing service owns retention; failed pruning preserves both stores and is reported by its caller.
+fn has_legacy(install:&Path)->Result<bool,String> {
+    Ok(install.join("telemetry.log/telemetry.sqlite3").try_exists().map_err(|e|e.to_string())?
+        || legacy_text(install)?.lines().any(telemetry))
+}
+
+/// Existing service owns archive retention; never create an empty replacement legacy sink.
 pub fn prune(install: &Path, now: u64) -> Result<(), String> {
+    if !has_legacy(install)? {return Ok(());}
     let mut db = open(install)?;
     import(&mut db, install, now)?;
     loop {
@@ -237,17 +287,69 @@ pub fn prune(install: &Path, now: u64) -> Result<(), String> {
 mod tests {
     use super::*;
     fn dir() -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("taskq-sqlite-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
-        std::fs::create_dir_all(&d).unwrap(); d
+        let d = std::env::temp_dir().join(format!("taskq-sqlite-{}-{}", std::process::id(), crate::runtime::uuid()));
+        std::fs::create_dir(&d).unwrap(); d
     }
     // Chain: retained semantic history + automatic observations -> read-only schema2 agent export.
+    #[test]
+    fn live_capacity_counts_retained_archive_without_deleting_it() {
+        let d=dir();drop(crate::profile::log_lock(&d.join("taskq.log")).unwrap());
+        let path=d.join("telemetry.log/universal.sqlite3");std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let live=coreq::telemetry::Store::open_bounded(&path,budget(&d,"telemetry.sqlite3").unwrap()).unwrap();
+        let before=live.storage().unwrap()["database_limit"].as_i64().unwrap();
+        let archive_count;
+        {
+            let _lock=crate::profile::log_lock(&d.join("taskq.log")).unwrap();let old=open(&d).unwrap();
+            old.execute("INSERT INTO records(retained_ms,line) VALUES(1,?1)",[r#"taskq-profile {"op":"spawn","us":1,"error":"none","at_ms":1}"#]).unwrap();
+            for _ in 0..17 {checkpoint(&old).unwrap();old.execute("INSERT INTO records(retained_ms,line) SELECT retained_ms,line FROM records",[]).unwrap();}
+            checkpoint(&old).unwrap();archive_count=old.query_row("SELECT count(*) FROM records",[],|r|r.get::<_,i64>(0)).unwrap();
+        }
+        let event=coreq::telemetry::Event::new(semantic::observation(r#"taskq-profile {"op":"spawn","us":2,"error":"none","at_ms":2}"#).unwrap()).unwrap();
+        live.append(&[event]).unwrap();let storage=live.storage().unwrap();
+        assert!(storage["database_limit"].as_i64().unwrap()<before);
+        assert!(storage["installation_accounted_bytes"].as_u64().unwrap()<=64<<20);
+        let _lock=crate::profile::log_lock(&d.join("taskq.log")).unwrap();let old=open(&d).unwrap();
+        assert_eq!(old.query_row("SELECT count(*) FROM records",[],|r|r.get::<_,i64>(0)).unwrap(),archive_count);
+        drop(old);drop(_lock);drop(live);std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn live_semantics_use_the_installed_capture_and_leave_no_legacy_sink() {
+        use tracing_subscriber::prelude::*;
+        let d=dir();std::fs::create_dir(d.join("telemetry.log")).unwrap();
+        let store=std::sync::Arc::new(coreq::telemetry::Store::open_bounded(&d.join("telemetry.log/universal.sqlite3"),budget(&d,"telemetry.sqlite3").unwrap()).unwrap());
+        let capture=coreq::telemetry::capture::Capture::new(store.clone(),"taskq","test").unwrap();
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(capture.clone()),|| {
+            let _action=tracing::info_span!("fixture.command").entered();
+            crate::profile::append_line(&d.join("taskq.log"),r#"taskq-stage {"stage":"claim","task":1,"attempt":2,"rt":"other","us":1,"outcome":"ok","error":"none","at_ms":1,"unknown":"no-model"}"#).unwrap();
+            for line in [
+                r#"taskq-profile {"op":"spawn","us":1,"error":"none","at_ms":1}"#,
+                r#"taskq-board {"op":"close","us":12,"outcome":"failed","error":"http4xx","remaining":null,"at_ms":1}"#,
+                r#"taskq-transition {"project":"other","task":1,"entry":2,"from":"doing","to":"ask","prev_s":null,"rt":null,"host":null,"at_ms":1}"#,
+                r#"taskq-requests {"at_ms":1,"source":"worker service status","ops":{"GET issues/N/comments":7}}"#,
+            ] {crate::profile::append_line(&d.join("taskq.log"),line).unwrap();}
+        });
+        capture.flush().unwrap();
+        assert!(!d.join("telemetry.log/telemetry.sqlite3").exists(),"live semantic events must use the installed writer");
+        let rows=store.export_kinds(&["stage"],0,0,1024).unwrap();
+        let event=&rows["events"][0]["observation"];
+        assert_eq!(event["version"],"test");assert!(event["trace"].is_string());
+        let report=crate::profile::read_log(&d).unwrap();
+        assert_eq!(report.lines().count(),5);
+        for prefix in ["taskq-profile ","taskq-stage ","taskq-board ","taskq-transition ","taskq-requests "] {
+            assert!(report.lines().any(|line|line.starts_with(prefix)),"{prefix}");
+        }
+        drop(capture);drop(store);std::fs::remove_dir_all(d).unwrap();
+    }
+
     #[test]
     fn export_preserves_history_unknowns_and_refuses_unimported_tail() {
         let d=dir();
         let old="taskq-profile {\"op\":\"spawn\",\"us\":7,\"error\":\"none\",\"at_ms\":1}\n";
         let unknown="taskq-profile {\"op\":\"spawn\",\"us\":8,\"error\":\"none\",\"at_ms\":null}\n";
-        crate::profile::append_line(&d.join("taskq.log"),old).unwrap();
-        crate::profile::append_line(&d.join("taskq.log"),unknown).unwrap();
+        drop(crate::profile::log_lock(&d.join("taskq.log")).unwrap());
+        append(&d,old,1).unwrap();
+        append(&d,unknown,1).unwrap();
         let store=coreq::telemetry::Store::open(&d.join("telemetry.log/universal.sqlite3")).unwrap();
         store.append(&[coreq::telemetry::Event::new(serde_json::json!({"product":"taskq","version":"1","operation":"resume","kind":"method","trace":"t","span":"s","started_ms":2000,"outcome":"failed","error":"returned-error"})).unwrap()]).unwrap();
         drop(store);
@@ -346,15 +448,18 @@ mod tests {
         std::fs::remove_dir_all(d).unwrap();
     }
     #[test]
-    fn pressure_prunes_oldest_and_keeps_total_disk_bound() {
-        let d = dir();
+    fn archive_pressure_refuses_growth_without_deleting_history() {
+        let d=dir();let mut accepted=0;
         for n in 0..600 {
-            append(&d, &format!("{n}:{}\n", "x".repeat(60 << 10)), 100).unwrap();
-            let bytes: u64 = std::fs::read_dir(d.join("telemetry.log")).unwrap().map(|e| e.unwrap().metadata().unwrap().len()).sum();
-            assert!(bytes < 64 << 20, "{bytes}");
+            match append(&d,&format!("{n}:{}\n","x".repeat(60<<10)),100) {
+                Ok(())=>accepted+=1,
+                Err(error)=>{assert!(error.contains("source archive preserved"),"append {n} at {}: {error}",d.display());break;}
+            }
+            let bytes:u64=std::fs::read_dir(d.join("telemetry.log")).unwrap().map(|e|e.unwrap().metadata().unwrap().len()).sum();
+            assert!(bytes<64<<20);
         }
-        let text = read(&d,100).unwrap();
-        assert!(!text.starts_with("0:")); assert!(text.lines().last().unwrap().starts_with("599:"));
+        assert!(accepted>0&&accepted<600);
+        let text=read(&d,100).unwrap();assert_eq!(text.lines().count(),accepted);assert!(text.starts_with("0:"));
         std::fs::remove_dir_all(d).unwrap();
     }
     #[test]

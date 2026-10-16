@@ -43,7 +43,6 @@ use core::{Entry, State, Task, entry, fold};
 use dispatch::{Op, Receipt, act, answer_picks, close_checked, current, deps_open};
 use serde_json::{Value, json};
 use service::{Config, Service};
-#[cfg(unix)]
 use service::Kid;
 use snapshot::in_scope;
 use std::collections::{BTreeMap, HashMap};
@@ -664,36 +663,76 @@ fn sleep_until_poke(paths: &[PathBuf; 2], start: [Option<SystemTime>; 2], secs: 
     }
 }
 
-/// The kids file carries live children across the update re-exec (unix). It names the PID that wrote it: a file from
-/// a crashed process is ignored and its attempts go `gone` (§ 4 restart). A malformed file is unknown: nothing is
-/// adopted and the file stays (§ 4 Data).
-fn kids_file(root: &Path) -> Vec<data::KidLine> {
-    let path = dot(root).join("kids");
-    let parsed = match fs::read_to_string(&path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return vec![],
-        Err(e) => Err(format!("kids: unreadable ({e}); file kept")),
-        Ok(t) => data::kids(&t),
-    };
-    match parsed {
-        Err(e) => {
-            log!("{e}; its attempts go gone");
-            vec![]
-        }
-        Ok((pid, kids)) => {
-            let _ = fs::remove_file(&path);
-            if pid == std::process::id() { kids } else { vec![] }
-        }
-    }
+/// Read-only recovery evidence; failed identity reads and a still-live foreign owner prevent takeover.
+fn kids_path(install:&Path,root:&Path)->Res<PathBuf> {
+    let root=root.canonicalize().map_err(|e|format!("native recovery root unavailable: {e}"))?;
+    let root=root.to_str().ok_or("native recovery root is not UTF-8")?;
+    let hash:String=ring::digest::digest(&ring::digest::SHA256,root.as_bytes()).as_ref().iter().map(|b|format!("{b:02x}")).collect();
+    Ok(install.join("native").join(format!("{hash}.kids")))
 }
 
-fn adopt(s: &mut Service, root: &Path) {
-    let kids = kids_file(root);
-    #[cfg(unix)]
-    for (task, attempt, rt, pid, delivered) in kids {
-        s.adopt(Kid { task, attempt, rt, proc: Box::new(runtime::Adopted(pid)) }, delivered);
+fn kids_file(install:&Path,root: &Path) -> Res<Vec<data::KidLine>> {
+    use std::io::Read;
+    let path = kids_path(install,root)?;
+    let file = match fs::File::open(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return match fs::symlink_metadata(dot(root).join("kids")) {
+                Err(e) if e.kind()==std::io::ErrorKind::NotFound=>Ok(vec![]),
+                _=>Err("legacy project kids record requires native reconciliation; file kept".into()),
+            };
+        },
+        Err(e) => return Err(format!("kids: unreadable ({e}); file kept")),
+        Ok(file) => file,
+    };
+    let mut text=String::new();
+    file.take(data::KIDS_MAX+1).read_to_string(&mut text).map_err(|e|format!("kids: unreadable ({e}); file kept"))?;
+    let (owner,kids)=data::kids(&text)?;
+    let current=coreq::process::identity(std::process::id()).map_err(|e|format!("service identity unknown: {e}"))?;
+    if current.as_ref()!=Some(&owner) && coreq::process::identity(owner.pid).map_err(|e|format!("kids: previous service identity unknown: {e}; file kept"))?.as_ref()==Some(&owner) {
+        return Err("kids: previous service still alive; file kept, native reconciliation required".into());
     }
-    #[cfg(not(unix))]
-    let _ = (s, kids);
+    Ok(kids)
+}
+
+fn adopt(s: &mut Service, install:&Path, root: &Path) -> Res<()> {
+    let kids = kids_file(install,root)?;
+    for k in kids {
+        let history=board::entries(s.board,k.task)?;
+        let execution=core::executions(k.task,&history).into_iter().find(|x|x.id==k.execution && x.attempt==k.attempt && x.host==s.cfg.me && x.runtime==k.runtime)
+            .ok_or("native recovery identity does not match board ownership; file kept")?;
+        match execution.release {
+            Some(core::Release::Exit)=>{
+                if runtime::released_execution_live(&k).map_err(|e|format!("released native scope unknown: {e}"))? {
+                    return Err("board exit contradicts a live native identity; file kept for reconciliation".into());
+                }
+                retire_kid(&s.cfg,k.task,k.attempt,k.execution)?;
+                continue;
+            },
+            Some(core::Release::NoStart)=>return Err("board no-start contradicts a recorded native process; file kept".into()),
+            None=>{},
+        }
+        if k.runtime=="claude" {
+            let proc=runtime::recover(root,install,k.task,&execution)?;
+            s.adopt(Kid {execution:k.execution,task:k.task,attempt:k.attempt,rt:k.runtime,proc})?;
+            continue;
+        }
+        #[cfg(windows)]
+        let native:Box<dyn runtime::Proc>=Box::new(runtime::windows_process::Execution::recover(k.process.clone(),k.job.as_deref().ok_or("legacy Windows execution has no native job scope; file kept")?)?);
+        #[cfg(unix)]
+        let native:Box<dyn runtime::Proc>={
+            if k.job.is_some() {return Err("Windows native scope cannot be adopted on Unix; file kept".into());}
+            Box::new(runtime::Adopted::new(k.process.clone()))
+        };
+        let worker=runtime::attempt_log(root,"worker",k.task,k.attempt);
+        let reviewer=runtime::attempt_log(root,"reviewer",k.task,k.attempt);
+        let log=match (worker.is_file(),reviewer.is_file()) {
+            (true,false)=>worker,(false,true)=>reviewer,
+            _=>return Err("kids: native attempt log missing or ambiguous; file kept".into()),
+        };
+        let proc=runtime::CliTurn {proc:native,log,pos:k.offset,start:k.offset,stopping:false,accepted:false,read_error:None,native:Some(k.process),recovery:None};
+        s.adopt(Kid { execution:k.execution,task:k.task,attempt:k.attempt,rt:k.runtime,proc:Box::new(proc) })?;
+    }
+    Ok(())
 }
 
 fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
@@ -710,6 +749,7 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
         } else { runtime::spawn(&env, l) }
     };
     let mut s = Service::new(c.board.as_ref(), cfg, platform::VERSION, Box::new(start));
+    s.recover = Some(Box::new(|task, execution| runtime::recover(&cfg.root, &cfg.install, task, execution)));
     s.host = host.clone();
     s.instance = enrollment::installation_id(&cfg.install).map(|id| service_id(&id))?;
     // § 4 machine line: agentq's `host.name` is the same `hostname` output; WSL as agentq detects it
@@ -727,7 +767,7 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
         }
         std::thread::sleep(Duration::from_secs(cfg.poll.max(1)));
     }
-    adopt(&mut s, &cfg.root);
+    adopt(&mut s, &cfg.install, &cfg.root)?;
     let is_installed = installed(&cfg.install);
     let began = Instant::now();
     log!("{}", incident::disclosure(Some(&cfg.root)));
@@ -864,7 +904,7 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
         }
         for (k, v) in [("focus", if focus_error.is_some() { Value::Null } else { json!(s.focus) }), ("focus_error", json!(focus_error)), ("focus_command",command), ("kids", json!(kids)), ("issues", json!(issues)), ("log", json!(log)),
             ("tasks_age_seconds", json!(s.tasks_read.map(|t| t.elapsed().as_secs()))), ("request", json!(request)), ("events_since", json!(s.events_since)),
-            ("capacity", s.capacity_json()), ("hold", json!(s.hold)), ("access", json!(access.iter().map(|e| e.json()).collect::<Vec<_>>())), ("agents", json!(agents.as_ref().map(|a| &a.1))),
+            ("execution_waits", json!(s.execution_waits)), ("capacity", s.capacity_json()), ("hold", json!(s.hold)), ("access", json!(access.iter().map(|e| e.json()).collect::<Vec<_>>())), ("agents", json!(agents.as_ref().map(|a| &a.1))),
             ("restart_waits", json!(d.join("restart").exists().then(|| restart_waits(&s, &cfg.root)))),
             ("incident", incident::status(&cfg.root)), ("incident_notice", json!(incident::notice(&cfg.root))),
             ("requests", requests_json), ("connection", json!(dashq.outcome))]
@@ -921,7 +961,7 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
         // § 4 Data: the pruners run hourly
         if !reduced && pruned.is_none_or(|t| t.elapsed().as_secs() >= 3600) {
             pruned = Some(Instant::now());
-            let live: Vec<u64> = s.kids.iter().map(|k| k.attempt).collect();
+            let live = s.retained_attempts();
             for l in data::prune(&cfg.root, &cfg.install, &project, &live) {
                 log!("{l}");
             }
@@ -1008,13 +1048,58 @@ fn publish_status(tool: &coreq::Tool, root: &Path, status: &Value, host: Option<
     qualified
 }
 
-fn save_kids(s: &Service, root: &Path) -> Res<()> {
-    let mut text = format!("pid {}\n", std::process::id());
-    for k in &s.kids { text += &format!("{} {} {} {} {}\n", k.task, k.attempt, k.rt, k.proc.id(), s.delivered(k.attempt)); }
-    platform::write_atomic(&dot(root).join("kids"), &text)
+fn write_kids(install:&Path,root:&Path,kids:&[data::KidLine])->Res<()> {
+    let owner=coreq::process::identity(std::process::id()).map_err(|e|e.to_string())?.ok_or("service native identity missing")?;
+    let mut text=format!("pid {} {} executor-v1\n",owner.pid,owner.started);
+    for k in kids {
+        text+=&format!("{} {} {} {} {} {} {}{}\n",k.task,k.attempt,k.runtime,k.process.pid,k.process.started,k.execution,k.offset,k.job.as_ref().map(|key|format!(" job-global:{key}")).unwrap_or_default());
+    }
+    data::kids(&text)?;
+    let path=kids_path(install,root)?;
+    fs::create_dir_all(path.parent().unwrap()).map_err(|e|e.to_string())?;
+    coreq::write_durable(&path, &text)
 }
 
-/// A failed reduced loop no longer beats or touches the board. Its exact handles still fence an image switch.
+fn checkpoint_kid(install:&Path,root:&Path,kid:data::KidLine)->Res<()> {
+    let mut kids=kids_file(install,root)?;
+    if let Some(old)=kids.iter_mut().find(|k|k.task==kid.task) {
+        if *old==kid { return Ok(()) }
+        if old.execution>=kid.execution { return Err("execution already has different or newer native recovery identity; file kept".into()); }
+        if runtime::execution_live(old)? {
+            return Err("previous native execution still present; recovery identity kept".into());
+        }
+        *old=kid;
+    } else { kids.push(kid); }
+    write_kids(install,root,&kids)
+}
+
+/// Called only after the exact execution's native Exit has been read back from the board.
+fn retire_kid(cfg:&Config,task:u64,attempt:u64,execution:u64)->Res<()> {
+    let mut kids=kids_file(&cfg.install,&cfg.root)?;
+    let before=kids.len();
+    kids.retain(|k|!(k.task==task && k.attempt==attempt && k.execution==execution));
+    if kids.len()==before { return Ok(()) }
+    write_kids(&cfg.install,&cfg.root,&kids)
+}
+
+fn save_kids(s: &Service, root: &Path) -> Res<()> {
+    let mut kids=vec![];
+    for k in &s.kids {
+        let process=k.proc.native_identity()?;
+        if coreq::process::identity(process.pid).map_err(|e|e.to_string())?.as_ref()!=Some(&process) { return Err("child identity changed during handover; reconcile before retry".into()); }
+        kids.push(data::KidLine {task:k.task,attempt:k.attempt,runtime:k.rt.clone(),process,execution:k.execution,offset:k.proc.input_offset()?,job:k.proc.job()});
+    }
+    for old in kids_file(&s.cfg.install,root)? {
+        if kids.contains(&old) { continue; }
+        let log=board::entries(s.board,old.task)?;
+        if !core::executions(old.task,&log).iter().any(|x|x.id==old.execution && x.attempt==old.attempt && x.host==s.cfg.me && x.runtime==old.runtime && x.release==Some(core::Release::Exit)) {
+            return Err("unresolved native recovery record cannot be discarded during handover".into());
+        }
+    }
+    write_kids(&s.cfg.install,root,&kids)
+}
+
+/// A failed reduced loop retains its handles; an image switch also needs recovery evidence.
 fn stopped_handoff(s: &mut Service, host: &host::Shared, cfg: &Config) -> Res<bool> {
     s.reap_owned();
     s.sync_host();
@@ -1534,11 +1619,7 @@ fn reexec(s: &Service, cfg: &Config) -> Res<()> {
     if !restart_waits(s, &cfg.root).is_empty() {
         return fs::write(dot(&cfg.root).join("restart"), "").map_err(|e| e.to_string());
     }
-    let mut text = format!("pid {}\n", std::process::id());
-    for k in &s.kids {
-        text += &format!("{} {} {} {} {}\n", k.task, k.attempt, k.rt, k.proc.id(), s.delivered(k.attempt));
-    }
-    platform::write_atomic(&dot(&cfg.root).join("kids"), &text)?;
+    save_kids(s, &cfg.root)?;
     let mut command = std::process::Command::new(cfg.install.join(platform::tool(&cfg.install).exe_name()));
     command.args(["service", "run"]);
     coreq::telemetry::capture::before_exec();
@@ -3267,6 +3348,155 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    // Chain: native image replacement -> exact child/input recovery -> accepted input -> exit receipt.
+    // Risk: a pending acceptance loses its execution or an old turn accepts the new input.
+    #[cfg(unix)]
+    #[test]
+    fn native_image_handover_preserves_pending_input_and_terminal_receipts() {
+        let root=std::env::temp_dir().join(format!("taskq-image-{}",runtime::uuid()));
+        fs::create_dir_all(&root).unwrap();
+        let result=coreq::process::output("qualification.image-handover",std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact","tests::handover_image_child","--ignored","--nocapture"])
+            .env("TASKQ_IMAGE_ROOT",&root).env("TASKQ_IMAGE_PHASE","before"),Duration::from_secs(20));
+        assert!(result.is_ok(),"image handover failed: {result:?}");
+        assert_eq!(fs::read_to_string(root.join("verified")).unwrap(),"same process; exact execution; accepted input; native exit");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // Chain: killed service -> cold restart with a live or already-exited native child -> exact receipt.
+    // Risk: restart loses ownership, invents no-start, or replays the pending input.
+    #[cfg(unix)]
+    #[test]
+    fn native_cold_restart_reconciles_the_original_execution() {
+        let phases=if cfg!(any(target_os="macos",target_os="linux")) { & ["live","ended","cancel"][..] } else { & ["live","ended"][..] };
+        for &phase in phases {
+            let root=std::env::temp_dir().join(format!("taskq-cold-{phase}-{}",runtime::uuid()));
+            fs::create_dir_all(&root).unwrap();
+            let mut command=std::process::Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact","tests::handover_image_child","--ignored","--nocapture"])
+                .env("TASKQ_IMAGE_ROOT",&root).env("TASKQ_IMAGE_COLD",phase)
+                .stdin(std::process::Stdio::null());
+            let mut old=command.env("TASKQ_IMAGE_PHASE","before")
+                .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+            let until=Instant::now()+Duration::from_secs(5);
+            while !root.join("ready").exists() {
+                assert!(old.try_wait().unwrap().is_none(),"old service stopped before its checkpoint");
+                assert!(Instant::now()<until); std::thread::sleep(Duration::from_millis(10));
+            }
+            if phase=="ended" {
+                fs::write(root.join("observe"),"").unwrap(); fs::write(root.join("exit"),"").unwrap();
+                while !root.join("native-exited").exists() { assert!(Instant::now()<until); std::thread::sleep(Duration::from_millis(10)); }
+            }
+            old.kill().unwrap();old.wait().unwrap();
+            let output=coreq::process::output("qualification.cold-restart",command
+                .env("TASKQ_IMAGE_PHASE","after").stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()),Duration::from_secs(8));
+            assert!(output.is_ok(),"{phase} cold recovery failed: {output:?}");
+            assert_eq!(fs::read_to_string(root.join("verified")).unwrap(),"same process; exact execution; accepted input; native exit");
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore="image handover fixture"]
+    fn handover_image_child() {
+        use std::os::unix::process::CommandExt;
+        let root=PathBuf::from(std::env::var_os("TASKQ_IMAGE_ROOT").unwrap());
+        fs::create_dir_all(dot(&root)).unwrap();
+        let b=Fake::default(); let n=b.create("T","",&[service::TASK_LABEL.into()]).unwrap();
+        let a=b.comment(n,"taskq: spawn worker codex:session mac").unwrap();
+        b.comment(n,&format!("taskq: accepted {a} attempt {a}")).unwrap();
+        b.comment(n,&format!("taskq: released {a} exit attempt {a}")).unwrap();
+        let input=b.comment(n,"taskq: steer\ncontinue").unwrap();
+        let execution=b.comment(n,&format!("taskq: executing {input} attempt {a}")).unwrap();
+        let c=Config {root:root.clone(),install:root.join("install"),..cfg()};
+        let mut s=Service::new(&b,&c,"fixture",Box::new(|_|panic!("handover must not submit new work")));
+        let log=runtime::attempt_log(&root,"worker",n,a);
+        let cold=std::env::var("TASKQ_IMAGE_COLD").unwrap_or_default();
+        if std::env::var("TASKQ_IMAGE_PHASE").unwrap()=="before" {
+            let old="{\"type\":\"turn.started\"}\n{\"type\":\"turn.completed\"}\n";
+            fs::write(&log,old).unwrap();
+            let output=fs::File::options().append(true).open(&log).unwrap();
+            let child=std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","tests::handover_native_child","--ignored","--nocapture"])
+                .env("TASKQ_IMAGE_ROOT",&root).stdin(std::process::Stdio::null()).stdout(output).stderr(std::process::Stdio::null()).spawn().unwrap();
+            let native=coreq::process::identity(child.id()).unwrap();
+            s.kids.push(Kid {execution,task:n,attempt:a,rt:"codex".into(),proc:Box::new(runtime::CliTurn {
+                proc:Box::new(child),log,pos:old.len() as u64,start:old.len() as u64,stopping:false,accepted:false,read_error:None,native,recovery:None
+            })});
+            let launch=runtime::Launch {execution:None,task:n,title:String::new(),attempt:a,role:"worker".into(),rt:"codex".into(),session:"session".into(),url:String::new(),resume:Some("continue".into())};
+            s.kids[0].proc.checkpoint(&c,&launch,execution).unwrap();
+            assert_eq!(kids_file(&c.install,&root).unwrap().first().map(|k|k.execution),Some(execution),"successful launch must retain its exact execution before any image handover");
+            if !cold.is_empty() {
+                fs::write(root.join("ready"),"").unwrap();
+                let until=Instant::now()+Duration::from_secs(10);
+                if cold=="ended" {
+                    while s.kids[0].proc.exited().unwrap().is_none() { assert!(Instant::now()<until);std::thread::sleep(Duration::from_millis(10)); }
+                    fs::write(root.join("native-exited"),"").unwrap();
+                }
+                loop { assert!(Instant::now()<until,"fixture service was not killed");std::thread::sleep(Duration::from_millis(10)); }
+            }
+            save_kids(&s,&root).unwrap();
+            coreq::telemetry::capture::before_exec();
+            let error=std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","tests::handover_image_child","--ignored","--nocapture"])
+                .env("TASKQ_IMAGE_ROOT",&root).env("TASKQ_IMAGE_PHASE","after").exec();
+            panic!("exec failed: {error}");
+        }
+        let checkpoint=fs::read_to_string(kids_path(&c.install,&root).unwrap()).unwrap();
+        adopt(&mut s,&c.install,&root).unwrap();
+        assert_eq!(s.kids[0].execution,execution); assert_eq!(s.delivered(a),a);
+        let pid=s.kids[0].proc.id();
+        if cold=="live" && !cfg!(any(target_os="macos",target_os="linux")) {
+            assert!(s.kids[0].proc.kill().unwrap_err().contains("recovered process"),"non-child stop needs a stable native control handle");
+            assert!(coreq::process::identity(pid).unwrap().is_some(),"failed stop cannot signal a reused PID");
+        }
+        s.reap_owned(); if cold!="ended" { assert_eq!(s.delivered(a),a,"old log entries cannot accept this input"); }
+        fs::write(root.join("observe"),"").unwrap();
+        let until=Instant::now()+Duration::from_secs(5);
+        while s.delivered(a)!=input {
+            s.reap_owned(); assert!(Instant::now()<until,"acceptance not observed: {:?}",s.unknown);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if cold=="cancel" { s.kids[0].proc.kill().unwrap(); }
+        else { fs::write(root.join("exit"),"").unwrap(); }
+        if !s.kids.is_empty() {
+            while !s.kids[0].proc.exited().is_ok_and(|code|code.is_some()) { assert!(Instant::now()<until);std::thread::sleep(Duration::from_millis(10)); }
+            let saved=fs::read_to_string(kids_path(&c.install,&root).unwrap()).unwrap();
+            b.state.borrow_mut().fail_comments=1;
+            s.reap_owned();
+            assert!(!s.kids.is_empty(),"failed release readback retains the terminal handle");
+            assert_eq!(fs::read_to_string(kids_path(&c.install,&root).unwrap()).unwrap(),saved,"recovery record survives a failed terminal receipt");
+        }
+        while !s.kids.is_empty() {
+            s.reap_owned(); assert!(Instant::now()<until,"native exit not observed: {:?}",s.unknown);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(coreq::process::identity(pid).unwrap(),None);
+        let records=core::executions(n,&board::entries(&b,n).unwrap());
+        assert!(records.iter().find(|x|x.id==execution).is_some_and(|x|x.accepted && x.release==Some(core::Release::Exit)));
+        if !cold.is_empty() {
+            // Crash after the board receipt but before local cleanup: the stale identity must not block startup.
+            fs::write(kids_path(&c.install,&root).unwrap(),checkpoint).unwrap();
+            adopt(&mut s,&c.install,&root).unwrap();
+            assert!(s.kids.is_empty());
+        }
+        save_kids(&s,&root).unwrap(); assert!(kids_file(&c.install,&root).unwrap().is_empty());
+        fs::write(root.join("verified"),"same process; exact execution; accepted input; native exit").unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore="native process for image handover fixture"]
+    fn handover_native_child() {
+        use std::io::Write;
+        let root=PathBuf::from(std::env::var_os("TASKQ_IMAGE_ROOT").unwrap());
+        let until=Instant::now()+Duration::from_secs(10);
+        while !root.join("observe").exists() { assert!(Instant::now()<until); std::thread::sleep(Duration::from_millis(10)); }
+        println!("\n{{\"type\":\"turn.started\"}}"); std::io::stdout().flush().unwrap();
+        while !root.join("exit").exists() { assert!(Instant::now()<until); std::thread::sleep(Duration::from_millis(10)); }
+    }
+
     // Chain: service install, § 8 step 3 kids file, adoption. Risk: an install from a project with a live child ends it
     #[cfg(unix)]
     #[test]
@@ -3285,17 +3515,24 @@ mod tests {
         fs::write(dot(&root).join("status.json"), format!(r#"{{"kids": [{{"task": 7, "attempt": 41, "rt": "claude", "pid": {pid}}}]}}"#)).unwrap();
         assert!(load_unit(&u, &root).unwrap(), "live child: hand over");
         assert!(dot(&root).join("restart").exists() && !reloaded.exists(), "the running service re-execs; no reload");
-        let mut adopted = runtime::Adopted(pid as i32);
+        let mut adopted = runtime::Adopted::new(coreq::process::identity(pid).unwrap().unwrap());
+        let mut wrong=coreq::process::identity(pid).unwrap().unwrap(); wrong.started.push_str("-wrong");
+        let mut wrong=runtime::Adopted::new(wrong);
+        assert_eq!(wrong.exited(),Ok(Some(-1)),"a different native incarnation proves the recorded one is gone");
+        wrong.kill().unwrap(); // Terminal identity is a no-op; the current incarnation must remain untouched.
         assert_eq!(adopted.exited(), Ok(None), "the child still runs");
         // the re-exec writes the kids file; the new image adopts the child, not `gone`
-        fs::write(dot(&root).join("kids"), format!("pid {}\n7 41 claude {pid} 40\n", std::process::id())).unwrap();
-        assert_eq!(kids_file(&root), vec![(7, 41, "claude".to_string(), pid as i32, 40)]);
+        let owner=coreq::process::identity(std::process::id()).unwrap().unwrap();
+        let native=coreq::process::identity(pid).unwrap().unwrap();
+        let path=kids_path(&root,&root).unwrap();fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, format!("pid {} {} executor-v1\n7 41 codex {pid} {} 43 40\n",owner.pid,owner.started,native.started)).unwrap();
+        assert_eq!(kids_file(&root,&root).unwrap(), vec![data::KidLine {task:7,attempt:41,runtime:"codex".into(),process:native,execution:43,offset:40,job:None}]);
         assert_eq!(adopted.exited(), Ok(None), "adopted live");
         // A real process stands in for an app turn: restart must stay pending and keep its lease.
         let b = Fake::default();
         let c = Config { root: root.clone(), ..cfg() };
         let mut s = Service::new(&b, &c, "test", Box::new(|_| unreachable!()));
-        s.kids.push(Kid { task: 7, attempt: 41, rt: "codex-app".into(), proc: Box::new(runtime::Adopted(pid as i32)) });
+        s.kids.push(Kid { execution: 41, task: 7, attempt: 41, rt: "codex-app".into(), proc: Box::new(runtime::Adopted::new(coreq::process::identity(pid).unwrap().unwrap())) });
         reexec(&s, &c).unwrap();
         assert!(dot(&root).join("restart").exists());
         assert_eq!(restart_waits(&s, &root), ["#7"], "status and log name the task the restart waits for");
@@ -3333,16 +3570,38 @@ mod tests {
         assert!(handover(&root), "unknown keeps them");
         fs::File::options().write(true).open(&st).unwrap().set_modified(SystemTime::now() - Duration::from_secs(120)).unwrap();
         assert!(!handover(&root), "a stale status.json: no running service");
-        let kids = dot(&root).join("kids");
-        assert!(kids_file(&root).is_empty());
+        let kids = kids_path(&root,&root).unwrap(); fs::create_dir_all(kids.parent().unwrap()).unwrap();
+        assert!(kids_file(&root,&root).unwrap().is_empty());
+        let legacy=dot(&root).join("kids"); fs::write(&legacy,"untrusted project recovery record").unwrap();
+        assert!(kids_file(&root,&root).unwrap_err().contains("legacy"));
+        assert_eq!(fs::read_to_string(&legacy).unwrap(),"untrusted project recovery record");
         fs::write(&kids, "pid 1\n7 41 claude\n").unwrap();
-        assert!(kids_file(&root).is_empty());
+        assert!(kids_file(&root,&root).is_err());
         assert_eq!(fs::read_to_string(&kids).unwrap(), "pid 1\n7 41 claude\n", "a malformed kids file stays");
-        fs::write(&kids, format!("pid {}\n7 41 claude 123 40\n", std::process::id())).unwrap();
-        assert_eq!(kids_file(&root), vec![(7, 41, "claude".to_string(), 123, 40)]);
-        assert!(!kids.exists(), "a valid one is consumed");
+        let owner=coreq::process::identity(std::process::id()).unwrap().unwrap();
+        let launcher_only=format!("pid {} {}\n7 41 codex 123 child 43 40\n",owner.pid,owner.started);
+        fs::write(&kids,&launcher_only).unwrap();
+        assert!(kids_file(&root,&root).unwrap_err().contains("legacy launcher"));
+        assert_eq!(fs::read_to_string(&kids).unwrap(),launcher_only,"never upgrade old launcher identity implicitly");
+        let valid=format!("pid {} {} executor-v1\n7 41 codex 123 child 43 40\n",owner.pid,owner.started);
+        fs::write(&kids,&valid).unwrap();
+        assert_eq!(kids_file(&root,&root).unwrap(),vec![data::KidLine {task:7,attempt:41,runtime:"codex".into(),process:coreq::process::Identity {pid:123,started:"child".into()},execution:43,offset:40,job:None}]);
+        assert_eq!(fs::read_to_string(&kids).unwrap(),valid,"readback never deletes recovery evidence");
+        assert!(legacy.exists(),"protected adoption does not delete the legacy artifact");
+        fs::write(&kids,format!("pid {} wrong-creation executor-v1\n",owner.pid)).unwrap();
+        assert!(kids_file(&root,&root).unwrap().is_empty(),"a different service incarnation permits reconciliation, never blind child control");
+        let mut foreign=std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact","runtime::tests::stop_child","--ignored"])
+            .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+        let foreign_id=coreq::process::identity(foreign.id()).unwrap().unwrap();
+        let foreign_record=format!("pid {} {} executor-v1\n",foreign_id.pid,foreign_id.started);
+        fs::write(&kids,&foreign_record).unwrap();
+        assert!(kids_file(&root,&root).unwrap_err().contains("still alive"));
+        foreign.kill().unwrap();foreign.wait().unwrap();
+        assert!(kids_file(&root,&root).unwrap().is_empty());
+        assert_eq!(fs::read_to_string(&kids).unwrap(),foreign_record,"native reads never erase the prior owner's record");
         fs::write(&kids, "pid 1\n7 41 claude 123 40\n").unwrap();
-        assert!(kids_file(&root).is_empty() && !kids.exists(), "another process's file: its attempts go gone");
+        assert!(kids_file(&root,&root).is_err() && kids.exists(), "previous service metadata survives for reconciliation");
         // a corrupt focus pauses nothing away and names its reason
         fs::write(dot(&root).join("focus"), b"\xff").unwrap();
         assert!(pause(&root,false).unwrap_err().contains("not UTF-8"));

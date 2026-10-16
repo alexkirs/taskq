@@ -153,6 +153,10 @@ pub fn cleanup(board: &dyn Board, root: &std::path::Path, mut skip: impl FnMut(u
         if skip(n) || !board.issue(n).is_ok_and(|i| !i.open) {
             continue; // a fresh read must show the issue closed (R12)
         }
+        if !crate::board::entries(board, n).is_ok_and(|entries| core::executions(n, &entries).iter().all(|x| x.release.is_some())) {
+            log.push(format!("#{n} worktree kept: execution termination unconfirmed"));
+            continue;
+        }
         let wt = format!(".worktrees/{name}");
         let removed = if force {
             let trash = root.join(".taskq/trash");
@@ -197,7 +201,41 @@ pub fn views(board: &dyn Board, cache: &mut HashMap<u64, (i64, Vec<Comment>)>, d
     Ok((out, hosts))
 }
 
+/// Release only a known submission, with idempotent write and authoritative readback.
+fn release_execution(board: &dyn Board, task: u64, attempt: u64, execution: u64, proof: &str) -> Result<(), String> {
+    let expected = match proof { "exit" => core::Release::Exit, "no-start" => core::Release::NoStart, _ => return Err("invalid release proof".into()) };
+    let released = |log: &[core::Entry]| core::executions(task, log).into_iter()
+        .find(|x| x.id == execution && x.attempt == attempt).map(|x| x.release);
+    match released(&crate::board::entries(board, task)?) {
+        Some(Some(found)) if found == expected => return Ok(()),
+        Some(Some(_)) => return Err(format!("execution {execution} has contradictory release proof")),
+        Some(None) => {},
+        None => return Err(format!("execution {execution} ownership unknown; release refused")),
+    }
+    let op = format!("release-{execution}");
+    let body = core::with_fields(core::entry("released", &[&execution.to_string(), proof], Some(attempt), ""), Some(&op), None);
+    let written = board.comment(task, &body);
+    if released(&crate::board::entries(board, task)?) == Some(Some(expected)) { Ok(()) }
+    else { Err(format!("execution {execution} release unconfirmed: {}", written.err().unwrap_or_else(|| "readback missing".into()))) }
+}
+
+fn accept_execution(board: &dyn Board, task: u64, attempt: u64, execution: u64) -> Result<u64, String> {
+    let accepted = |log: &[core::Entry]| core::executions(task, log).into_iter()
+        .find(|x| x.id == execution && x.attempt == attempt && x.accepted).map(|x| x.through);
+    let log = crate::board::entries(board, task)?;
+    let known = core::executions(task,&log).into_iter().find(|x| x.id == execution && x.attempt == attempt)
+        .ok_or_else(|| format!("execution {execution} ownership unknown; acceptance refused"))?;
+    if known.release == Some(core::Release::NoStart) { return Err(format!("execution {execution} confirmed no-start; acceptance refused")); }
+    if known.accepted { return Ok(known.through); }
+    let op = format!("accept-{execution}");
+    let body = core::with_fields(core::entry("accepted", &[&execution.to_string()], Some(attempt), ""), Some(&op), None);
+    let written = board.comment(task, &body);
+    accepted(&crate::board::entries(board, task)?).ok_or_else(|| format!("execution {execution} acceptance unconfirmed: {}",
+        written.err().unwrap_or_else(|| "readback missing or contradictory".into())))
+}
+
 pub struct Kid {
+    pub execution: u64,
     pub task: u64,
     pub attempt: u64,
     pub rt: String,
@@ -226,6 +264,7 @@ pub struct Service<'a> {
     /// Worktrees of closed tasks already tried once by `prune`.
     pruned: HashSet<u64>,
     start: Box<dyn FnMut(&Launch) -> Result<Box<dyn Proc>, crate::runtime::StartError> + 'a>,
+    pub recover: Option<Box<dyn FnMut(u64, &core::Execution) -> Result<Box<dyn Proc>, String> + 'a>>,
     #[cfg(test)]
     agent_status: Value,
     pub log: Vec<String>,
@@ -234,6 +273,8 @@ pub struct Service<'a> {
     pub tasks_read: Option<std::time::Instant>,
     /// This host's heartbeat issue, from the last board read: a lease write needs no second list (§ 4 budget).
     host_issue: Option<u64>,
+    /// Rebuilt from board ownership; heartbeat projection only, never a launch/release authority.
+    observations: BTreeMap<(u64,u64),core::Execution>,
     /// Owner comments of the last pass (§ 4): task, comment id, text, card.
     pub owner_comments: Vec<(u64, u64, String, String)>,
     /// State of each open task in the previous pass, for `events`.
@@ -267,6 +308,8 @@ pub struct Service<'a> {
     pub refused_access: BTreeMap<String, String>,
     /// Children whose last liveness read failed, by attempt: kept and reported unknown, never `gone` (§ 4).
     pub unknown: HashMap<u64, String>,
+    pub execution_waits: BTreeMap<u64, String>,
+    pending_releases: BTreeSet<(u64, u64, u64)>,
     stopping: BTreeSet<u64>,
     /// Children by attempt: role, runtime, and start with attempt log offset; `None` when adopted across a re-exec
     /// (§ 4 Profiling stages).
@@ -498,7 +541,7 @@ pub fn record(path: &std::path::Path, now: i64, moves: &[(u64, &str, u64)]) -> R
 impl<'a> Service<'a> {
     pub fn new(board: &'a dyn Board, cfg: &'a Config, version: &str, start: Box<dyn FnMut(&Launch) -> Result<Box<dyn Proc>, crate::runtime::StartError> + 'a>) -> Self {
         let cap = Ok(Capacity::fixed(cfg.limits.clone(), GATE_DEFAULT));
-        Service { reduced_at: None, host: None, wall: 0, reserved: vec![], requested: vec![], refused: None, host_used: None, board, cfg: cfg.clone(), version: version.into(), kids: vec![], instance: String::new(), machine: String::new(), focus: vec![], focus_error: None, delivered: HashMap::new(), cache: HashMap::new(), deps: HashMap::new(), label_fixes: HashMap::new(), pruned: HashSet::new(), start, #[cfg(test)] agent_status: json!([]), log: vec![], snapshot: None, tasks_read: None, host_issue: None, owner_comments: vec![], seen: HashMap::new(), gone_after: None, moved_after: None, events_since: None, cap, gate: Gate::default(), mono: 0, held: vec![], pending: BTreeSet::new(), hold: None, refused_access: BTreeMap::new(), unknown: HashMap::new(), stopping: BTreeSet::new(), begun: HashMap::new(), asked: HashMap::new(), sessions: HashMap::new() }
+        Service { reduced_at: None, host: None, wall: 0, reserved: vec![], requested: vec![], refused: None, host_used: None, board, cfg: cfg.clone(), version: version.into(), kids: vec![], instance: String::new(), machine: String::new(), focus: vec![], focus_error: None, delivered: HashMap::new(), cache: HashMap::new(), deps: HashMap::new(), label_fixes: HashMap::new(), pruned: HashSet::new(), start, recover: None, #[cfg(test)] agent_status: json!([]), log: vec![], snapshot: None, tasks_read: None, host_issue: None, observations: BTreeMap::new(), owner_comments: vec![], seen: HashMap::new(), gone_after: None, moved_after: None, events_since: None, cap, gate: Gate::default(), mono: 0, held: vec![], pending: BTreeSet::new(), hold: None, refused_access: BTreeMap::new(), unknown: HashMap::new(), execution_waits: BTreeMap::new(), pending_releases: BTreeSet::new(), stopping: BTreeSet::new(), begun: HashMap::new(), asked: HashMap::new(), sessions: HashMap::new() }
     }
 
     /// Rebuild board-derived state after unwind; live handles, pending launches and delivery cursors stay owned.
@@ -535,12 +578,30 @@ impl<'a> Service<'a> {
         if let Some(host) = &self.host { if let Ok(mut h) = host.lock() { h.ready(&self.cfg.root, false); } }
     }
 
-    /// Liveness/handoff monitoring remains available if the reduced board loop fails; it never renews a lease.
+    /// Liveness monitoring never frees ownership before the exact execution release is read back.
     pub fn reap_owned(&mut self) {
-        self.kids.retain_mut(|k| match k.proc.exited() {
-            Ok(Some(_)) => { self.unknown.remove(&k.attempt); self.stopping.remove(&k.attempt); false }
-            Ok(None) => { if !self.stopping.contains(&k.attempt) { self.unknown.remove(&k.attempt); } true }
+        self.kids.retain_mut(|k| {
+            let status = k.proc.exited();
+            let mut acceptance_unknown = false;
+            match k.proc.accepted() {
+                Ok(true) => match accept_execution(self.board,k.task,k.attempt,k.execution) {
+                    Ok(through) => { self.delivered.entry(k.attempt).and_modify(|v| *v = (*v).max(through)).or_insert(through); },
+                    Err(e) => { self.unknown.insert(k.attempt,e); return true; }
+                },
+                Ok(false) => {},
+                Err(e) => { acceptance_unknown = true; self.unknown.insert(k.attempt,e); }
+            }
+            match status {
+            Ok(Some(_)) => match release_execution(self.board,k.task,k.attempt,k.execution,"exit") {
+                Ok(())=>{
+                    if matches!(k.rt.as_str(),"codex"|"claude") { if let Err(e)=crate::retire_kid(&self.cfg,k.task,k.attempt,k.execution) { self.log.push(format!("native recovery cleanup: {e}")); } }
+                    self.observations.remove(&(k.task,k.execution));self.cache.remove(&k.task);self.unknown.remove(&k.attempt);self.stopping.remove(&k.attempt);false
+                },
+                Err(e)=>{self.unknown.insert(k.attempt,e);true}
+            },
+            Ok(None) => { if !self.stopping.contains(&k.attempt) && !acceptance_unknown { self.unknown.remove(&k.attempt); } true }
             Err(e) => { self.unknown.insert(k.attempt, e); true }
+            }
         });
     }
 
@@ -572,6 +633,11 @@ impl<'a> Service<'a> {
         let held = self.kids.iter().map(|k| (k.task, k.attempt, k.rt.clone())).chain(self.reserved.iter().cloned())
             .collect::<BTreeSet<_>>().into_iter().collect();
         Entry { version: self.version.clone(), at: 0, held, requested: self.requested.clone() }
+    }
+
+    /// Lost native handles still hold reservations and must retain their recovery inputs.
+    pub fn retained_attempts(&self)->Vec<u64> {
+        self.entry().held.into_iter().map(|(_,attempt,_)|attempt).collect()
     }
 
     /// Admission of one launch (§ 3): the load gate, then under Auto a reservation from the host authority, which
@@ -660,8 +726,8 @@ impl<'a> Service<'a> {
             .chain(self.reserved.iter().map(|r| res(r, "held"))).chain(self.requested.iter().map(|r| res(r, "requested"))).collect();
         let limits = self.cap.as_ref().map(|c| c.limits.clone()).unwrap_or_default();
         let mut used: BTreeMap<String, u32> = limits.keys().map(|k| (k.clone(), 0)).collect();
-        for k in &self.kids {
-            *used.entry(k.rt.clone()).or_default() += 1;
+        for (_, _, rt) in self.entry().held {
+            *used.entry(rt).or_default() += 1;
         }
         let last = self.gate.last.filter(|_| self.gate.enabled());
         json!({"limits": limits, "used": used, "load_gate": self.cap.as_ref().map(|c| c.json()["load_gate"].clone()).unwrap_or(Value::Null),
@@ -672,13 +738,19 @@ impl<'a> Service<'a> {
             "sample_at": last.map(|l| l.1), "sample_age_seconds": last.map(|l| self.mono.saturating_sub(l.0))})
     }
 
-    /// Children of the previous process image after an update re-exec; their inbox counts as delivered.
-    pub fn adopt(&mut self, kid: Kid, delivered: u64) {
-        self.delivered.insert(kid.attempt, delivered);
+    /// Handover carries execution identity; only board acceptance establishes delivery.
+    pub fn adopt(&mut self, kid: Kid) -> Result<(),String> {
+        let log = crate::board::entries(self.board,kid.task)?;
+        let x=core::executions(kid.task,&log).into_iter().find(|x|x.id==kid.execution && x.attempt==kid.attempt && x.host==self.cfg.me && x.runtime==kid.rt && x.release.is_none())
+            .ok_or_else(||format!("execution {} handover does not match unresolved board ownership",kid.execution))?;
+        if self.kids.iter().any(|k|k.task==kid.task || k.execution==kid.execution) { return Err("duplicate native handover".into()); }
+        if let Some(through) = core::delivered(kid.task, &log, kid.attempt) { self.delivered.insert(kid.attempt, through); }
         // the role is the attempt log that exists; its start and offset stayed in the replaced image
         let role = if crate::runtime::attempt_log(&self.cfg.root, "reviewer", kid.task, kid.attempt).exists() { "reviewer" } else { "worker" };
         self.begun.insert(kid.attempt, (role.into(), kid.rt.clone(), None));
+        self.observations.insert((kid.task,kid.execution),x);
         self.kids.push(kid);
+        Ok(())
     }
 
     pub fn delivered(&self, attempt: u64) -> u64 {
@@ -736,6 +808,21 @@ impl<'a> Service<'a> {
         self.board.comment(n, &body)
     }
 
+    fn execution_statuses(&self)->Vec<crate::snapshot::ExecutionStatus> {
+        self.observations.iter().map(|((task,_),x)| {
+            let child=self.kids.iter().any(|k|k.execution==x.id && k.task==*task);
+            let (state,reason)=if let Some(e)=self.unknown.get(&x.attempt) {("unknown",e.clone())}
+                else if self.stopping.contains(&x.attempt) {("waiting","cancellation pending; awaiting native termination".into())}
+                else if self.held.iter().any(|l|l.task==*task && l.attempt==x.attempt) {("waiting","launch held by admission gate".into())}
+                else if !child {("unknown",self.execution_waits.get(task).cloned().unwrap_or("native observation unavailable; restore owning runtime".into()))}
+                else if self.delivered(x.attempt)<x.through {("waiting","native input acceptance pending".into())}
+                else if self.snapshot.as_ref().is_some_and(|s|s.tasks.iter().any(|r|r.n==*task && r.task.state==State::Ask)) {("waiting","owner answer required".into())}
+                else {("running","native execution observed; termination pending".into())};
+            crate::snapshot::ExecutionStatus {task:*task,attempt:x.attempt,id:x.id,through:x.through,state:state.into(),
+                reason:reason.chars().map(|c|if c.is_control() {' '} else {c}).take(240).collect()}
+        }).collect()
+    }
+
     fn heartbeat_body(&self) -> String {
         let mut lines = vec![format!("version {}", self.version)];
         if !self.instance.is_empty() {
@@ -750,6 +837,7 @@ impl<'a> Service<'a> {
         let kids: BTreeSet<_> = self.kids.iter().map(|k| (k.task, k.attempt)).chain(self.pending.iter().copied()).collect();
         lines.extend(kids.iter().map(|(t, a)| format!("#{t} {a}")));
         lines.extend(kids.iter().filter_map(|(t, a)| self.sessions.get(a).map(|u| format!("session #{t} {a} {u}"))));
+        lines.extend(self.execution_statuses().iter().map(|s|format!("execution {}",serde_json::to_string(s).unwrap())));
         lines.join("\n")
     }
 
@@ -762,15 +850,46 @@ impl<'a> Service<'a> {
         }
         let r = crate::profile::measure("service.pass", || self.pass_inner());
         if r.is_err() { self.unready(); }
+        let observations=self.execution_statuses();
+        if let Some(snapshot) = &mut self.snapshot {
+            for row in &mut snapshot.tasks {
+                row.executions.retain(|value|value["host"].as_str()!=Some(&self.cfg.me)
+                    || observations.iter().any(|s|s.task==row.n && Some(s.id)==value["id"].as_u64()));
+                for value in &mut row.executions {
+                    if let Some(status)=observations.iter().find(|s|s.task==row.n && Some(s.id)==value["id"].as_u64()
+                        && Some(s.through)==value["through"].as_u64()) {
+                        *value=serde_json::to_value(status).unwrap();
+                        value["host"]=json!(self.cfg.me);value["observed"]=json!(snapshot.observed);
+                    }
+                }
+                if row.executions.iter().any(|x|x["host"].as_str()==Some(&self.cfg.me)) {
+                    row.execution_wait=row.executions.iter().find(|x|x["state"]!="running" || x["attempt"].as_u64()!=row.task.attempt)
+                        .map(|x|format!("execution {} on {}: {}: {}",x["id"],self.cfg.me,
+                            x["state"].as_str().unwrap_or("unknown"),x["reason"].as_str().unwrap_or("observation unavailable")));
+                }
+                if !self.kids.iter().any(|k| k.task == row.n && row.task.attempt == Some(k.attempt)) {
+                    if let Some(reason)=self.execution_waits.get(&row.n) {row.execution_wait=Some(reason.clone());}
+                }
+            }
+        }
+
         r
     }
 
     fn pass_inner(&mut self) -> Result<(), String> {
+        for (task, attempt, execution) in self.pending_releases.clone() {
+            release_execution(self.board, task, attempt, execution, "no-start")?;
+            self.pending_releases.remove(&(task, attempt, execution));
+            self.cache.remove(&task);
+        }
         let previous_fixes = std::mem::take(&mut self.label_fixes);
         let me = self.cfg.me.clone();
         let ttl = self.cfg.ttl;
         let (views, hosts) = views(self.board, &mut self.cache, &mut self.deps)?;
         let now = self.board.now()?;
+        self.observations.retain(|(task,id),_|self.kids.iter().any(|k|k.task==*task && k.execution==*id));
+        self.observations.extend(views.iter().flat_map(|v|core::executions(v.issue.number,&v.log).into_iter()
+            .filter(|x|x.host==me && x.release.is_none()).map(|x|((v.issue.number,x.id),x))));
         self.snapshot = Some(crate::snapshot::from_views("host", self.board, &self.cfg, now, &views, &hosts));
         self.tasks_read = Some(std::time::Instant::now());
         // § 4 one service per host name: another install's fresh heartbeat under this name holds every write (#933)
@@ -785,26 +904,63 @@ impl<'a> Service<'a> {
         self.events(&views, now)?;
         let by_n: HashMap<u64, &View> = views.iter().map(|v| (v.issue.number, v)).collect();
         let mut touched = HashSet::new();
+        let mut released = HashSet::new();
+        self.execution_waits.clear();
+        for v in &views {
+            let task = v.issue.number;
+            let unresolved: Vec<_> = core::executions(task, &v.log).into_iter().filter(|x| x.release.is_none()).collect();
+            if self.kids.iter().any(|k| k.task == task) || self.held.iter().any(|l| l.task == task) { continue; }
+            let Some(x) = unresolved.iter().find(|x| x.host == me && matches!(x.runtime.as_str(), "claude" | "codex-app")) else { continue };
+            if unresolved.len() != 1 {
+                self.execution_waits.insert(task, "multiple unresolved executions; verify native ownership before recovery".into());
+                continue;
+            }
+            let Some(recover) = &mut self.recover else { continue };
+            let result = recover(task, x).and_then(|proc| self.adopt(Kid { task, attempt: x.attempt, execution: x.id, rt: x.runtime.clone(), proc }));
+            if let Err(e) = result {
+                self.execution_waits.insert(task, format!("execution {} on {}: recovery unknown: {e}", x.id, x.host));
+            }
+        }
 
         self.hold = crate::admission::hold(&self.cfg.install);
-        // 1. reap; a failed read keeps the child, unknown with its reason
+        let mut pending_acceptance = HashSet::new();
+        // 1. Observe native state once; retry lost evidence writes without resubmitting input.
         let mut exited = vec![];
         let unknown = &mut self.unknown;
         let stopping = &mut self.stopping;
-        self.kids.retain_mut(|k| match k.proc.exited() {
+        self.kids.retain_mut(|k| {
+            let status = k.proc.exited();
+            let confirmed = by_n.get(&k.task).and_then(|v| core::executions(k.task, &v.log).into_iter().find(|x| x.id == k.execution && x.accepted));
+            let accepted = if let Some(x) = confirmed { Ok(Some(x.through)) } else {
+                k.proc.accepted().and_then(|yes| if yes {
+                    accept_execution(self.board, k.task, k.attempt, k.execution).map(Some).inspect_err(|_| { pending_acceptance.insert(k.attempt); })
+                } else { Ok(None) })
+            };
+            let acceptance_unknown = accepted.is_err();
+            match accepted {
+                Ok(Some(through)) => { self.delivered.entry(k.attempt).and_modify(|v| *v = (*v).max(through)).or_insert(through); self.cache.remove(&k.task); },
+                Ok(None) => {},
+                Err(e) => { unknown.insert(k.attempt, e); },
+            }
+            match status {
             Ok(Some(code)) => {
+                if pending_acceptance.contains(&k.attempt) { return true; }
+                if let Err(e)=release_execution(self.board,k.task,k.attempt,k.execution,"exit") {unknown.insert(k.attempt,e);return true;}
+                if matches!(k.rt.as_str(),"codex"|"claude") { if let Err(e)=crate::retire_kid(&self.cfg,k.task,k.attempt,k.execution) { self.log.push(format!("native recovery cleanup: {e}")); } }
+                self.observations.remove(&(k.task,k.execution));released.insert(k.execution);self.cache.remove(&k.task);
                 exited.push((k.task, k.attempt, code, k.proc.exit_error()));
                 unknown.remove(&k.attempt);
                 stopping.remove(&k.attempt);
                 false
             }
             Ok(None) => {
-                if !stopping.contains(&k.attempt) { unknown.remove(&k.attempt); }
+                if !stopping.contains(&k.attempt) && !acceptance_unknown { unknown.remove(&k.attempt); }
                 true
             }
             Err(e) => {
                 unknown.insert(k.attempt, e);
                 true
+            }
             }
         });
         for (n, a, code, failure) in exited {
@@ -838,7 +994,14 @@ impl<'a> Service<'a> {
             if !current {
                 self.stopping.insert(k.attempt);
                 match crate::runtime::stop(k.proc.as_mut()) {
-                    Ok(_) => { stopped.push((k.task, k.attempt)); self.stopping.remove(&k.attempt); }
+                    Ok(_) if pending_acceptance.contains(&k.attempt) => return true,
+                    Ok(_) => match release_execution(self.board,k.task,k.attempt,k.execution,"exit") {
+                        Ok(())=>{
+                            if matches!(k.rt.as_str(),"codex"|"claude") { if let Err(e)=crate::retire_kid(&self.cfg,k.task,k.attempt,k.execution) { self.log.push(format!("native recovery cleanup: {e}")); } }
+                            self.observations.remove(&(k.task,k.execution));released.insert(k.execution);self.cache.remove(&k.task);stopped.push((k.task,k.attempt));self.stopping.remove(&k.attempt);
+                        },
+                        Err(e)=>{self.unknown.insert(k.attempt,e);return true;}
+                    },
                     Err(e) => { self.unknown.insert(k.attempt, e); return true; }
                 }
             }
@@ -861,19 +1024,7 @@ impl<'a> Service<'a> {
             .collect();
         self.sessions.extend(found);
 
-        // 3. heartbeat
-        let body = self.heartbeat_body();
-        self.host_issue = hosts.iter().find(|h| h.title == title).map(|h| h.number);
-        match hosts.iter().find(|h| h.title == title) {
-            Some(h) if h.body.lines().filter(|l| !l.starts_with("at ")).eq(body.lines()) && now - h.updated < ttl / 3 => {}
-            // a same-body edit leaves `updated_at` as is (GitHub), so the stamp keeps the heartbeat fresh
-            Some(h) => self.board.edit(h.number, &format!("{body}\nat {now}"))?,
-            None => {
-                self.host_issue = Some(self.board.create(&title, &body, &[HOST_LABEL.to_string()])?);
-            }
-        }
-
-        // 4. gone for attempts of dead hosts (§ 3)
+        // 4. Expired heartbeat is not evidence that an external executor stopped.
         // A lease newer than the accepted attempt is a spawn that lost the claim and still runs. An older one is a
         // replaced attempt its host lists until its next pass: normal lag, not a second live attempt (#1140).
         for hb in hosts.iter().filter(|h| now - h.updated <= ttl) {
@@ -885,20 +1036,51 @@ impl<'a> Service<'a> {
                 }
             }
         }
+        let mut unresolved_local = BTreeSet::new();
         for v in &views {
-            let (n, t) = (v.issue.number, &v.task);
-            let (Some(a), Some(h)) = (t.attempt, host_of(t)) else { continue };
-            if h == me || !matches!(t.state, State::Doing | State::Review) || touched.contains(&n) {
-                continue;
+            let (n,t) = (v.issue.number,&v.task);
+            if let Some(a) = t.attempt.filter(|_| host_of(t) != Some(&me) && matches!(t.state,State::Doing|State::Review)) {
+                let delivered = core::delivered(n,&v.log,a).unwrap_or(0);
+                if t.inbox.iter().all(|id| *id <= delivered) {
+                    let executions = core::executions(n,&v.log);
+                    if let Some(x) = executions.iter().rev().find(|x| x.attempt == a).filter(|_| executions.iter().all(|x| x.release.is_some())) {
+                        if !core::handed_in(n,&v.log,a,x.through) {
+                            self.gone(n,t,a,&format!("execution {} confirmed {:?} without task outcome",x.id,x.release.unwrap()))?;
+                            touched.insert(n);
+                        }
+                    }
+                }
             }
-            let young = v.comments.iter().filter(|c| c.id == a || t.inbox.contains(&c.id)).any(|c| now - c.created <= ttl);
-            let dead = match hosts.iter().find(|i| i.title == format!("taskq host {h}")) {
-                None => !young,
-                Some(hb) => now - hb.updated > ttl || (!young && !hb.body.lines().any(|l| l == format!("#{n} {a}"))),
-            };
-            if dead {
-                self.gone(n, t, a, &format!("host {h} lease expired"))?;
-                touched.insert(n);
+            let unresolved: Vec<_> = core::executions(v.issue.number, &v.log).into_iter()
+                .filter(|x| x.release.is_none() && !released.contains(&x.id)).collect();
+            for x in &unresolved {
+                if x.host == me { unresolved_local.insert((v.issue.number, x.attempt, x.runtime.clone())); }
+                if x.host == me && !self.kids.iter().any(|k| k.execution == x.id) {
+                    let r = (v.issue.number, x.attempt, x.runtime.clone());
+                    if !self.reserved.contains(&r) { self.reserved.push(r); }
+                }
+            }
+            if let Some(x) = unresolved.first().filter(|x| !self.held.iter().any(|l| l.attempt == x.id)) {
+                self.execution_waits.entry(v.issue.number).or_insert_with(|| format!("execution {} on {}: termination unconfirmed", x.id, x.host));
+            } else if let Some(x) = core::executions(v.issue.number, &v.log).into_iter()
+                .find(|x| Some(x.attempt) == v.task.attempt && !v.task.inbox.is_empty() && x.release == Some(core::Release::Exit) && !x.accepted) {
+                self.execution_waits.insert(v.issue.number, format!("execution {} on {}: input acceptance unknown; reconcile native input", x.id, x.host));
+            } else if let (Some(a),Some(owner)) = (v.task.attempt,host_of(&v.task)) {
+                if owner != me && matches!(v.task.state,State::Doing|State::Review) && v.task.inbox.iter().any(|id| *id > core::delivered(v.issue.number,&v.log,a).unwrap_or(0)) {
+                    self.execution_waits.insert(v.issue.number,format!("input pending on {owner}; await or restore the owning service"));
+                }
+            }
+        }
+
+        // 3. heartbeat
+        let body = self.heartbeat_body();
+        self.host_issue = hosts.iter().find(|h| h.title == title).map(|h| h.number);
+        match hosts.iter().find(|h| h.title == title) {
+            Some(h) if h.body.lines().filter(|l| !l.starts_with("at ")).eq(body.lines()) && now - h.updated < 60.min(ttl / 3) => {}
+            // a same-body edit leaves `updated_at` as is (GitHub), so the stamp keeps the heartbeat fresh
+            Some(h) => self.board.edit(h.number, &format!("{body}\nat {now}"))?,
+            None => {
+                self.host_issue = Some(self.board.create(&title, &body, &[HOST_LABEL.to_string()])?);
             }
         }
 
@@ -930,7 +1112,7 @@ impl<'a> Service<'a> {
         // 6. route to own attempts, then admit within capacity; the gate holds launches, the lease stays (§ 3)
         let mut pending = BTreeSet::new();
         // a reservation lives within one pass: it becomes a child or a held claim, or is released here
-        self.reserved.retain(|r| self.held.iter().any(|l| l.task == r.0 && l.attempt == r.1));
+        self.reserved.retain(|r| self.held.iter().any(|l| l.task == r.0 && l.attempt == r.1) || unresolved_local.contains(r));
         (self.requested, self.refused) = (vec![], None);
         if self.host.is_some() { self.sync_host(); }
         for v in &views {
@@ -943,23 +1125,29 @@ impl<'a> Service<'a> {
                 let rt = self.held[i].rt.clone();
                 if self.reserve(n, a, &rt) {
                     let l = self.held.remove(i);
-                    self.launch(l)?;
+                    self.launch(l, a)?;
                 } else {
                     pending.insert((n, a));
                 }
                 continue;
             }
-            let seen = self.delivered.get(&a).copied().unwrap_or(0);
+            if self.execution_waits.contains_key(&n) { pending.insert((n, a)); continue; }
+            let seen = core::delivered(n, &v.log, a).unwrap_or(0);
             let new: Vec<&Comment> = v.comments.iter().filter(|c| t.inbox.contains(&c.id) && c.id > seen).collect();
             let Some(last) = new.last().map(|c| c.id) else {
-                let text = format!("no child on its host{}", self.last_message(n, a, t));
-                self.gone(n, t, a, &text)?;
-                touched.insert(n);
+                let last = core::executions(n, &v.log).into_iter().rev().find(|x| x.attempt == a);
+                if let Some(x) = last.filter(|x| x.release.is_some()) {
+                    let text = format!("execution {} confirmed {:?} without task outcome{}", x.id, x.release.unwrap(), self.last_message(n, a, t));
+                    self.gone(n, t, a, &text)?;
+                    touched.insert(n);
+                } else {
+                    self.execution_waits.insert(n,"native execution evidence missing; reconcile the owning runtime".into());
+                }
                 continue;
             };
             let (rt, session) = rt_of(t).unwrap_or(("", ""));
             let mut session = session.to_string();
-            let mut l = Launch { task: n, title: v.issue.title.clone(), attempt: a, role: t.role.clone().unwrap_or_default(), rt: rt.into(), session: session.clone(), url: self.board.url(n), resume: None };
+            let mut l = Launch { execution: None, task: n, title: v.issue.title.clone(), attempt: a, role: t.role.clone().unwrap_or_default(), rt: rt.into(), session: session.clone(), url: self.board.url(n), resume: None };
             if session == "-" || rt == "claude" {
                 session = crate::runtime::codex_thread(&crate::runtime::log_path(&self.cfg.root, &l)).unwrap_or_else(|| if session == "-" { String::new() } else { session });
             }
@@ -967,16 +1155,15 @@ impl<'a> Service<'a> {
             l.session = session;
             l.resume = Some(text.join("\n\n"));
             if l.session.is_empty() {
-                self.gone(n, t, a, "session unknown")?;
-                touched.insert(n);
+                self.execution_waits.insert(n,"session identity unknown; recover the original native session".into());
+                pending.insert((n,a));
                 continue;
             }
             if self.refused_access.contains_key(&l.rt) || !self.reserve(n, a, &l.rt) {
                 pending.insert((n, a)); // the inbox stays undelivered
                 continue;
             }
-            self.delivered.insert(a, last);
-            self.launch(l)?;
+            self.launch(l, last)?;
         }
         pending.extend(self.held.iter().map(|l| (l.task, l.attempt)));
         if pending != self.pending {
@@ -991,7 +1178,7 @@ impl<'a> Service<'a> {
         let user = self.board.me().unwrap_or_default();
         let mut queue: Vec<&View> = views
             .iter()
-            .filter(|v| !touched.contains(&v.issue.number))
+            .filter(|v| !touched.contains(&v.issue.number) && !self.execution_waits.contains_key(&v.issue.number))
             .filter(|v| !self.kids.iter().any(|k| k.task == v.issue.number))
             .filter(|v| v.task.state == State::Ready || (v.task.state == State::Review && v.task.attempt.is_none()))
             .filter(|v| {
@@ -1194,13 +1381,15 @@ impl<'a> Service<'a> {
         };
         crate::profile::stage("claim", n, a, rt, Some(began.elapsed()), outcome, err, crate::profile::Usage::NoModel);
         match r? {
-            Some(l) => self.launch(l),
+            Some(l) => { let through = l.attempt; self.launch(l, through) },
             None => Ok(()),
         }
     }
 
     fn claim_inner(&mut self, v: &View, role: &str, rt: &str) -> Result<Option<Launch>, String> {
         let n = v.issue.number;
+        let before = crate::board::entries(self.board, n)?;
+        if core::executions(n, &before).iter().any(|x| x.release.is_none()) { return Ok(None); }
         let session = crate::runtime::new_session(rt);
         let id = self.post(n, core::entry("spawn", &[role, &format!("{rt}:{session}"), &self.cfg.me], None, ""))?;
         let comments = self.board.comments(n)?;
@@ -1217,8 +1406,7 @@ impl<'a> Service<'a> {
         }
         for r in self.reserved.iter_mut().filter(|r| r.0 == n && r.1 == 0) { r.1 = id; }
         if let Some(host) = &self.host { if let Ok(mut h) = host.lock() { h.claimed(&self.cfg.root, n, id); } }
-        let l = Launch { task: n, title: v.issue.title.clone(), attempt: id, role: role.into(), rt: rt.into(), session, url: self.board.url(n), resume: None };
-        self.delivered.insert(id, t.inbox.last().copied().unwrap_or(0));
+        let l = Launch { execution: None, task: n, title: v.issue.title.clone(), attempt: id, role: role.into(), rt: rt.into(), session, url: self.board.url(n), resume: None };
         if !self.may_launch() {
             self.pending.insert((n, id));
             self.held.push(l);
@@ -1237,12 +1425,44 @@ impl<'a> Service<'a> {
     }
 
     #[tracing::instrument(name="service.Service.launch",skip_all)]
-    fn launch(&mut self, l: Launch) -> Result<(), String> {
-        // the reservation becomes the child, or is released when the start fails
+    fn launch(&mut self, mut l: Launch, through: u64) -> Result<(), String> {
+        let log = crate::board::entries(self.board, l.task)?;
+        let executions = core::executions(l.task, &log);
+        let t = core::fold(l.task, &log, false);
+        if t.attempt != Some(l.attempt) || !matches!(t.state, State::Doing | State::Review) {
+            if l.resume.is_none() { release_execution(self.board, l.task, l.attempt, l.attempt, "no-start")?; }
+            return Ok(());
+        }
+        let execution = if l.resume.is_some() {
+            if executions.iter().any(|x| x.release.is_none()) { return Err(format!("#{} prior execution termination unconfirmed", l.task)); }
+            let previous = executions.last().ok_or("execution ownership missing")?.id;
+            let op = format!("execute-{}-{through}-{previous}", l.attempt);
+            // A previously submitted intent is uncertain, never permission to repeat the external call.
+            if log.iter().any(|e| core::op_id(l.task, &e.body) == Some(&op)) { return Err("execution intent already submitted; reconcile native ownership".into()); }
+            let id = self.post(l.task, core::with_fields(core::entry("executing", &[&through.to_string()], Some(l.attempt), ""), Some(&op), None))?;
+            let fresh = crate::board::entries(self.board, l.task)?;
+            if !core::executions(l.task, &fresh).iter().any(|x| x.id == id && x.release.is_none()) { return Err("execution intent readback missing".into()); }
+            id
+        } else {
+            if !executions.iter().any(|x| x.id == l.attempt && x.release.is_none()) { return Err("initial execution ownership missing".into()); }
+            if executions.iter().any(|x| x.release.is_none() && x.id != l.attempt) {
+                release_execution(self.board, l.task, l.attempt, l.attempt, "no-start")?;
+                return Err("previous execution termination unconfirmed".into());
+            }
+            l.attempt
+        };
+        // The reservation becomes the child; uncertain handoff keeps its execution fence.
+        l.execution=Some(execution);
+        self.observations.insert((l.task,execution),core::Execution {id:execution,attempt:l.attempt,through,
+            host:self.cfg.me.clone(),runtime:l.rt.clone(),accepted:false,release:None});
         let pos = std::fs::metadata(crate::runtime::attempt_log(&self.cfg.root, &l.role, l.task, l.attempt)).map_or(0, |m| m.len());
         let began = std::time::Instant::now();
         let started = (self.start)(&l).map(|proc| {
-            self.kids.push(Kid { task: l.task, attempt: l.attempt, rt: l.rt.clone(), proc });
+            self.kids.push(Kid { execution, task: l.task, attempt: l.attempt, rt: l.rt.clone(), proc });
+            if matches!(l.rt.as_str(),"codex"|"claude") {
+                // A failed checkpoint retains the handle; polling retries persistence, never launch.
+                if let Err(e)=self.kids.last_mut().unwrap().proc.checkpoint(&self.cfg,&l,execution) { self.unknown.insert(l.attempt,e); }
+            }
         });
         let err = started.as_ref().err().map_or("none", |e| crate::profile::class(&e.to_string()));
         crate::profile::stage("start", l.task, l.attempt, &l.rt, Some(began.elapsed()), if started.is_ok() { "ok" } else { "failed" }, err, crate::profile::Usage::NoModel);
@@ -1254,9 +1474,31 @@ impl<'a> Service<'a> {
                 self.begun.insert(l.attempt, (l.role.clone(), l.rt.clone(), Some((std::time::Instant::now(), pos))));
                 self.pending.remove(&(l.task, l.attempt));
                 self.gate.launch(self.mono);
+                // Keep the owned handle even if acceptance/readback fails.
+                let k = self.kids.last_mut().unwrap();
+                match k.proc.accepted().and_then(|yes| if yes { accept_execution(self.board, l.task, l.attempt, execution).map(Some) } else { Ok(None) }) {
+                    Ok(Some(cursor)) => { self.delivered.insert(l.attempt, cursor); self.cache.remove(&l.task); },
+                    Ok(None) => {},
+                    Err(e) => { self.unknown.insert(l.attempt, e); },
+                }
                 self.beat()
             }
             Err(e) => {
+                if !e.no_start {
+                    let reason = format!("execution {execution} launch outcome unknown: {e}");
+                    self.execution_waits.insert(l.task, reason.clone());
+                    let reservation = (l.task, l.attempt, l.rt.clone());
+                    if !self.reserved.contains(&reservation) { self.reserved.push(reservation); }
+                    self.pending.insert((l.task, l.attempt));
+                    self.sync_host();
+                    self.beat()?;
+                    return Err(reason);
+                }
+                self.pending_releases.insert((l.task, l.attempt, execution));
+                release_execution(self.board, l.task, l.attempt, execution, "no-start")?;
+                self.pending_releases.remove(&(l.task, l.attempt, execution));
+                self.observations.remove(&(l.task,execution));
+                self.cache.remove(&l.task);
                 self.reserved.retain(|r| r.0 != l.task || r.1 != l.attempt);
                 self.sync_host();
                 if e.reportable {
@@ -1270,8 +1512,18 @@ impl<'a> Service<'a> {
                 }
                 let text = format!("start failed: {e}");
                 // without a fresh fold a gone could park the task on a card without options: post nothing, report the
-                // read error; the next pass finds no child on its host and posts the gone with the limit card (#1123)
+                // read error; the next pass reconciles the no-start proof and posts the limit card (#1123).
                 let log = crate::board::entries(self.board, l.task).map_err(|r| format!("#{} {text}; gone not posted: {r}", l.task))?;
+                if l.resume.is_some() {
+                    let failures = core::executions(l.task, &log).iter().filter(|x| x.attempt == l.attempt && x.through == through && x.release == Some(core::Release::NoStart)).count();
+                    if failures >= core::GONE_MAX as usize {
+                        let op = format!("input-retry-{execution}");
+                        let card = format!("{text}\nProblem: input launch failed {failures} times; input retained.\n1. Retry undelivered input in this session ★\n2. later: park the task");
+                        self.post(l.task, core::with_fields(core::entry("ask", &[], Some(l.attempt), &card), Some(&op), None))?;
+                        return Ok(());
+                    }
+                    return Err(format!("#{} {text}; input retained for retry", l.task));
+                }
                 self.gone(l.task, &core::fold(l.task, &log, false), l.attempt, &text).map(|_| ())
             }
         }
@@ -1287,6 +1539,7 @@ mod tests {
 
     struct FakeProc(Rc<RefCell<Option<i32>>>);
     impl Proc for FakeProc {
+        fn accepted(&mut self) -> Result<bool, String> { Ok(true) }
         fn exited(&mut self) -> Result<Option<i32>, String> {
             // -999: a failed read
             match *self.0.borrow() {
@@ -1299,6 +1552,217 @@ mod tests {
         }
         fn id(&self) -> u32 {
             0
+        }
+    }
+
+    // Chain: cold service -> board ownership -> observer -> terminal receipt. Risk: recovery replays an uncertain submit.
+    #[test]
+    fn cold_native_observers_never_use_the_launch_path() {
+        for rt in ["claude","codex-app"] {
+            for case in ["live","unknown","missing","foreign","released","ambiguous"] {
+                let b=Fake::default();let c=cfg("mac");
+                let n=b.create("T","",&[TASK_LABEL.into()]).unwrap();
+                let host=if case=="foreign" {"other"} else {"mac"};
+                let a=b.comment(n,&format!("taskq: spawn worker {rt}:session {host}")).unwrap();
+                if case=="released" {release_execution(&b,n,a,a,"exit").unwrap();}
+                if case=="ambiguous" {
+                    b.comment(n,&core::entry("gone",&[],Some(a),"legacy gone without native exit")).unwrap();
+                    b.comment(n,&format!("taskq: spawn worker {rt}:second mac")).unwrap();
+                    assert_eq!(core::executions(n,&entries(&b,n).unwrap()).iter().filter(|x|x.release.is_none()).count(),2);
+                }
+                let seen=Rc::new(RefCell::new(Vec::new()));let calls=seen.clone();
+                let exit=Rc::new(RefCell::new(if case=="unknown" {Some(-999)} else {None}));let flag=exit.clone();
+                let mut s=Service::new(&b,&c,"fixture",Box::new(|_|panic!("recovery must never launch")));
+                s.recover=Some(Box::new(move |task,x| {
+                    calls.borrow_mut().push((task,x.attempt,x.id,x.runtime.clone()));
+                    if case=="missing" {Err("original input unavailable; inspect native submission".into())}
+                    else {Ok(Box::new(FakeProc(flag.clone())))}
+                }));
+                s.pass().unwrap();s.pass().unwrap();
+                if matches!(case,"foreign"|"released"|"ambiguous") {
+                    assert!(seen.borrow().is_empty(),"{rt}: {case}");
+                    if case=="ambiguous" {assert!(s.execution_waits[&n].contains("multiple unresolved"));}
+                } else if case=="missing" {
+                    assert_eq!(seen.borrow().len(),2,"only observation is retried");
+                    assert!(s.kids.is_empty());
+                    assert!(s.reserved.iter().any(|r|r.0==n && r.1==a));
+                    assert!(s.execution_waits[&n].contains("original input unavailable"));
+                    assert!(s.snapshot.as_ref().unwrap().tasks.iter().find(|r|r.n==n).unwrap().execution_wait.as_ref().unwrap().contains("original input unavailable"));
+                } else {
+                    assert_eq!(*seen.borrow(),vec![(n,a,a,rt.to_owned())]);
+                    assert_eq!(s.kids.len(),1);
+                    assert!(core::executions(n,&entries(&b,n).unwrap())[0].release.is_none());
+                    if case=="unknown" {assert_eq!(s.unknown[&a],"read failed");}
+                    *exit.borrow_mut()=Some(0);
+                    s.pass().unwrap();
+                    assert!(s.kids.is_empty());
+                    assert_eq!(core::executions(n,&entries(&b,n).unwrap())[0].release,Some(core::Release::Exit));
+                }
+            }
+        }
+    }
+
+    // Chain: re-exec during pending acceptance -> exact execution. Risk: the old delivered cursor adopts execution zero.
+    #[test]
+    fn handover_uses_execution_identity_before_input_acceptance() {
+        let b=Fake::default(); let n=b.create("T","",&[TASK_LABEL.into()]).unwrap(); let c=cfg("mac");
+        let a=b.comment(n,"taskq: spawn worker codex:session mac").unwrap();
+        accept_execution(&b,n,a,a).unwrap(); release_execution(&b,n,a,a,"exit").unwrap();
+        let input=b.comment(n,"taskq: steer\ncontinue").unwrap();
+        let execution=b.comment(n,&core::entry("executing",&[&input.to_string()],Some(a),"")).unwrap();
+        let mut s=service(&b,&c,Default::default());
+        s.adopt(Kid {execution,task:n,attempt:a,rt:"codex".into(),proc:Box::new(FakeProc(Rc::new(RefCell::new(None))))}).unwrap();
+        assert_eq!(s.kids[0].execution,execution,"pending acceptance does not change native ownership");
+        assert_eq!(s.delivered(a),a,"handover does not invent input acceptance");
+    }
+
+    // Chain: undelivered continuation -> no-start -> restart -> retry. Risk: an intent cursor loses input or retries without a bound.
+    #[test]
+    fn continuation_no_start_retries_retained_input_across_restart() {
+        for refused in [1, 2] {
+            let b = Fake::default();
+            let n = b.create("T", "", &[TASK_LABEL.into()]).unwrap();
+            let a = b.comment(n, "taskq: spawn worker codex:session mac").unwrap();
+            accept_execution(&b,n,a,a).unwrap(); release_execution(&b,n,a,a,"exit").unwrap();
+            let cursor = b.comment(n,"taskq: steer\nretained user input").unwrap();
+            let c = cfg("mac");
+            let calls = Rc::new(RefCell::new(Vec::new()));
+            for count in 0..refused {
+                let seen = calls.clone();
+                let mut s = Service::new(&b,&c,"fixture",Box::new(move |l| {
+                    assert!(l.execution.is_some_and(|id|id>l.attempt));
+                    seen.borrow_mut().push((l.resume.clone().unwrap(),l.execution.unwrap()));
+                    Err(crate::runtime::StartError::io(std::io::Error::other("pre-submit refusal"),None))
+                }));
+                let result = s.pass();
+                if count + 1 < core::GONE_MAX { assert!(result.unwrap_err().contains("input retained")); } else { result.unwrap(); }
+                assert_eq!(core::delivered(n,&entries(&b,n).unwrap(),a),Some(a));
+                assert_eq!(task(&b,n).attempt,Some(a));
+            }
+            if refused == 2 {
+                assert_eq!(task(&b,n).state,State::Ask);
+                let mut parked = service(&b,&c,Default::default()); parked.pass().unwrap();
+                assert!(parked.kids.is_empty());
+                b.comment(n,"taskq: answer 1").unwrap();
+            }
+            let seen = calls.clone();
+            let mut recovered = Service::new(&b,&c,"fixture",Box::new(move |l| {
+                assert!(l.execution.is_some_and(|id|id>l.attempt));
+                seen.borrow_mut().push((l.resume.clone().unwrap(),l.execution.unwrap()));
+                Ok(Box::new(FakeProc(Rc::new(RefCell::new(None)))))
+            }));
+            recovered.pass().unwrap();
+            assert_eq!(calls.borrow().len(),refused as usize + 1);
+            assert!(calls.borrow().iter().all(|(input,_)|input.contains("retained user input")));
+            assert!(core::delivered(n,&entries(&b,n).unwrap(),a).unwrap() >= cursor);
+            let execution = recovered.kids[0].execution;
+            assert_eq!(calls.borrow().last().unwrap().1,execution,"adapter receives the exact continuation intent");
+            recovered.pass().unwrap();
+            assert_eq!(recovered.kids[0].execution,execution);
+            drop(recovered);
+            let mut restarted = service(&b,&c,Default::default()); restarted.pass().unwrap();
+            assert!(restarted.kids.is_empty());
+            assert!(restarted.execution_waits[&n].contains("termination unconfirmed"));
+            assert!(restarted.retained_attempts().contains(&a),"lost handle retains its input evidence after restart");
+        }
+    }
+
+    // Chain: native acceptance/exit -> failed or lost board response -> durable readback. Risk: evidence retry replays work or drops its handle.
+    #[test]
+    fn acceptance_readback_retries_evidence_and_keeps_the_native_handle() {
+        struct Deferred { accepted: Rc<std::cell::Cell<bool>>, exit: Rc<std::cell::Cell<bool>> }
+        impl Proc for Deferred {
+            fn accepted(&mut self) -> Result<bool,String> { Ok(self.accepted.get()) }
+            fn exited(&mut self) -> Result<Option<i32>,String> { Ok(self.exit.get().then_some(0)) }
+            fn kill(&mut self) -> Result<(),String> { self.exit.set(true); Ok(()) }
+            fn id(&self) -> u32 { 0 }
+        }
+        let b=Fake::default(); let n=b.create("T","",&[TASK_LABEL.into()]).unwrap(); let c=cfg("mac");
+        let accepted=Rc::new(std::cell::Cell::new(false)); let exit=Rc::new(std::cell::Cell::new(false));
+        let starts=Rc::new(std::cell::Cell::new(0)); let (ac,ex,calls)=(accepted.clone(),exit.clone(),starts.clone());
+        let mut s=Service::new(&b,&c,"fixture",Box::new(move |_| {
+            calls.set(calls.get()+1); Ok(Box::new(Deferred { accepted:ac.clone(),exit:ex.clone() }))
+        }));
+        s.focus=vec!["all".into()]; s.pass().unwrap(); let a=task(&b,n).attempt.unwrap();
+        assert_eq!(s.delivered(a),0,"a created handle is not acceptance");
+        assert_eq!(core::delivered(n,&entries(&b,n).unwrap(),a),None);
+        b.comment(n,&core::entry("ask",&[],Some(a),"Which?\n1. Continue ★")).unwrap();
+        accepted.set(true); exit.set(true); b.state.borrow_mut().fail_comments=1;
+        s.pass().unwrap();
+        assert_eq!(s.kids.len(),1,"retain native proof until its receipt is durable");
+        assert_eq!(s.delivered(a),0); assert_eq!(starts.get(),1);
+        assert!(s.unknown[&a].contains("acceptance unconfirmed"));
+        b.state.borrow_mut().lose_comment_response=true;
+        s.pass().unwrap();
+        assert_eq!(s.delivered(a),a); assert!(s.kids.is_empty()); assert_eq!(starts.get(),1);
+        let log=entries(&b,n).unwrap();
+        assert_eq!(log.iter().filter(|e|e.body.starts_with("taskq: accepted ")).count(),1);
+        assert_eq!(core::executions(n,&log)[0].release,Some(core::Release::Exit));
+        assert!(release_execution(&b,n,a,a,"no-start").unwrap_err().contains("contradictory"));
+        let mut restarted=service(&b,&c,Default::default()); restarted.pass().unwrap();
+        assert!(restarted.kids.is_empty()); assert_eq!(task(&b,n).state,State::Ask);
+    }
+
+    // Chain: terminal old turn -> pending owner input -> unavailable owner/session. Risk: recovery drops input by fabricating gone.
+    #[test]
+    fn unavailable_owner_or_session_preserves_pending_input() {
+        for (runtime, host) in [("codex:session","other"),("codex:-","mac")] {
+            let b=Fake::default(); let n=b.create("T","",&[TASK_LABEL.into()]).unwrap(); let c=cfg("mac");
+            let a=b.comment(n,&core::entry("spawn",&["worker",runtime,host],None,"")).unwrap();
+            accept_execution(&b,n,a,a).unwrap(); release_execution(&b,n,a,a,"exit").unwrap();
+            let input=b.comment(n,"taskq: steer\nkeep this input").unwrap();
+            b.advance(3600);
+            let mut s=service(&b,&c,Default::default()); s.pass().unwrap();
+            assert_eq!(task(&b,n).attempt,Some(a)); assert_eq!(task(&b,n).inbox,[input]);
+            assert!(s.kids.is_empty());
+            assert!(!b.comments(n).unwrap().iter().any(|c|c.body.starts_with("taskq: gone")));
+            if host == "mac" {
+                assert!(s.execution_waits[&n].contains("session identity unknown"));
+                assert!(s.snapshot.as_ref().unwrap().tasks.iter().find(|r|r.n==n).unwrap().execution_wait.as_ref().unwrap().contains("session identity unknown"));
+            } else {
+                assert!(s.execution_waits[&n].contains("input pending on other"));
+            }
+        }
+    }
+
+    // Chain: uncertain native submit -> service restart -> result/requeue -> another host.
+    // Risk: task state or a lost process handle permits duplicate external execution.
+    #[test]
+    fn uncertain_submission_stays_fenced_through_restart_and_task_moves() {
+        for result in [true, false] {
+            let b = Fake::default();
+            let n = b.create("T", "", &[TASK_LABEL.into()]).unwrap();
+            let (ca, cb) = (cfg("mac"), cfg("win"));
+            let starts = Rc::new(std::cell::Cell::new(0)); let called = starts.clone();
+            let mut a = Service::new(&b, &ca, "fixture", Box::new(move |_| {
+                called.set(called.get() + 1);
+                let mut error = crate::runtime::StartError::io(std::io::Error::other("response lost after submission"), None);
+                error.no_start = false;
+                Err(error)
+            }));
+            a.focus = vec!["all".into()];
+            assert!(a.pass().unwrap_err().contains("launch outcome unknown"));
+            let attempt = task(&b, n).attempt.unwrap();
+            assert_eq!(a.entry().held.len(), 1, "unknown submission retains capacity");
+            drop(a);
+            let exits: Exits = Default::default();
+            let mut restored = service(&b, &ca, exits.clone());
+            restored.pass().unwrap();
+            assert_eq!(restored.entry().held.len(), 1, "restart rebuilds unresolved ownership");
+            assert!(exits.borrow().is_empty());
+            b.comment(n, &if result { core::entry("result", &[&"a".repeat(40)], Some(attempt), "ready for review") }
+                else { core::entry("requeue", &[], Some(attempt), "retry") }).unwrap();
+            b.advance(900);
+            let mut other = service(&b, &cb, exits.clone());
+            other.pass().unwrap(); restored.pass().unwrap();
+            assert_eq!(starts.get(), 1); assert!(exits.borrow().is_empty());
+            assert!(other.execution_waits.contains_key(&n));
+            release_execution(&b, n, attempt, attempt, "exit").unwrap();
+            other.pass().unwrap();
+            assert_eq!(exits.borrow().len(), 1, "fresh native exit evidence permits the next role");
+            restored.pass().unwrap();
+            assert!(restored.entry().held.is_empty(), "another host's new attempt cannot retain the old reservation");
+            assert_eq!(task(&b, n).role.as_deref(), Some(if result { "reviewer" } else { "worker" }));
         }
     }
 
@@ -1361,11 +1825,13 @@ mod tests {
             text.push_str(&terminal);
             std::fs::write(&path, &text).unwrap();
             let mut writer = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            crate::profile::prune(&root).unwrap();
             assert!(crate::profile::selftest(&root, "o/r", &vec![], 300).is_ok(), "legacy log size no longer stops collection");
             let lock = crate::profile::log_lock(&path).unwrap();
             s.pass().unwrap();
             assert_eq!(std::fs::read_to_string(&path).unwrap(), text, "busy lock preserves evidence");
             drop(lock);
+            let (_capture,_guard)=crate::profile::tests::collecting(&root);
             s.pass().unwrap();
             let retained = std::fs::read_to_string(&path).unwrap();
             assert!(retained.len() as u64 <= crate::data::LOG_MAX / 2);
@@ -1376,7 +1842,7 @@ mod tests {
             assert!(crate::profile::selftest(&root, "o/r", &vec![], 300).unwrap().contains("no overdue"));
             assert!(!crate::profile::report(&root).contains("collection stopped"));
             drop(writer);
-            std::fs::remove_dir_all(&root).unwrap();
+            drop(_guard);drop(_capture);std::fs::remove_dir_all(&root).unwrap();
             std::fs::create_dir_all(&root).unwrap();
         }
         std::fs::remove_dir_all(root).unwrap();
@@ -1420,11 +1886,12 @@ mod tests {
         let n = b.create("Exit qualification", "", &["taskq".into()]).unwrap();
         let a = b.comment(n, "taskq: spawn worker claude:invented win").unwrap();
         b.comment(n, &core::entry("result", &["0123456789abcdef0123456789abcdef01234567"], Some(a), "invented candidate")).unwrap();
+        release_execution(&b, n, a, a, "exit").unwrap();
         let mut s = Service::new(&b, &c, "4.4.0", Box::new(|l| {
             assert_eq!(l.role, "reviewer");
             let text = format!("{}\nReply EXIT_CHECK and do nothing else.", "Qualification input only.\n".repeat(1800));
             ClaudeTurn::start(&env, l, &log_path(env.root, l), &text, &access(&env, "claude").unwrap())
-                .map(|t| Box::new(t) as Box<dyn Proc>).map_err(|message| crate::runtime::StartError::io(std::io::Error::other(message), None))
+                .map(|t| Box::new(t) as Box<dyn Proc>)
         }));
         s.focus = vec!["all".into()];
         s.pass().unwrap();
@@ -1510,6 +1977,11 @@ mod tests {
                 assert_eq!(launch["trace"], command["trace"]);
                 assert_eq!(launch["outcome"], "ok");
             }
+            if !held {
+                assert!(observations.iter().any(|r|r["kind"]=="stage"&&r["operation"]=="start"&&r["trace"]==command["trace"]));
+                assert!(observations.iter().any(|r|r["kind"]=="stage"&&r["open"]==true&&r["version"]=="fixture"));
+            }
+            assert!(!dir.join("i/telemetry.log/telemetry.sqlite3").exists(),"scheduler must not open a second live sink");
             let text = serde_json::to_string(&observations).unwrap();
             assert!(!text.contains("private owner reason") && !text.contains(dir.to_str().unwrap()));
             drop(reader);
@@ -1521,7 +1993,8 @@ mod tests {
     #[ignore = "subprocess helper exercised by resume_handoff_links_the_service_decision"]
     fn resume_handoff_child() {
         let dir = PathBuf::from(std::env::var_os("TASKQ_HANDOFF_ROOT").unwrap());
-        let _runtime = coreq::telemetry::capture::Runtime::install(&dir.join("i/telemetry.log/universal.sqlite3"), "taskq", "fixture").unwrap();
+        crate::profile::init(&dir.join("i"));
+        let _runtime = coreq::telemetry::capture::Runtime::install_bounded(&dir.join("i/telemetry.log/universal.sqlite3"), "taskq", "fixture",crate::telemetry::budget(&dir.join("i"),"telemetry.sqlite3").unwrap()).unwrap();
         if std::env::var("TASKQ_HANDOFF_MODE").unwrap() == "resume" {
             crate::resume(&dir).unwrap();
         } else {
@@ -1663,7 +2136,7 @@ mod tests {
         let mut sa = service(&a, &ca, Default::default()); let mut sb = service(&b, &cb, Default::default());
         for s in [&mut sa, &mut sb] {
             s.host = Some(host.clone()); s.reload(Ok(p.cap.clone()));
-            s.kids.push(Kid { task: 1, attempt: 7, rt: "claude".into(), proc: Box::new(FakeProc(Default::default())) });
+            s.kids.push(Kid { execution: 7, task: 1, attempt: 7, rt: "claude".into(), proc: Box::new(FakeProc(Default::default())) });
             host.lock().unwrap().busy.insert(s.cfg.root.clone(), true);
             s.sync_host();
         }
@@ -1694,8 +2167,10 @@ mod tests {
             h.reserve(&healthy, n, n, "claude", &p.cap, true, (n - 1) * 30).unwrap();
             h.sync(&healthy, vec![]);
         }
+        let n = b.create("Owned", "", &[TASK_LABEL.into()]).unwrap();
+        let a = b.comment(n, "taskq: spawn worker claude:fixture invented").unwrap();
         let exit = Rc::new(RefCell::new(None));
-        s.kids.push(Kid { task: 1, attempt: 7, rt: "claude".into(), proc: Box::new(FakeProc(exit.clone())) });
+        s.kids.push(Kid { execution: a, task: n, attempt: a, rt: "claude".into(), proc: Box::new(FakeProc(exit.clone())) });
         { let mut h = host.lock().unwrap(); h.busy.insert(root.clone(), true); h.restart = true; }
         // This is the monitor entered after a reduced-loop panic: no board pass and no lease renewal.
         assert!(!crate::stopped_handoff(&mut s, &host, &c).unwrap());
@@ -1704,14 +2179,14 @@ mod tests {
         assert!(!crate::stopped_handoff(&mut s, &host, &c).unwrap());
         let h = host.lock().unwrap();
         assert!(h.busy.keys().all(|p| h.prepared.contains(p)), "coordinator can restart after verified exit");
-        assert!(b.issues(None).unwrap().is_empty(), "the stopped monitor makes no board writes");
+        assert!(core::executions(n, &entries(&b,n).unwrap()).iter().all(|x| x.release.is_some()), "only confirmed release permits handoff");
         drop(h); std::fs::remove_dir_all(root).unwrap();
     }
 
-    // Chain: § 3 cross-host grace. Risk: ignored entries extend another host's lease.
+    // Chain: cross-host recovery. Risk: inbox age or an unlisted lease is mistaken for exit.
     #[test]
-    fn cross_host_grace_uses_only_accepted_inbox_entries() {
-        for (entry, trusted, edited, grace) in [
+    fn cross_host_recovery_needs_exit_regardless_of_inbox_grace() {
+        for (entry, trusted, edited, pending_input) in [
             ("taskq: answer 1", true, false, true),
             ("taskq: steer\ncontinue", true, false, true),
             ("taskq: steer attempt 999999\ncontinue", true, false, false),
@@ -1732,13 +2207,14 @@ mod tests {
             let mut s = service(&b, &c, Default::default());
             s.focus.clear();
             s.pass().unwrap();
-            assert_eq!(task(&b, n).attempt, grace.then_some(a), "{entry}, trusted={trusted}, edited={edited}");
-            if grace {
-                b.advance(301);
-                b.edit(hb, "version 4.0.0\nat fresh").unwrap();
-                s.pass().unwrap();
-                assert_eq!(task(&b, n).attempt, None, "inbox grace expires despite a fresh unlisted heartbeat");
-            }
+            assert_eq!(task(&b, n).attempt, Some(a), "{entry}, trusted={trusted}, edited={edited}");
+            b.advance(301);
+            b.edit(hb, "version 4.0.0\nat fresh").unwrap();
+            s.pass().unwrap();
+            assert_eq!(task(&b, n).attempt, Some(a));
+            release_execution(&b, n, a, a, "exit").unwrap();
+            s.pass().unwrap();
+            assert_eq!(task(&b, n).attempt, pending_input.then_some(a), "confirmed exit permits recovery but cannot discard pending input");
         }
     }
 
@@ -1764,7 +2240,8 @@ mod tests {
         assert_eq!((task(&b, n).attempt, exits.borrow().len()), (Some(a), 2));
         b.advance(301);
         other.pass().unwrap();
-        assert_eq!(task(&b, n).attempt, None, "an accepted inbox entry does not protect a stale host");
+        assert_eq!(task(&b, n).attempt, Some(a), "the continuation remains owned after heartbeat expiry");
+        assert_eq!(core::executions(n, &entries(&b,n).unwrap()).iter().filter(|x| x.release.is_none()).count(), 1);
     }
 
     // Chain: § 4 step 1 turn end, A1/A2 of #1034. Risk: a worker whose `taskq result` was rate-limited finishes its
@@ -1774,6 +2251,66 @@ mod tests {
         for paused in [false, true] {
             turn_end(paused);
         }
+    }
+
+    // Chain: service launch -> failed native checkpoint -> repair -> observation -> terminal receipt.
+    // Risk: persistence failure loses a live handle or resubmits the task instead of saving its identity.
+    #[cfg(unix)]
+    #[test]
+    fn native_checkpoint_failure_retains_execution_and_retries_only_storage() {
+        let root=std::env::temp_dir().join(format!("taskq-checkpoint-{}",crate::runtime::uuid()));
+        let install=root.join("install");
+        std::fs::create_dir_all(&install).unwrap();
+        std::fs::write(install.join("native"),"blocked directory").unwrap();
+        let b=Fake::default();
+        let n=b.create("T","",&[TASK_LABEL.into()]).unwrap();
+        let c=Config {root:root.clone(),install:install.clone(),limits:BTreeMap::from([("codex".into(),1)]),..cfg("mac")};
+        let count=Rc::new(RefCell::new(0)); let launched=count.clone();
+        let mut s=Service::new(&b,&c,"fixture",Box::new(|l| {
+            *launched.borrow_mut()+=1;
+            let log=crate::runtime::log_path(&root,l);
+            std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+            std::fs::write(&log,"").unwrap();
+            let child=std::process::Command::new("sleep").arg("30").spawn().unwrap();
+            let native=coreq::process::identity(child.id()).unwrap();
+            Ok(Box::new(crate::runtime::CliTurn {proc:Box::new(child),log,pos:0,start:0,stopping:false,accepted:false,read_error:None,native,recovery:None}))
+        }));
+        s.focus=vec!["all".into()];
+        s.pass().unwrap();
+        let a=task(&b,n).attempt.unwrap();
+        assert_eq!(s.kids.len(),1);
+        s.reap_owned();
+        assert!(s.unknown[&a].contains("checkpoint failed"));
+        let pid=s.kids[0].proc.id();
+        assert!(coreq::process::identity(pid).unwrap().is_some());
+        std::fs::remove_file(install.join("native")).unwrap();
+        s.reap_owned();
+        let rows=crate::kids_file(&install,&root).unwrap();
+        assert_eq!(rows.len(),1);
+        assert_eq!((rows[0].task,rows[0].attempt,rows[0].execution,rows[0].process.pid),(n,a,a,pid));
+        assert_eq!(*count.borrow(),1,"retry storage, never work");
+        assert!(!s.unknown.contains_key(&a));
+        let held=std::mem::take(&mut s.kids);
+        let discarded=crate::save_kids(&s,&root);
+        s.kids=held;
+        assert!(discarded.unwrap_err().contains("unresolved"));
+        assert_eq!(crate::kids_file(&install,&root).unwrap(),rows,"a missing handle cannot erase recovery evidence");
+        // A second failed checkpoint must not prevent emergency cancellation.
+        let l=Launch {execution:None,task:n,title:String::new(),attempt:a,role:"worker".into(),rt:"codex".into(),session:"-".into(),url:String::new(),resume:None};
+        let path=crate::kids_path(&install,&root).unwrap();
+        std::fs::write(&path,"corrupt").unwrap();
+        assert!(s.kids[0].proc.checkpoint(&c,&l,a).is_err());
+        s.kids[0].proc.kill().unwrap();
+        let until=std::time::Instant::now()+std::time::Duration::from_secs(3);
+        while !s.kids.is_empty() {
+            s.reap_owned();
+            assert!(std::time::Instant::now()<until,"stop must remain available during storage failure");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(*count.borrow(),1);
+        assert_eq!(core::executions(n,&crate::board::entries(&b,n).unwrap())[0].release,Some(core::Release::Exit));
+        assert_eq!(std::fs::read_to_string(path).unwrap(),"corrupt","failed recovery evidence is preserved");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     fn turn_end(paused: bool) {
@@ -1791,7 +2328,7 @@ mod tests {
             let log = crate::runtime::log_path(&r, l);
             std::fs::create_dir_all(log.parent().unwrap()).unwrap();
             std::fs::write(&log, "{\"type\":\"thread.started\",\"thread_id\":\"t\"}\n").unwrap();
-            Ok(Box::new(crate::runtime::CliTurn { proc: Box::new(FakeProc(flag)), log, pos: 0, stopping: false }) as Box<dyn Proc>)
+            Ok(Box::new(crate::runtime::CliTurn { proc: Box::new(FakeProc(flag)), log, pos: 0, start: 0, stopping: false, accepted: false, read_error: None, native: None, recovery: None }) as Box<dyn Proc>)
         }));
         s.focus = vec!["all".into()];
         s.pass().unwrap();
@@ -1808,16 +2345,18 @@ mod tests {
         writeln!(f, "{}", json!({"type": "item.completed", "item": {"type": "agent_message", "text": text}})).unwrap();
         writeln!(f, "{{\"type\":\"turn.completed\"}}").unwrap();
         if paused {
-            // the service's own `gone` meets the same pause: the next pass still ends the attempt
+            // A failed release keeps the exited handle and retries only its evidence write.
             b.state.borrow_mut().fail_comments = 1;
-            assert!(s.pass().is_err());
+            s.pass().unwrap();
+            assert_eq!(s.kids.len(), 1);
+            assert!(s.unknown.contains_key(&a));
         }
         s.pass().unwrap();
         assert_eq!(*flags.borrow()[0].1.borrow(), Some(-9), "the lingering process tree is stopped");
         let t = task(&b, n);
         let gone = b.comments(n).unwrap().into_iter().rfind(|c| c.body.starts_with("taskq: gone")).unwrap().body;
         assert_eq!((t.state, t.attempt, t.retries), (State::Ready, None, 1), "paused={paused}");
-        let reason = if paused { "no child on its host" } else { "exit -9" };
+        let reason = "exit -9";
         assert!(gone.ends_with(&format!("\n{reason}\nLast message: Task handoff is incomplete: GitHub rate limits rejected `taskq result`. See [log](.taskq/x.log).")), "{gone}");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1897,7 +2436,7 @@ mod tests {
             let mut s = service(&b, &c, Rc::new(RefCell::new(vec![])));
             s.focus.clear();
             let flag = Rc::new(RefCell::new(None));
-            s.kids.push(Kid { task: n, attempt: if rejected { lost } else { accepted }, rt: "claude".into(), proc: Box::new(FakeProc(flag.clone())) });
+            s.kids.push(Kid { execution: if rejected { lost } else { accepted }, task: n, attempt: if rejected { lost } else { accepted }, rt: "claude".into(), proc: Box::new(FakeProc(flag.clone())) });
             s.pass().unwrap();
             assert_eq!(*flag.borrow(), Some(-9));
             assert_eq!(crate::incident::take_detected(), if rejected { vec!["invariant.double_attempt"] } else { vec![] });
@@ -1999,28 +2538,74 @@ mod tests {
         assert_eq!(urls.into_iter().collect::<Vec<_>>(), vec![(("win".to_string(), 42), "https://claude.ai/code/session_014abc".to_string())]);
     }
 
+    // Chain: native observation -> aggregate heartbeat -> remote read -> durable terminal after lost response.
+    #[test]
+    fn execution_heartbeat_is_fenced_visible_and_never_reopens_terminal() {
+        let b=Fake::default();let c=cfg("mac");let remote=cfg("win");
+        let n=b.create("T","",&[TASK_LABEL.into()]).unwrap();
+        let exits:Exits=Default::default();let mut s=service(&b,&c,exits.clone());
+        s.pass().unwrap();s.pass().unwrap();let a=task(&b,n).attempt.unwrap();
+        let read=||crate::snapshot::read(&b,&remote,&json!({}),&[]).tasks.into_iter().find(|r|r.n==n).unwrap().json();
+        let host=b.issues(None).unwrap().into_iter().find(|i|i.title=="taskq host mac").unwrap();
+        let running=host.body.clone();
+        assert_eq!(read()["executions"][0]["state"],"running");
+        for fault in ["foreign","execution","input","duplicate","malformed","partial-duplicate","invalid-state","untrusted","stale","future"] {
+            let mut body=running.clone();
+            if fault=="foreign" {body=body.replace("execution ","ignored ");}
+            if matches!(fault,"execution"|"input"|"invalid-state") {
+                let mut row:Value=serde_json::from_str(running.lines().find_map(|l|l.strip_prefix("execution ")).unwrap()).unwrap();
+                match fault {"execution"=>row["id"]=json!(a+999),"input"=>row["through"]=json!(a+999),_=>row["state"]=json!("finished")};
+                body=running.lines().filter(|l|!l.starts_with("execution ")).chain(std::iter::once("")).collect::<Vec<_>>().join("\n")+&format!("execution {row}");
+            }
+            if fault=="duplicate" {body+=&format!("\n{}",running.lines().find(|l|l.starts_with("execution ")).unwrap());}
+            if fault=="partial-duplicate" {body+="\nexecution {";}
+            if fault=="malformed" {body=running.lines().filter(|l|!l.starts_with("execution ")).collect::<Vec<_>>().join("\n")+"\nexecution {";}
+            b.edit(host.number,&body).unwrap();
+            {let mut st=b.state.borrow_mut();let now=st.clock;let h=st.issues.iter_mut().find(|i|i.number==host.number).unwrap();
+                h.trusted=fault!="untrusted";if fault=="stale" {h.updated=now-61;}if fault=="future" {h.updated=now+60;}}
+            let row=read();assert_eq!(row["executions"][0]["state"],"unknown","{fault}: {row}");
+            assert!(row["execution_wait"].is_string(),"{fault}");
+            b.state.borrow_mut().issues.iter_mut().find(|i|i.number==host.number).unwrap().trusted=true;
+        }
+        b.edit(host.number,&running).unwrap();
+        s.stopping.insert(a);s.beat().unwrap();assert_eq!(read()["executions"][0]["state"],"waiting");s.stopping.remove(&a);
+        *exits.borrow().iter().find(|(id,_)|*id==n).unwrap().1.borrow_mut()=Some(-999);s.pass().unwrap();
+        assert!(read()["executions"][0]["reason"].as_str().unwrap().contains("read failed"));
+        assert!(s.snapshot.as_ref().unwrap().tasks.iter().find(|r|r.n==n).unwrap().json()["execution_wait"].as_str().unwrap().contains("read failed"));
+        *exits.borrow().iter().find(|(id,_)|*id==n).unwrap().1.borrow_mut()=Some(0);b.state.borrow_mut().fail_comments=1;
+        s.reap_owned();s.beat().unwrap();assert_eq!(s.kids.len(),1);
+        assert_eq!(read()["executions"][0]["state"],"unknown","failed final delivery retains ownership");
+        b.state.borrow_mut().lose_comment_response=true;s.reap_owned();assert!(s.kids.is_empty());
+        b.state.borrow_mut().lose_comment_response=false;
+        let log=entries(&b,n).unwrap();assert_eq!(core::executions(n,&log)[0].release,Some(core::Release::Exit));
+        assert_eq!(log.iter().filter(|e|e.body.starts_with("taskq: released")).count(),1);
+        b.edit(host.number,&running).unwrap();let row=read();assert!(row.get("executions").is_none(),"late heartbeat cannot reopen terminal");
+        let mut fresh=service(&b,&c,Default::default());fresh.focus.clear();fresh.pass().unwrap();
+        assert!(!fresh.heartbeat_body().lines().any(|l|l.starts_with("execution ")),"restart reads durable terminal");
+    }
+
     // Chain: § 4 board budget, heartbeat. Risk: a PATCH every pass burns the shared budget, or a sparse heartbeat
     // lets another host expire a live lease.
     #[test]
-    fn idle_heartbeat_writes_every_third_of_ttl_and_stays_fresh() {
+    fn idle_heartbeat_is_batched_at_sixty_seconds_and_stays_fresh() {
         let b = Fake::default();
         let c = cfg("mac");
         let mut s = service(&b, &c, Default::default());
         let beat = |b: &Fake| b.issues(None).unwrap().into_iter().find(|i| i.title == "taskq host mac").map(|i| i.updated).unwrap();
         s.pass().unwrap();
         let (mut writes, mut last) = (0, beat(&b));
-        for _ in 0..60 {
-            b.advance(60); // default poll
+        for _ in 0..360 {
+            b.advance(10);
             assert!(b.now().unwrap() - beat(&b) < c.ttl, "lease stays fresh between passes");
             s.pass().unwrap();
             if beat(&b) != last { writes += 1; last = beat(&b); }
         }
-        assert_eq!(writes, 30, "one write per 2 passes at poll 60, ttl 300; was 60 at ttl / 5");
+        assert_eq!(writes, 60, "one periodic write per minute, not one per fast pass");
     }
 
-    // Chain: R2 § 3 two hosts one attempt. Risk: two attempts run, or a dead host blocks the task.
+    // Chain: R2 two hosts -> lost heartbeat -> still-live executor -> confirmed exit -> replacement.
     #[test]
-    fn two_hosts_admit_one_attempt_and_the_survivor_recovers_a_dead_host() {
+    fn two_hosts_wait_for_confirmed_exit_before_replacement() {
         let b = Fake::default();
         let n = b.create("T", "## Goal\ng", &["taskq".into()]).unwrap();
         let (ca, cb) = (cfg("mac"), cfg("win"));
@@ -2041,9 +2626,19 @@ mod tests {
             w.pass().unwrap();
         }
         assert_eq!(host_of(&task(&b, n)), Some("mac"));
-        // the mac host dies: win waits out the ttl, then posts gone and takes the task
+        // A missing heartbeat does not kill the old executor.
         b.advance(301);
         w.pass().unwrap();
+        assert_eq!(host_of(&task(&b, n)), Some("mac"));
+        assert_eq!(ea.borrow().iter().chain(eb.borrow().iter()).filter(|(_, p)| p.borrow().is_none()).count(), 1);
+        assert!(w.execution_waits[&n].contains("termination unconfirmed"));
+        let snapshot = crate::snapshot::read(&b, &cb, &json!({}), &[]);
+        assert!(snapshot.tasks.iter().find(|r| r.n == n).unwrap().json()["execution_wait"].as_str().unwrap().contains("termination unconfirmed"));
+        assert!(snapshot.text(&cb, &json!({})).unwrap().contains("termination unconfirmed"));
+        assert!(eb.borrow().is_empty());
+        *ea.borrow()[0].1.borrow_mut() = Some(0);
+        a.focus.clear();
+        a.pass().unwrap();
         assert_eq!(task(&b, n).state, State::Ready);
         w.pass().unwrap();
         let t = task(&b, n);
@@ -2057,18 +2652,17 @@ mod tests {
     fn missing_terminal_record_repaired_only_by_normal_recovery() {
         let dir = std::env::temp_dir().join(format!("taskq-terminal-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
+        let (_capture,_guard)=crate::profile::tests::collecting(&dir);
         let b = Fake::default();
         let n = b.create("T", "", &["taskq".into()]).unwrap();
         let a = b.comment(n, &core::entry("spawn", &["worker", "claude:s", "mac"], None, "")).unwrap();
         let mut c = cfg("mac");
         c.install = dir.clone();
         c.root = dir.clone();
-        crate::profile::open(&dir, &c.repo, "mac", n, a, "claude", false);
-        let text = crate::profile::read_log(&dir).unwrap();
-        let mut record: Value = serde_json::from_str(text.trim().strip_prefix("taskq-stage ").unwrap()).unwrap();
-        record["at_ms"] = json!(1);
-        rusqlite::Connection::open(dir.join("telemetry.log/telemetry.sqlite3")).unwrap().execute(
-            "UPDATE records SET line=?1", [format!("taskq-stage {record}")]).unwrap();
+        let record=json!({"project":c.repo,"host":"mac","stage":"build","open":true,"task":n,"attempt":a,"rt":"claude",
+            "outcome":"unknown","error":"none","at_ms":1,"unknown":"open-stage"});
+        drop(crate::profile::log_lock(&dir.join("taskq.log")).unwrap());
+        crate::telemetry::append(&dir,&format!("taskq-stage {record}"),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64).unwrap();
         assert!(crate::profile::selftest(&dir, &c.repo, &vec![], 300).unwrap_err().contains("FAIL"));
         // A live attempt stays exempt even after ttl; the check never mutates board state.
         assert!(crate::profile::selftest(&dir, &c.repo, &vec![(c.repo.clone(), a)], 300).is_ok());
@@ -2077,6 +2671,10 @@ mod tests {
         assert!(report.contains(&format!("| o/r | #{n} | {a} | claude | mac |")), "{report}");
         let mut s = service(&b, &c, Default::default());
         s.focus.clear();
+        s.pass().unwrap();
+        assert_eq!(task(&b, n).attempt, Some(a), "missing child is unknown, not exited");
+        assert!(s.execution_waits.contains_key(&n));
+        release_execution(&b, n, a, a, "exit").unwrap();
         s.pass().unwrap();
         assert!(b.comments(n).unwrap().iter().any(|c| c.body.starts_with(&format!("taskq: gone attempt {a}"))));
         assert_eq!(task(&b, n).attempt, None);
@@ -2087,7 +2685,7 @@ mod tests {
         s.pass().unwrap();
         assert_eq!(crate::profile::read_log(&dir).unwrap(), repaired, "repair is idempotent");
 
-        std::fs::remove_dir_all(dir).unwrap();
+        drop(_guard);drop(_capture);std::fs::remove_dir_all(dir).unwrap();
     }
 
     // Chain: §4 ended review -> left-board -> close -> next-pass repair -> selftest.
@@ -2097,6 +2695,7 @@ mod tests {
         for closed in [true, false] {
             let dir = std::env::temp_dir().join(format!("taskq-ended-{}-{closed}", std::process::id()));
             std::fs::create_dir_all(&dir).unwrap();
+            let (_capture,_guard)=crate::profile::tests::collecting(&dir);
             let b = Fake::default();
             let n = b.create("T", "", &["taskq".into()]).unwrap();
             let w = b.comment(n, "taskq: spawn worker codex:w mac").unwrap();
@@ -2125,7 +2724,7 @@ mod tests {
             s.pass().unwrap();
             assert_eq!(crate::profile::read_log(&dir).unwrap(), repaired);
             assert!(!b.comments(n).unwrap().iter().any(|c| c.body.starts_with("taskq: gone")));
-            std::fs::remove_dir_all(dir).unwrap();
+            drop(_guard);drop(_capture);std::fs::remove_dir_all(dir).unwrap();
         }
     }
 
@@ -2137,6 +2736,7 @@ mod tests {
             for evidence in ["local", "foreign-project", "foreign-host", "missing-log", "empty-log", "unreadable-log", "ignored-spawn", "untrusted-spawn", "runtime-mismatch", "unreadable-board", "unreadable-comments"] {
                 let dir = std::env::temp_dir().join(format!("taskq-no-host-{}-{closed}-{evidence}", std::process::id()));
                 std::fs::create_dir_all(dir.join(".taskq")).unwrap();
+                let (_capture,_guard)=crate::profile::tests::collecting(&dir);
                 let b = Fake::default();
                 let n = b.create("T", "", &["taskq".into()]).unwrap();
                 let w = b.comment(n, "taskq: spawn worker codex:w mac").unwrap();
@@ -2192,7 +2792,7 @@ mod tests {
                 }
                 if attempt_log.is_file() { assert_eq!(std::fs::read_to_string(attempt_log).unwrap(), if evidence == "empty-log" { "" } else { "original reviewer output\n" }); }
                 assert!(!b.comments(n).unwrap().iter().any(|c| c.body.starts_with("taskq: gone")));
-                std::fs::remove_dir_all(dir).unwrap();
+                drop(_guard);drop(_capture);std::fs::remove_dir_all(dir).unwrap();
             }
         }
     }
@@ -2238,6 +2838,7 @@ mod tests {
         let n = b.create("T", "", &["taskq".into()]).unwrap();
         let a = b.comment(n, "taskq: spawn worker claude:invented win").unwrap();
         b.comment(n, &core::entry("result", &["0123456789abcdef0123456789abcdef01234567"], Some(a), "ok")).unwrap();
+        release_execution(&b, n, a, a, "exit").unwrap();
         let c = cfg("win");
         let root = std::env::temp_dir().join(format!("taskq-native-failure-{}", crate::runtime::uuid()));
         std::fs::create_dir_all(root.join("jobs/abcdef12")).unwrap();
@@ -2273,6 +2874,7 @@ mod tests {
         let n = b.create("T", "", &["taskq".into()]).unwrap();
         let w = b.comment(n, &core::entry("spawn", &["worker", "claude:s", "linux"], None, "")).unwrap();
         b.comment(n, &core::entry("result", &["0123456789abcdef0123456789abcdef01234567"], Some(w), "ok")).unwrap();
+        release_execution(&b, n, w, w, "exit").unwrap();
         let (cm, cw) = (cfg("mac"), cfg("win"));
         let (em, ew): (Exits, Exits) = Default::default();
         let (mut mac, mut win) = (service(&b, &cm, em.clone()), service(&b, &cw, ew.clone()));
@@ -2282,11 +2884,8 @@ mod tests {
         let r = task(&b, n).attempt.unwrap();
         let (labels, comments) = (b.issue(n).unwrap().labels, b.comments(n).unwrap().len());
         mac.claim(&stale, "reviewer", "claude").unwrap();
-        // A2: the loser posts only its spawn: no label, no other comment, no event, no child
-        let lost = b.comments(n).unwrap().pop().unwrap();
-        assert!(lost.body.starts_with("taskq: spawn reviewer claude:") && lost.body.ends_with(" mac"), "{}", lost.body);
-        assert_eq!(mac.log, [format!("#{n} {}", lost.body), format!("#{n} spawn {} lost the claim", lost.id)]);
-        assert_eq!((b.issue(n).unwrap().labels, b.comments(n).unwrap().len(), mac.kids.len(), em.borrow().len()), (labels, comments + 1, 0, 0));
+        // Fresh ownership read prevents even a losing spawn for the stale view.
+        assert_eq!((b.issue(n).unwrap().labels, b.comments(n).unwrap().len(), mac.kids.len(), em.borrow().len()), (labels, comments, 0, 0));
         assert_eq!((task(&b, n).attempt, task(&b, n).state), (Some(r), State::Review));
         // A3: later passes of both hosts start no second reviewer for this result
         mac.pass().unwrap();
@@ -2316,6 +2915,7 @@ mod tests {
         let n = b.create("T", "", &["taskq".into()]).unwrap();
         let w = b.comment(n, &core::entry("spawn", &["worker", "claude:s", "linux"], None, "")).unwrap();
         b.comment(n, &core::entry("gone", &[], Some(w), "exit 1")).unwrap();
+        release_execution(&b, n, w, w, "exit").unwrap();
         assert_eq!((task(&b, n).state, task(&b, n).retries), (State::Ready, 1));
         let c = cfg("mac");
         let mut s = Service::new(&b, &c, "4.0.0", Box::new(|_: &Launch| {
@@ -2325,13 +2925,13 @@ mod tests {
         s.focus = vec!["all".into()];
         let comments = b.comments(n).unwrap().len();
         let e = s.pass().unwrap_err();
-        assert!(e.contains("start failed: claude: boom; gone not posted: comment read failed"), "{e}");
+        assert!(e.contains("comment read failed"), "{e}");
         assert_eq!((b.comments(n).unwrap().len(), task(&b, n).state), (comments + 1, State::Doing), "only the spawn");
         s.pass().unwrap();
         let t = task(&b, n);
         let card = t.card.clone().unwrap();
         assert_eq!((t.state, t.retries), (State::Ask, 2));
-        assert!(card.starts_with("no child on its host") && card.contains("Problem: retry limit 2 reached by this gone"), "{card}");
+        assert!(card.contains("confirmed NoStart") && card.contains("Problem: retry limit 2 reached by this gone"), "{card}");
         assert_eq!(core::options(&card).len(), 2);
     }
 
@@ -2357,7 +2957,7 @@ mod tests {
             c.limits = limits.iter().cloned().collect();
             let mut s = service(&b, &c, Default::default());
             for (task, attempt, rt) in held {
-                s.kids.push(Kid { task, attempt, rt, proc: Box::new(FakeProc(Rc::new(RefCell::new(None)))) });
+                s.kids.push(Kid { execution: attempt, task, attempt, rt, proc: Box::new(FakeProc(Rc::new(RefCell::new(None)))) });
             }
             s.pass().unwrap();
             let got: Vec<Option<String>> = ns.iter().map(|&n| rt_of(&task(&b, n)).map(|(rt, _)| rt.to_string())).collect();
@@ -3025,7 +3625,7 @@ mod tests {
         *e.borrow()[0].1.borrow_mut() = Some(0);
         s.pass().unwrap();
         let created = |id: u64| b.state.borrow().comments.iter().find(|(_, c)| c.id == id).unwrap().1.created;
-        let ids: Vec<u64> = entries(&b, x).unwrap().iter().map(|e| e.id).collect();
+        let ids: Vec<u64> = core::changes(x, &entries(&b, x).unwrap()).iter().map(|e| e.0).collect();
         let (records, report) = crate::profile::take_moves();
         let r: Vec<serde_json::Value> = records.lines().map(|l| serde_json::from_str(l.strip_prefix("taskq-transition ").unwrap()).unwrap()).collect();
         let row = |v: &serde_json::Value| (v["task"].as_u64().unwrap(), v["from"].as_str().unwrap().to_string(), v["to"].as_str().unwrap().to_string(), v["prev_s"].as_u64(), v["host"].as_str().map(String::from));
@@ -3100,7 +3700,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // Chain: § 7 worktree cleanup. Risk: a dirty worktree is deleted.
+    // Chain: closed task -> execution release -> worktree cleanup. Risk: deleting dirty or still-owned work.
     #[test]
     fn closed_tasks_lose_clean_worktrees_only() {
         let root = std::env::temp_dir().join(format!("taskq-prune-{}", std::process::id()));
@@ -3109,14 +3709,16 @@ mod tests {
         let git = |args: &[&str]| assert!(std::process::Command::new("git").arg("-C").arg(&root).args(["-c", "user.name=t", "-c", "user.email=t@t"]).args(args).output().unwrap().status.success(), "{args:?}");
         git(&["init", "-q"]);
         git(&["commit", "-q", "--allow-empty", "-m", "init"]);
-        for n in ["1", "2", "3"] {
+        for n in ["1", "2", "3", "4"] {
             git(&["worktree", "add", "-q", "-b", &format!("taskq-{n}"), &format!(".worktrees/taskq-{n}")]);
         }
         std::fs::write(root.join(".worktrees/taskq-2/wip"), "x").unwrap();
         let b = Fake::default();
-        for _ in 0..3 {
+        for _ in 0..4 {
             b.create("T", "", &["taskq".into()]).unwrap();
         }
+        let execution = b.comment(4, "taskq: spawn worker claude:owned disconnected").unwrap();
+        b.close(4).unwrap();
         b.close(1).unwrap();
         b.close(2).unwrap();
         let mut c = cfg("mac");
@@ -3127,6 +3729,10 @@ mod tests {
         assert_eq!((wt("1"), wt("2"), wt("3")), (false, true, true), "clean closed removed; dirty and open stay");
         cleanup(&b, &root, |_| false, true);
         assert_eq!((wt("2"), wt("3")), (false, true), "force removes dirty closed; open stays");
+        assert!(wt("4"), "even forced cleanup preserves an unresolved execution's worktree");
+        release_execution(&b, 4, execution, execution, "exit").unwrap();
+        cleanup(&b, &root, |_| false, false);
+        assert!(!wt("4"), "confirmed release permits cleanup");
         assert!(std::fs::read_to_string(root.join(".taskq/trash/taskq-2.patch")).unwrap().contains("wip"), "dirty work saved");
         let _ = std::fs::remove_dir_all(&root);
     }

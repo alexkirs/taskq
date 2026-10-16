@@ -636,7 +636,8 @@ mod tests {
         assert_eq!(host.lock().unwrap().slots.len(),1,"publication must not lose child ownership");
         fs::remove_dir(&path).unwrap();
         assert!(crate::publish_status(&tool,&root,&status,Some(&host)));
-        for failed in [json!({"complete":false,"tasks":[]}),json!({"complete":true,"tasks":[],"error":"board unavailable"})] {
+        for failed in [json!({"complete":false,"tasks":[]}),json!({"complete":true,"tasks":[],"error":"board unavailable"}),
+            json!({"complete":true,"tasks":[],"focus_error":"focus command pending"})] {
             assert!(!crate::publish_status(&tool,&root,&failed,Some(&host)));
             assert!(!host.lock().unwrap().publications_ready(&roots));
         }

@@ -9,6 +9,7 @@ mod admission;
 mod host;
 mod board;
 mod core;
+mod control;
 mod data;
 mod dispatch;
 mod enrollment;
@@ -298,11 +299,20 @@ fn change_focus<T>(root: &Path, restrictive: bool, initialize: bool, change: imp
     if !restrictive { if let Err(error) = &received { return Err(format!("command not applied: receipt unavailable ({error}); check service status")); } }
     // Retain the settings lock through terminal commit, including partial failures.
     let mut locked = None;
+    let mut tracking = None;
+    let mut tracking_error = None;
     let result = (|| {
         if initialize { fs::create_dir_all(dot(root)).map_err(|e| e.to_string())?; }
         fs::metadata(dot(root)).map_err(|e| format!("focus unchanged: state directory unavailable: {e}"))?;
         locked = Some(wake_lock(root)?);
         let lock = locked.as_ref().unwrap();
+        let prepared=received.as_ref().map_err(Clone::clone)
+            .and_then(|_|receipt.as_ref().map_err(Clone::clone)).and_then(|r|control::begin(root,r));
+        match prepared {
+            Ok(pending)=>tracking=Some(pending),
+            Err(error) if restrictive=>tracking_error=Some(error),
+            Err(error)=>return Err(format!("command not applied: service tracking unavailable ({error})")),
+        }
         // A failed mutation must never leave its new state attributed to the preceding signal.
         lock.file().set_len(0).map_err(|e| format!("focus unchanged: cannot invalidate previous signal: {e}"))?;
         let result = change(&dot(root));
@@ -315,15 +325,20 @@ fn change_focus<T>(root: &Path, restrictive: bool, initialize: bool, change: imp
         }
     })();
     let terminal = receipt.and_then(|r| r.checkpoint(if result.is_ok() { "applied" } else { "failed" }));
-    let uncertain = received.err().or_else(|| terminal.as_ref().err().cloned());
+    if terminal.is_ok() {if let Some(pending)=tracking {
+        if let Err(error)=control::finish(root,pending,result.is_ok()) {tracking_error=Some(error);}
+    }}
+    let uncertain = received.err().or_else(|| terminal.as_ref().err().cloned()).map(|e|format!("durable receipt unknown ({e})"))
+        .into_iter().chain(tracking_error.map(|e|format!("service tracking unknown ({e})"))).collect::<Vec<_>>().join("; ");
+    let uncertain=(!uncertain.is_empty()).then_some(uncertain);
     match (result, uncertain) {
         (Ok(value), None) => {
             println!("Command applied locally; service observation pending; receipt {}", terminal.unwrap());
             Ok(value)
         }
-        (Ok(_), Some(error)) => Err(format!("command applied locally; durable receipt unknown ({error}); check service status before retry")),
+        (Ok(_), Some(error)) => Err(format!("command applied locally; {error}; check service status before retry")),
         (Err(error), None) => Err(format!("{error}; failure receipt {}", terminal.unwrap())),
-        (Err(error), Some(receipt)) => Err(format!("{error}; durable receipt unknown ({receipt}); check service status before retry")),
+        (Err(error), Some(receipt)) => Err(format!("{error}; {receipt}; check service status before retry")),
     }
 }
 
@@ -740,11 +755,13 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
     let mut panics = host::Panics::default();
     let pokes = [d.join("poke"), cfg.install.join("poke")];
     let mut observed_poke = None;
+    let mut observed_command = None;
     loop {
         let poke_start = poke_times(&pokes);
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Res<()> {
-        let control = wake_read(&pokes[0], &mut observed_poke, || data::focus(&cfg.root));
-        let wakeup = control.as_ref().ok().and_then(|(link, _)| link.as_ref()).map(|link| link.span().entered());
+        let control = control::snapshot(&cfg.root,&mut observed_poke,&mut observed_command);
+        let command=match &control {Ok(snapshot)=>snapshot.command.clone(),Err(e)=>json!({"state":"unknown","reason":e})};
+        let wakeup = control.as_ref().ok().and_then(|s|s.link.as_ref()).map(|link| link.span().entered());
         let reduced = panics.quarantined() || began.elapsed().as_secs() < panics.until;
         // § 3: capacity reloads before each admission decision; children are untouched
         let cap = fs::read_to_string(cfg.root.join("taskq.json")).map_err(|e| e.to_string())
@@ -771,7 +788,7 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
         s.mono = host.as_ref().and_then(|h| h.lock().ok().map(|h| h.elapsed())).unwrap_or_else(|| began.elapsed().as_secs());
         s.wall = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
         // § 4 Data: an unreadable focus admits nothing and reads unknown with its reason
-        let focus = control.map(|(_, focus)| focus);
+        let focus = control.map(|snapshot|snapshot.focus);
         if focus.as_ref().err() != focus_error.as_ref() {
             if let Err(e) = &focus { log!("{e}; nothing admitted"); }
             focus_error = focus.as_ref().err().cloned();
@@ -841,7 +858,7 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
             Some(snap) => for (k, v) in snap.status_keys(error.as_deref()) { status[k] = v; },
             None => { status["complete"] = json!(false); status["reason"] = json!(error.as_deref().unwrap_or("no board read yet")); status["tasks"] = json!([]); }
         }
-        for (k, v) in [("focus", if focus_error.is_some() { Value::Null } else { json!(s.focus) }), ("focus_error", json!(focus_error)), ("kids", json!(kids)), ("issues", json!(issues)), ("log", json!(log)),
+        for (k, v) in [("focus", if focus_error.is_some() { Value::Null } else { json!(s.focus) }), ("focus_error", json!(focus_error)), ("focus_command",command), ("kids", json!(kids)), ("issues", json!(issues)), ("log", json!(log)),
             ("tasks_age_seconds", json!(s.tasks_read.map(|t| t.elapsed().as_secs()))), ("request", json!(request)), ("events_since", json!(s.events_since)),
             ("capacity", s.capacity_json()), ("hold", json!(s.hold)), ("access", json!(access.iter().map(|e| e.json()).collect::<Vec<_>>())), ("agents", json!(agents.as_ref().map(|a| &a.1))),
             ("restart_waits", json!(d.join("restart").exists().then(|| restart_waits(&s, &cfg.root)))),
@@ -982,7 +999,7 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
 fn publish_status(tool: &coreq::Tool, root: &Path, status: &Value, host: Option<&host::Shared>) -> bool {
     let written = coreq::status::write(tool, root, status);
     if let Err(e) = &written { log!("status publication failed: {e}; observed state unknown"); }
-    let qualified = written.is_ok() && snapshot::complete(status) && status["error"].is_null();
+    let qualified = written.is_ok() && snapshot::complete(status) && status["error"].is_null() && status["focus_error"].is_null();
     if let Some(host) = host { if let Ok(mut h) = host.lock() { h.publication(root, qualified); } }
     qualified
 }

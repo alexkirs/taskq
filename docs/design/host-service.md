@@ -1,6 +1,6 @@
 # One service process per host
 
-Status: proposal for owner approval (#1220). The owner chose option B: one OS unit per host runs every registered project in one `taskq service run` process. This page holds the proposed `taskq.md` diff, the migration and rollback plan, the isolation model and the implementation split. Nothing here is shipped behavior; `taskq.md` stays authoritative until the implementation tasks land the diff together with the code (R8, R13).
+Status: design detail for the adopted host model in [taskq.md](../../taskq.md). Runtime recovery follows [execution ownership](../runtime-qualification.md#execution-ownership); remaining migration and native qualification are not implied by this document.
 
 ## Decision
 
@@ -58,11 +58,11 @@ With:
 
 Replace:
 
-> - One service per root and host name: `service run` waits while a `status.json` under 60 s old names another live pid; a pass that finds this host's heartbeat under `ttl` naming another `service <id>` writes nothing and fails with `another service <id> runs as host <name>`. Restart: rebuild from the board; former children are not adopted (except the § 8 re-exec), their attempts are `gone`. `service restart` writes `<root>/.taskq/restart`: the next pass re-execs (§ 8 step 3).
+> - One service per root and host name: `service run` waits while a `status.json` under 60 s old names another live pid; a pass that finds this host's heartbeat under `ttl` naming another `service <id>` writes nothing and fails with `another service <id> runs as host <name>`. Restart: rebuild from the board and reconcile original native executions; missing handles stay unknown and never imply `gone` or release. `service restart` writes `<root>/.taskq/restart`: the next pass re-execs (§ 8 step 3).
 
 With:
 
-> - One service per host: `service run` waits while `<install>/service` (the service's pid) is under 60 s old and names another live pid; a project thread waits while its `status.json` under 60 s old names another live pid; a pass that finds this host's heartbeat under `ttl` naming another `service <id>` writes nothing and fails with `another service <id> runs as host <name>`. Restart: rebuild from the board; former children are not adopted (except the § 8 re-exec), their attempts are `gone`. `service restart` writes `<install>/restart` (a project's `<root>/.taskq/restart` counts the same): the process re-execs (§ 8 step 3).
+> - One service per host: `service run` waits while `<install>/service` (the service's pid) is under 60 s old and names another live pid; a project thread waits while its `status.json` under 60 s old names another live pid; a pass that finds this host's heartbeat under `ttl` naming another `service <id>` writes nothing and fails with `another service <id> runs as host <name>`. Restart: rebuild from the board and reconcile original native executions; missing handles stay unknown and never imply `gone` or release. `service restart` writes `<install>/restart` (a project's `<root>/.taskq/restart` counts the same): the process re-execs (§ 8 step 3).
 
 ### § 4 Tray (line 168, first sentence)
 
@@ -165,7 +165,7 @@ The six existing project `capacity_hosts` copies are input, not six independent 
 
 Compare the resolved policies before writing anything. Identical values collapse to one host.json. Differences, missing/unreadable inputs, Fixed-to-Auto changes, and policies that cannot be represented as host limits plus lowering project caps are owner choices: show values and affected projects, recommend a conservative policy, and stop migration until answered. Never infer that a zero in one copy is a host-wide owner decision. This design does not assert those six live copies were inspected in this task.
 
-After approval, save byte-for-byte originals and the chosen mapping in a bounded migration backup under install; preserve unknown keys and original file ownership. Stage host.json and project edits, validate all, then atomically replace each file with restart-safe progress/readback. Keep every affected service admission-held until the whole set reads back; interruption resumes or restores originals, never enables partial policy. Remove only migrated keys, including capacity_hosts, admission/mode, load_gate, hosts, has, codex and permission_mode; keep optional lowering limits and unrelated keys. Preserve per-host backups: project files may contain remote-host copies needed by another host's migration. Re-run is idempotent. Do not commit local paths or secrets. Rollback restores these originals before legacy services start.
+After approval, save byte-for-byte originals and the chosen mapping in a bounded migration backup under install; preserve unknown keys and original file ownership. Stage host.json and project edits, validate all, then atomically replace each file with restart-safe progress/readback. Keep every affected service admission-held until the whole set reads back; interruption resumes or restores originals, never enables partial policy. Remove only migrated keys, including capacity_hosts, admission/mode, load_gate, hosts, has, codex and permission_mode; keep optional lowering limits and unrelated keys. Preserve per-host backups: project files may contain remote-host copies needed by another host's migration. Re-run is idempotent. Do not commit local paths or secrets. Rollback restores these originals only within a qualified compatible protocol version; legacy services that expire attempts cannot restart against unresolved executions.
 
 ## Migration
 
@@ -196,9 +196,9 @@ Why drain instead of cross-process adoption: removing a legacy unit kills its pr
 - **Project panic.** Each project runs in its own thread. A pass runs inside `catch_unwind`. On a panic:
   - The project's `status.json` reads `state` `error`, `reason` `panic:<class>; restarting in <s> s` (class as in the incident catalog `stdio|unwrap|index|other`); the project log keeps the panic text; an incident report follows § 4.
   - Child handles live in a table owned by the project thread, outside the panicking state; the rebuilt state re-attaches them, so live children keep running and their leases stay listed in the heartbeat.
-  - Backoff 1 s, 10 s, 60 s. Three panics in 10 minutes quarantine the project: a reduced loop only reaps, beats and writes `status.json`, reason `quarantined: panic:<class>`; no claim, reviewer or resume. `service restart` or an update clears it. If the reduced loop also panics, the thread stops; its attempts expire through § 3 on other hosts.
+  - Backoff 1 s, 10 s, 60 s. Three panics in 10 minutes quarantine the project: a reduced loop only reaps, beats and writes `status.json`, reason `quarantined: panic:<class>`; no claim, reviewer or resume. `service restart` or an update clears it. If the reduced loop also panics, the thread stops; other hosts report its executions unknown and wait for attributable termination evidence (§ 3).
   - Other projects never pause: they share no lock with the panicking pass except host state (budget, admission, profile writer). Poisoned admission state holds launches until rebuilt from verified child handles; never grant from potentially inconsistent counters. Budget/profile errors report unknown without blocking other project loops.
-- **Process fault.** An abort, stack overflow, OOM kill or a panic outside a project thread stops every project. The launcher restarts the unit; former children are not adopted and their attempts go `gone` (§ 4 restart). This blast radius is the cost of option B; today it is one project.
+- **Process fault.** An abort, stack overflow, OOM kill or a panic outside a project thread stops every project. The launcher restarts the unit and reconciles original native identities (§ 4 restart); unresolved executions retain their fence and occupied capacity. Neither restart nor a missing handle implies `gone` or release. This blast radius is the cost of option B; today it is one project.
 - **Config.** An unreadable `taskq.json` holds that project only (reason in its `status.json`); a malformed `<install>/projects` keeps the last good list and reads unknown in `service status`.
 
 ## Defects this removes
@@ -223,7 +223,7 @@ Each task is one reviewable diff. Lines `Depends on` go into the task body as wr
    `Depends on #<task 2>`
 4. **Legacy mode and migration.** Apply the § 8 shared core and step 3 diff blocks. Legacy-mode detection, `handoff` reason, own unit removal with readback, host-wide admission hold until all legacy entries have verified exit, rollback floor. Chain check: legacy root with a live child admits nothing, keeps the child, then removes its unit and the host thread takes over.
    `Depends on #<task 3>`
-5. **Release and host qualification.** Release N; on mac, Windows and FRA record per host: legacy units gone, every root served by the host pid, no `gone` from migration, rollback drills to N-1 on macOS, Windows and Linux using isolated units and children; verify drain, exit, unit removal order, restored config and update hold before any live rollout.
+5. **Release and host qualification.** Release N; on mac, Windows and FRA record per host: legacy units gone, every root served by the host pid, no `gone` from migration, rollback drills within the qualified execution-protocol floor, plus refusal below that floor, on macOS, Windows and Linux using isolated units and children; verify drain, exit, unit removal order, restored config and update hold before any live rollout.
    `Depends on #<task 4>`
 
 ## Open

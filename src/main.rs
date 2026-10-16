@@ -3383,34 +3383,49 @@ mod tests {
     // Chain: settings change -> blocked terminal commit -> competing reader/writer refused -> committed readback.
     #[test]
     fn focus_lock_outlives_terminal_receipt_commit() {
-        crate::with_test_capture(|store, dir| {
+        use std::sync::Arc;
+        use tracing_subscriber::prelude::*;
+        let dir=std::env::temp_dir().join(format!("taskq-commit-lock-{}",std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let store=Arc::new(coreq::telemetry::Store::open(&dir.join("db")).unwrap());
+        let capture=coreq::telemetry::capture::Capture::new(store.clone(),"taskq","fixture").unwrap();
+        // Only the action and required receipts enter this collector; its next accepted row is the terminal receipt.
+        let layer=capture.clone().with_filter(tracing_subscriber::filter::Targets::new()
+            .with_target("taskq::receipt_lock_fixture",tracing::Level::INFO));
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(layer),|| {
             let root=dir.join("project");fs::create_dir_all(dot(&root)).unwrap();
             fs::write(dot(&root).join("focus"),"off").unwrap();
-            let (start_tx,start_rx)=std::sync::mpsc::channel();
+            #[cfg(windows)]
+            {
+                let path=dir.join("raw-read");fs::write(&path,"signal").unwrap();
+                let locked=coreq::file_lock::try_lock(&path).unwrap();
+                assert!(fs::read_to_string(&path).is_err(),"raw reads bypassed the Windows byte-range lock");
+                drop(locked);assert_eq!(fs::read_to_string(path).unwrap(),"signal");
+            }
+            let (start_tx,start_rx)=std::sync::mpsc::channel::<u64>();
             let (ready_tx,ready_rx)=std::sync::mpsc::channel();
             std::thread::scope(|scope| {
-                let root=&root;
+                let root=&root;let capture=&capture;let dir=&dir;
                 let blocker=scope.spawn(move || {
                     let db=rusqlite::Connection::open(dir.join("db")).unwrap();
                     db.busy_timeout(Duration::from_secs(3)).unwrap();
-                    start_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+                    let baseline=start_rx.recv_timeout(Duration::from_secs(3)).unwrap();
                     db.execute_batch("BEGIN IMMEDIATE").unwrap();
                     ready_tx.send(()).unwrap();
                     let until=Instant::now()+Duration::from_secs(3);
-                    while !fs::read_to_string(dot(root).join("poke")).is_ok_and(|s|s.len()>1) {
-                        assert!(Instant::now()<until,"command never completed notification");
+                    while capture.health()["accepted"].as_u64().unwrap()==baseline {
+                        assert!(Instant::now()<until,"terminal receipt was never submitted");
                         std::thread::sleep(Duration::from_millis(5));
                     }
-                    // Hold the database past notification, while the terminal receipt waits for its commit.
-                    std::thread::sleep(Duration::from_millis(100));
                     let file=fs::OpenOptions::new().read(true).write(true).open(dot(root).join("poke")).unwrap();
                     assert!(coreq::file_lock::try_lock_shared_file(file).is_err(),"service read settings before terminal receipt commit");
                     assert!(wake_lock(root).is_err(),"next command overtook terminal receipt commit");
                     db.execute_batch("ROLLBACK").unwrap();
                 });
-                let _action=tracing::info_span!("fixture.focus").entered();
+                let _action=tracing::info_span!(target:"taskq::receipt_lock_fixture","fixture.focus").entered();
                 change_focus(root,false,false,|d| {
-                    start_tx.send(()).unwrap();ready_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+                    start_tx.send(capture.health()["accepted"].as_u64().unwrap()).unwrap();
+                    ready_rx.recv_timeout(Duration::from_secs(3)).unwrap();
                     platform::write_atomic(&d.join("focus"),"all")
                 }).unwrap();
                 blocker.join().unwrap();
@@ -3423,6 +3438,7 @@ mod tests {
             assert_eq!(receipts[0]["span"],receipts[1]["span"]);
             assert_eq!(data::focus(&root).unwrap(),["all"]);
         });
+        capture.flush().unwrap();drop(capture);drop(store);fs::remove_dir_all(dir).unwrap();
     }
 
     // Chain: § 4 pause and resume focus. Risk: resume widens focus to all.

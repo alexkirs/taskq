@@ -2701,7 +2701,8 @@ mod tests {
 
     pub(crate) fn cfg() -> Config {
         Config {
-            root: std::env::temp_dir().join("taskq-main-test"),
+            // Independent command fixtures must not contend for the same project wake lock.
+            root: std::env::temp_dir().join(format!("taskq-main-test-{}",crate::runtime::uuid())),
             install: PathBuf::from("/nonexistent"),
             board: &board::github::KIND,
             web_host: String::new(),

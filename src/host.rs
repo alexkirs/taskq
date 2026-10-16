@@ -108,6 +108,7 @@ pub struct Host {
     pub last_hour: Option<BTreeMap<String, u64>>,
     rebuilding: bool,
     rebuilt: BTreeSet<PathBuf>,
+    published: BTreeMap<PathBuf, Instant>,
 }
 
 impl Host {
@@ -115,7 +116,7 @@ impl Host {
         Self { policy, slots: BTreeMap::new(), gate: Gate::default(), began: Instant::now(), last: None,
             ready: BTreeSet::new(), turn: None, held: None, restart: false, busy: BTreeMap::new(), prepared: BTreeSet::new(), draining: BTreeSet::new(),
             request_since: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()), hour_start: crate::requests::totals(), last_hour: None,
-            rebuilding: false, rebuilt: BTreeSet::new() }
+            rebuilding: false, rebuilt: BTreeSet::new(), published: BTreeMap::new() }
     }
 
     pub fn reload(&mut self, policy: Res<Policy>) {
@@ -144,6 +145,15 @@ impl Host {
 
     pub fn ready(&mut self, project: &Path, ready: bool) {
         if ready { self.ready.insert(project.into()); } else { self.ready.remove(project); }
+    }
+
+    pub fn publication(&mut self, project: &Path, qualified: bool) {
+        if qualified { self.published.insert(project.into(), Instant::now()); } else { self.published.remove(project); }
+    }
+
+    pub fn publications_ready(&self, roots: &[PathBuf]) -> bool {
+        self.policy.is_ok() && self.held.is_none() && !self.rebuilding && roots.iter().all(|root|
+            self.published.get(root).is_some_and(|at| at.elapsed().as_secs() < 60))
     }
 
     pub fn reserve(&mut self, project: &Path, n: u64, a: u64, rt: &str, cap: &Capacity, queue: bool, now: u64) -> Res<usize> {
@@ -313,6 +323,7 @@ pub fn run(install: &Path) -> Res<()> {
             let outcome = threads.remove(&root).unwrap().join();
             let drained = matches!(&outcome, Ok(Err(e)) if e == "project drained");
             let mut h = shared.lock().unwrap_or_else(|e| e.into_inner());
+            h.publication(&root, false);
             if drained { h.busy.remove(&root); h.prepared.remove(&root); }
             else {
                 // A reduced loop failed: its attempts expire on other hosts, and local launches hold for inspection.
@@ -354,7 +365,11 @@ pub fn run(install: &Path) -> Res<()> {
         drop(h);
         if crate::installed(install) {
             crate::keep_tray(install, &mut tray);
-            if began.elapsed().as_secs() >= timers.1 { let _ = fs::write(install.join("releases").join(crate::platform::VERSION).join("healthy"), ""); }
+            if began.elapsed().as_secs() >= timers.1 && shared.lock().is_ok_and(|h| h.publications_ready(&roots)) {
+                if let Err(e) = fs::write(install.join("releases").join(crate::platform::VERSION).join("healthy"), "") {
+                    crate::platform::log(&format!("release health unknown: {e}"));
+                }
+            }
         }
         if hour.0.elapsed().as_secs() >= 3600 {
             let total = crate::requests::totals();
@@ -596,6 +611,43 @@ mod tests {
     }
     fn policy() -> Policy {
         Policy::parse(json!({"limits": {"codex": 2}, "admission": {"max": 2}, "load_gate": {"enabled": false}}), "invented").unwrap()
+    }
+
+    // Chain: published project passes -> host release qualification; failure keeps owned work and recovery can qualify.
+    #[test]
+    fn release_health_requires_current_successful_publications() {
+        let root=std::env::temp_dir().join(format!("taskq-publication-{}",std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let tool=crate::platform::tool(&root.join("install"));
+        let host=Arc::new(Mutex::new(Host::new(Ok(policy()))));
+        let roots=vec![root.clone()];
+        host.lock().unwrap().sync(&root,vec![(1,99,"codex".into())]);
+        let mut status=coreq::status::common(&tool,"fixture","project",1,None,None);
+        status["complete"]=json!(true);status["tasks"]=json!([]);
+        assert!(!host.lock().unwrap().publications_ready(&roots));
+        assert!(crate::publish_status(&tool,&root,&status,Some(&host)));
+        assert!(host.lock().unwrap().publications_ready(&roots));
+        let path=coreq::status::path(&tool,&root);
+        fs::remove_file(&path).unwrap();fs::create_dir(&path).unwrap();
+        assert!(!crate::publish_status(&tool,&root,&status,Some(&host)));
+        assert!(!host.lock().unwrap().publications_ready(&roots));
+        assert_eq!(host.lock().unwrap().slots.len(),1,"publication must not lose child ownership");
+        fs::remove_dir(&path).unwrap();
+        assert!(crate::publish_status(&tool,&root,&status,Some(&host)));
+        for failed in [json!({"complete":false,"tasks":[]}),json!({"complete":true,"tasks":[],"error":"board unavailable"})] {
+            assert!(!crate::publish_status(&tool,&root,&failed,Some(&host)));
+            assert!(!host.lock().unwrap().publications_ready(&roots));
+        }
+        assert!(crate::publish_status(&tool,&root,&status,Some(&host)));
+        let mut h=host.lock().unwrap();
+        h.published.insert(root.clone(),Instant::now()-std::time::Duration::from_secs(61));
+        assert!(!h.publications_ready(&roots),"old evidence cannot qualify a blocked thread");
+        h.publication(&root,true);
+        assert!(!h.publications_ready(&[root.clone(),root.join("new-project")]));
+        h.held=Some("registry unreadable".into());assert!(!h.publications_ready(&roots));
+        h.held=None;assert!(h.publications_ready(&roots));
+        h.publication(&root,false);assert!(!h.publications_ready(&roots),"thread exit invalidates evidence");
+        drop(h);fs::remove_dir_all(root).unwrap();
     }
 
     // Chain A3: grant -> accepted attempt -> pending/running union -> verified exit -> new grant.

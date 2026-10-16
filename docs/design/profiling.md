@@ -10,6 +10,8 @@ Signal writes run through the shared execution boundary: their stable failure cl
 
 Pokes coalesce. The link proves that this pass observed this signal, not that every earlier signal was delivered or that the command launched work. Superseded, missing, legacy, malformed or unreadable contexts have no causal acknowledgment; decode/read errors are captured and do not stop service work. Host-wide legacy pokes remain unlinked. A signal arriving after the read waits for the next pass. These are coverage gaps, not successful delivery. The span closes after status publication, before update/maintenance and sleep.
 
+Failed status publication records a shared `status-write` outcome and reports the original error in the service log. The loop retains its children and continues supervision, maintenance and retry; failed publication does not acknowledge observed state. Initial release-health marking requires a successfully published, complete pass without a service error. The host requires this evidence from every currently registered project within60s, from its own threads; a publication failure or thread exit invalidates that project's evidence. Empty hosts still require valid policy and registry/ownership. Publication recovery can qualify later; an existing release-health marker is not a continuous health report.
+
 Admission checks attach fixed refusal codes to their own generated spans: `hold`, `config`, the load gate's `sample|cpu|memory|cooldown`, or `launch-interval`. An empty focus marks the pass `refused/focus`. A normal pass or accepted Resume alone is not evidence of a child start: read the linked claim/launch and its result. Board/task filters and runtime-access-specific decisions still need full semantic qualification.
 
 ## Stage tokens

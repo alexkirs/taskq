@@ -800,12 +800,12 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
         {
             status[k] = v;
         }
-        let _ = coreq::status::write(&tool, &cfg.root, &status);
+        let published = publish_status(&tool, &cfg.root, &status, host.as_ref());
         drop(wakeup);
-        if host.is_none() && is_installed && began.elapsed().as_secs() >= cfg.rollback_after {
+        if host.is_none() && is_installed && published && began.elapsed().as_secs() >= cfg.rollback_after {
             let h = cfg.install.join("releases").join(platform::VERSION).join("healthy");
             if !h.exists() {
-                let _ = fs::write(h, "");
+                if let Err(e) = fs::write(h, "") { log!("release health unknown: {e}"); }
             }
         }
         // § 4 step 7: a not installed service only reports a newer version; `<root>/.taskq/update` checks at once
@@ -895,7 +895,7 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
             status["tasks_age_seconds"] = json!(s.tasks_read.map(|t| t.elapsed().as_secs()));
             status["capacity"] = s.capacity_json();
             status["at"] = json!(wall);
-            let _ = coreq::status::write(&tool, &cfg.root, &status);
+            publish_status(&tool, &cfg.root, &status, host.as_ref());
         };
         tick();
         sleep_until_poke(&pokes, poke_start, if reduced { 1 } else { cfg.poll }, &mut tick);
@@ -923,10 +923,18 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
                     SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs()), panics.reason.clone(), None);
                 status["complete"] = json!(false);
                 status["kids"] = json!(s.kids.iter().map(|k| json!({"task": k.task, "attempt": k.attempt, "rt": k.rt, "pid": k.proc.id()})).collect::<Vec<_>>());
-                let _ = coreq::status::write(&platform::tool(&cfg.install), &cfg.root, &status);
+                publish_status(&platform::tool(&cfg.install), &cfg.root, &status, host.as_ref());
             }
         }
     }
+}
+
+fn publish_status(tool: &coreq::Tool, root: &Path, status: &Value, host: Option<&host::Shared>) -> bool {
+    let written = coreq::status::write(tool, root, status);
+    if let Err(e) = &written { log!("status publication failed: {e}; observed state unknown"); }
+    let qualified = written.is_ok() && snapshot::complete(status) && status["error"].is_null();
+    if let Some(host) = host { if let Ok(mut h) = host.lock() { h.publication(root, qualified); } }
+    qualified
 }
 
 fn save_kids(s: &Service, root: &Path) -> Res<()> {

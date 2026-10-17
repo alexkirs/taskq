@@ -36,8 +36,8 @@ enum Ev {
     Click(Rect),
     Shot,
     Shot2,
-    /// Add project: the picked folder classified, or Null (cancel)
-    Added(Value),
+    /// Add project: the generation fences a late picker or install result.
+    Added(u64, Value),
     Answer(Value),
     /// A notification click: its request identifier (M14)
     Note(String),
@@ -540,45 +540,105 @@ struct ActionQueue {
     sender: std::sync::mpsc::SyncSender<QueuedAction>,
     worker: std::thread::JoinHandle<()>,
     allowed:&'static [&'static str],
+    pending: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>>,
+}
+enum AddJob { Pick(QueuedAction), Install(QueuedAction, Value) }
+const ADD_IDLE:u8=0;
+const ADD_RUNNING:u8=1;
+const ADD_UNAVAILABLE:u8=2;
+struct AddOwner { sender:std::sync::mpsc::SyncSender<AddJob>,state:std::sync::Arc<std::sync::atomic::AtomicU8>,_worker:std::thread::JoinHandle<()> }
+impl AddOwner {
+    fn start(install:PathBuf,proxy:tao::event_loop::EventLoopProxy<Ev>)->crate::Res<Self> {
+        let (sender,receiver)=std::sync::mpsc::sync_channel(1);let state=std::sync::Arc::new(std::sync::atomic::AtomicU8::new(ADD_IDLE));let released=state.clone();
+        let worker=std::thread::Builder::new().name("tray.add.execute".into()).spawn(move ||while let Ok(job)=receiver.recv() {
+            let (job,adding)=match job {AddJob::Pick(job)=>(job,None),AddJob::Install(job,adding)=>(job,Some(adding))};let generation=job.message["generation"].as_u64().unwrap_or(0);
+            let operation=if adding.is_some() {"tray.install.execute"} else {"tray.picker.execute"};
+            tracing::dispatcher::with_default(&job.dispatch,|| {let _context=job.context.as_ref().map(|c|c.span().entered());
+                let (mut result,state)=add_outcome(operation,||match adding {
+                    Some(adding)=>install_service(&install,adding),
+                    None=>match pick() {Ok(Some(dir))=>classify(&dir,selftest),Ok(None)=>json!({"state":"cancelled"}),Err(reason)=>json!({"state":"pick failed","reason":reason})},
+                });
+                result["generation"]=json!(generation);
+                released.store(state,std::sync::atomic::Ordering::Release);
+                let _=coreq::telemetry::capture::operation("tray.add.report",||proxy.send_event(Ev::Added(generation,result)),|_|"ui-closed");
+            });
+        }).map_err(|e|format!("Cannot start add worker: {e}"))?;
+        Ok(Self{sender,state,_worker:worker})
+    }
+    fn submit(&self,generation:u64,adding:Option<Value>)->crate::Res<()> {
+        coreq::telemetry::capture::operation("tray.add.dispatch",|| {
+        if self._worker.is_finished() {self.state.store(ADD_UNAVAILABLE,std::sync::atomic::Ordering::Release);return Err("Add project worker stopped; prior result unknown; do not retry".into());}
+        let action=if adding.is_some() {"add-install"} else {"add"};
+        let job=QueuedAction {id:format!("add-{generation}"),root:PathBuf::new(),message:json!({"a":action,"generation":generation}),context:coreq::telemetry::capture::TraceContext::current(),dispatch:tracing::dispatcher::get_default(Clone::clone)};
+        add_submit(&self.sender,&self.state,if let Some(adding)=adding {AddJob::Install(job,adding)} else {AddJob::Pick(job)})
+        },|_|"add-admission")
+    }
+}
+fn add_outcome(operation:&'static str,work:impl FnOnce()->Value)->(Value,u8) {
+    let result=coreq::telemetry::capture::operation(operation,||match std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)) {
+        Ok(value) if matches!(value["state"].as_str(),Some("pick failed"|"install failed"))=>Err((value,false)),
+        Ok(value)=>Ok(value),
+        Err(_)=>Err((json!({"state":"add failed","reason":"Add worker panicked; outcome unknown; verify the prior picker or installation before restarting the tray"}),true)),
+    },|(_,panicked)|if *panicked {"add-panic"}else{"add-failed"});
+    match result {Ok(value)=>(value,ADD_IDLE),Err((value,panicked))=>(value,if panicked {ADD_UNAVAILABLE}else{ADD_IDLE})}
+}
+fn add_submit(sender:&std::sync::mpsc::SyncSender<AddJob>,state:&std::sync::Arc<std::sync::atomic::AtomicU8>,job:AddJob)->crate::Res<()> {
+    match state.compare_exchange(ADD_IDLE,ADD_RUNNING,std::sync::atomic::Ordering::AcqRel,std::sync::atomic::Ordering::Acquire) {Ok(_)=>{},Err(ADD_UNAVAILABLE)=>return Err("Add project worker unavailable; prior result unknown; do not retry".into()),Err(_)=>return Err("Add project already in progress; wait for the picker or install to finish".into())};
+    sender.try_send(job).map_err(|e| {state.store(if matches!(e,std::sync::mpsc::TrySendError::Disconnected(_)) {ADD_UNAVAILABLE} else {ADD_IDLE},std::sync::atomic::Ordering::Release);match e {std::sync::mpsc::TrySendError::Full(_)=>"Add project queue full",std::sync::mpsc::TrySendError::Disconnected(_)=>"Add project worker unavailable; prior result unknown; do not retry"}.into()})
 }
 impl ActionQueue {
-    fn start(install: PathBuf,allowed:&'static [&'static str],execute:fn(&Path,&Path,&Value)->crate::Res<Value>,report: impl Fn(PathBuf, String, crate::Res<Value>) + Send + 'static) -> crate::Res<Self> {
+    fn start<E>(install: PathBuf,allowed:&'static [&'static str],registered:bool,execute:E,report: impl Fn(PathBuf, String, crate::Res<Value>) + Send + 'static) -> crate::Res<Self>
+    where E: Fn(&Path,&Path,&Value)->crate::Res<Value> + Send + 'static {
         let (sender, receiver)=std::sync::mpsc::sync_channel::<QueuedAction>(16);
+        let pending=std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+        let completed=pending.clone();
         let operation=if allowed.contains(&"capacity") {"tray.capacity.execute"}else{"tray.focus.execute"};
         let worker=std::thread::Builder::new().name(operation.into()).spawn(move || {
             while let Ok(job)=receiver.recv() {
-                let operation=match job.message["a"].as_str() {Some("restart")=>"tray.restart.execute",Some("stop")=>"tray.stop.execute",Some("uninstall")=>"tray.uninstall.execute",_=>operation};
+                let operation=match job.message["a"].as_str() {Some("answer")=>"tray.answer.execute",Some("resources")=>"tray.resources.execute",Some("restart")=>"tray.restart.execute",Some("stop")=>"tray.stop.execute",Some("uninstall")=>"tray.uninstall.execute",_=>operation};
                 tracing::dispatcher::with_default(&job.dispatch,|| {
                     let _context=job.context.as_ref().map(|c|c.span().entered());
                     let result=coreq::telemetry::capture::operation(operation,||std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        if !crate::host::project_paths(&install)?.iter().any(|r|r==&job.root) {
+                        if registered&&!crate::host::project_paths(&install)?.iter().any(|r|r==&job.root) {
                             return Err("Project is no longer registered; command not applied".into());
                         }
                         execute(&install,&job.root,&job.message)
                     })).unwrap_or_else(|_|Err("Command panicked; result unknown; check service status before retry".into())),|_|"command-failed");
                     report(job.root.clone(),job.id.clone(),result);
+                    completed.lock().unwrap_or_else(|e|e.into_inner()).remove(&format!("{}#{}",job.root.display(),job.id));
                 });
             }
         }).map_err(|e|format!("Cannot start command worker: {e}"))?;
-        Ok(Self{sender,worker,allowed})
+        Ok(Self{sender,worker,allowed,pending})
     }
     fn submit(&self,message:&Value) -> crate::Res<()> {
         let action=message["a"].as_str().unwrap_or("");let id=message["id"].as_str().unwrap_or("");
-        let name=match action {"pause"=>"tray.pause.dispatch","resume"=>"tray.resume.dispatch","focus"=>"tray.focus.dispatch","capacity"=>"tray.capacity.dispatch","restart"=>"tray.restart.dispatch","stop"=>"tray.stop.dispatch","uninstall"=>"tray.uninstall.dispatch",_=>"tray.invalid.dispatch"};
+        let name=match action {"answer"=>"tray.answer.dispatch","resources"=>"tray.resources.dispatch","pause"=>"tray.pause.dispatch","resume"=>"tray.resume.dispatch","focus"=>"tray.focus.dispatch","capacity"=>"tray.capacity.dispatch","restart"=>"tray.restart.dispatch","stop"=>"tray.stop.dispatch","uninstall"=>"tray.uninstall.dispatch",_=>"tray.invalid.dispatch"};
         coreq::telemetry::capture::operation(name,|| {
             if !self.allowed.contains(&action) {return Err(("invalid-command","Unsupported queued command"));}
-            if id.is_empty() || id.len()>64 || !id.bytes().all(|b|b.is_ascii_alphanumeric()||b==b'-') {
+            if id.is_empty() || id.len()>64 || !id.bytes().all(|b|b.is_ascii_alphanumeric()||matches!(b,b'-'|b'.')) {
                 return Err(("invalid-id","Invalid command correlation id; action not submitted"));
             }
-            if serde_json::to_vec(message).map_or(true,|bytes|bytes.len()>20<<10) {return Err(("request-too-large","Command payload too large; action not submitted"));}
+            let mut frozen=message.clone();frozen.as_object_mut().map(|m|m.remove("context"));
+            let bytes=serde_json::to_vec(&frozen).map_err(|_|("request-too-large","Command payload too large; action not submitted"))?;
+            if bytes.len()>20<<10 {return Err(("request-too-large","Command payload too large; action not submitted"));}
             let root=message["root"].as_str().filter(|root|!root.is_empty()).ok_or(("invalid-root","Project root missing; action not submitted"))?;
             if self.worker.is_finished() {return Err(("worker-unavailable","Command worker unavailable; action not submitted"));}
-            self.sender.try_send(QueuedAction {id:id.into(),root:root.into(),message:message.clone(),
+            let key=format!("{root}#{id}");let mut pending=self.pending.lock().unwrap_or_else(|e|e.into_inner());
+            if let Some(existing)=pending.get(&key) {
+                return if existing==&bytes {Ok(())} else {Err(("id-mismatch","Correlation id is already pending for a different request"))};
+            }
+            pending.insert(key.clone(),bytes);
+            if let Err(error)=self.sender.try_send(QueuedAction {id:id.into(),root:root.into(),message:message.clone(),
                 context:coreq::telemetry::capture::TraceContext::current(),dispatch:tracing::dispatcher::get_default(Clone::clone)})
-                .map_err(|error|match error {
+            {
+                pending.remove(&key);
+                return Err(match error {
                     std::sync::mpsc::TrySendError::Full(_)=>("queue-full","Command queue full; action not submitted"),
                     std::sync::mpsc::TrySendError::Disconnected(_)=>("worker-unavailable","Command worker unavailable; action not submitted"),
-                })
+                });
+            }
+            Ok(())
         },|(code,_)|*code).map_err(|(_,message)|message.into())
     }
 }
@@ -587,6 +647,10 @@ fn queued_focus(_install:&Path,root:&Path,message:&Value)->crate::Res<Value> {
     let receipt=act(message["a"].as_str().unwrap_or(""),root,message["label"].as_str())?.ok_or("Command confirmation unavailable; check service status")?;
     Ok(json!({"applied_receipt":receipt}))
 }
+fn queued_answer(install:&Path,_root:&Path,message:&Value)->crate::Res<Value> {Ok(answer(install,message))}
+fn queued_resources(_install:&Path,_root:&Path,_message:&Value)->crate::Res<Value> {resources()}
+fn answer_reply(root:PathBuf,id:String,result:crate::Res<Value>)->Value {result.unwrap_or_else(|error|json!({"answerReceipt":{"root":root,"id":id,"state":"unknown","reason":error,"next":"Check delivery with the same operation"}}))}
+fn resources_reply(result:crate::Res<Value>)->Value {match result {Ok(_)=>json!({"resources_receipt":{"state":"submitted","reason":"Resources terminal submitted"}}),Err(reason)=>json!({"resources_receipt":{"state":"unknown","reason":reason}})}}
 
 // The page owns asynchronous work; a submission result cannot acknowledge its execution.
 struct WebCalls {
@@ -746,15 +810,26 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
     });
     let proxy = event_loop.create_proxy();
     let replies=proxy.clone();
-    let focus_actions=ActionQueue::start(install.clone(),&["pause","resume","focus"],queued_focus,move |root,id,result| {
+    let focus_actions=ActionQueue::start(install.clone(),&["pause","resume","focus"],true,queued_focus,move |root,id,result| {
         let mut reply=result.unwrap_or_else(|error|json!({"text":error}));reply["root"]=json!(root);reply["id"]=json!(id);
         let _=coreq::telemetry::capture::operation("tray.focus.report",||replies.send_event(Ev::Answer(json!({"focus_receipt":reply}))),|_|"ui-closed");
     })?;
     let replies=proxy.clone();
-    let capacity_actions=ActionQueue::start(install.clone(),&["capacity","restart","stop","uninstall"],capacity,move |root,id,result| {
+    let capacity_actions=ActionQueue::start(install.clone(),&["capacity","restart","stop","uninstall"],true,capacity,move |root,id,result| {
         let mut reply=result.unwrap_or_else(|error|json!({"state":"unknown","reason":error}));reply["root"]=json!(root);reply["id"]=json!(id);
         let _=coreq::telemetry::capture::operation("tray.capacity.report",||replies.send_event(Ev::Answer(json!({"capmsg":reply}))),|_|"ui-closed");
     })?;
+    let replies=proxy.clone();
+    let answer_actions=ActionQueue::start(install.clone(),&["answer"],true,queued_answer,move |root,id,result| {
+        let receipt=answer_reply(root,id,result);
+        let _=coreq::telemetry::capture::operation("tray.answer.report",||replies.send_event(Ev::Answer(receipt)),|_|"ui-closed");
+    })?;
+    let replies=proxy.clone();
+    let resources_actions=ActionQueue::start(install.clone(),&["resources"],false,queued_resources,move |_root,_id,result| {
+        let receipt=resources_reply(result);
+        let _=coreq::telemetry::capture::operation("tray.resources.report",||replies.send_event(Ev::Answer(receipt)),|_|"ui-closed");
+    })?;
+    let add_actions=AddOwner::start(install.clone(),proxy.clone())?;
     let mut settings = Settings::load(&install);
     let mut ui: Option<(Window, WebView)> = None;
     let mut tray: Option<TrayIcon> = None;
@@ -766,6 +841,7 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
     // snapshot pages wider than their window (#1073): `tray --snapshot` fails naming them
     let mut overflow: Vec<String> = Vec::new();
     let mut adding = Value::Null;
+    let mut add_generation=0u64;
     let mut moved = false;
     let mut asked = false;
     let mut bursts = notify::Bursts::new();
@@ -957,8 +1033,10 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
                 if web.failed {return;}
                 match m["a"].as_str().unwrap_or("") {
                     "answer" if snapshot.is_none() => {
-                        let (p, install) = (proxy.clone(), install.clone());
-                        std::thread::spawn(coreq::telemetry::capture::bind(move || { let _ = p.send_event(Ev::Answer(answer(&install, &m))); }));
+                        let mut request=m.clone();request["id"]=m["op"]["id"].clone();
+                        if let Err(error)=answer_actions.submit(&request) {
+                            push(&mut web,&ui,&json!({"answerReceipt":{"root":m["root"],"id":m["op"]["id"],"state":"rejected","reason":error,"next":"Check delivery with the same operation"}}));
+                        }
                     }
                     "overflow" if snapshot.is_some() => overflow.push(format!("{} by {} px", m["shot"].as_str().unwrap_or("?"), m["x"])),
                     "ready" => {
@@ -1015,7 +1093,9 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
                         let _ = w.drag_window();
                     }
                     "resources" => {
-                        std::thread::spawn(coreq::telemetry::capture::bind(resources));
+                        let id=format!("resources-{}",std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0,|d|d.as_nanos()));
+                        let request=json!({"a":"resources","root":install,"id":id});
+                        if let Err(error)=resources_actions.submit(&request) {push(&mut web,&ui,&json!({"resources_receipt":{"state":"rejected","reason":error}}));}
                     }
                     "open" => {
                         if let Some(u) = m["url"].as_str().filter(|u| u.starts_with("https://") || u.starts_with("http://")) {
@@ -1050,26 +1130,29 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
                         }
                     }
                     // Add project (§ 4): the folder comes only from the OS picker, never from the page
-                    "add" => {
-                        adding = json!({"state": "picking"});
+                    "add" if adding.is_null() => {
+                        add_generation=add_generation.wrapping_add(1);
+                        let generation=add_generation;
+                        adding = json!({"state": "picking", "generation":generation});
                         push(&mut web,&ui, &state(&install, &settings, dark, None, &adding));
-                        let p = proxy.clone();
-                        std::thread::spawn(coreq::telemetry::capture::bind(move || {
-                            let v = pick().map_or(Value::Null, |d| classify(&d, selftest));
-                            let _ = p.send_event(Ev::Added(v));
-                        }));
+                        if let Err(error)=add_actions.submit(generation,None) {adding=json!({"state":"add failed","reason":error});push(&mut web,&ui,&state(&install,&settings,dark,None,&adding));}
                     }
-                    "add-cancel" => {
-                        adding = Value::Null;
+                    "add-cancel" if adding["state"]=="picking" => {
+                        add_generation=add_generation.wrapping_add(1);
+                        adding = json!({"state":"picking dismissed","generation":add_generation});
                         push(&mut web,&ui, &state(&install, &settings, dark, None, &adding));
                     }
+                    "add-cancel" if adding["state"]=="installing" => {
+                        add_generation=add_generation.wrapping_add(1);
+                        adding = json!({"state":"installing dismissed","generation":add_generation});
+                        push(&mut web,&ui, &state(&install, &settings, dark, None, &adding));
+                    }
+                    "add-cancel" => {adding=Value::Null;push(&mut web,&ui,&state(&install,&settings,dark,None,&adding));}
                     "add-install" if adding["kind"] == "taskq" && adding["state"] == "picked" => {
                         adding["state"] = json!("installing");
                         push(&mut web,&ui, &state(&install, &settings, dark, None, &adding));
-                        let (p, a, inst) = (proxy.clone(), adding.clone(), install.clone());
-                        std::thread::spawn(coreq::telemetry::capture::bind(move || {
-                            let _ = p.send_event(Ev::Added(install_service(&inst, a)));
-                        }));
+                        let generation=adding["generation"].as_u64().unwrap_or(0);
+                        if let Err(error)=add_actions.submit(generation,Some(adding.clone())) {adding["state"]=json!("install failed");adding["reason"]=json!(error);push(&mut web,&ui,&state(&install,&settings,dark,None,&adding));}
                     }
                     "add-setup" if matches!(adding["kind"].as_str(), Some("new" | "plain")) => {
                         let text = format!("Set up {} as a taskq project", adding["name"].as_str().unwrap_or("this folder"));
@@ -1100,8 +1183,9 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
                     }
                 }
             }
-            Event::UserEvent(Ev::Added(v)) => {
-                adding = v;
+            Event::UserEvent(Ev::Added(generation,v)) => {
+                if matches!(adding["state"].as_str(),Some("picking dismissed"|"installing dismissed"))&&add_generation==generation.wrapping_add(1) {adding=Value::Null;push(&mut web,&ui,&state(&install,&settings,dark,None,&adding));return;}
+                if !apply_added(&mut adding,add_generation,generation,v) {return;}
                 push(&mut web,&ui, &state(&install, &settings, dark, None, &adding));
                 if let (Some((w, _)), false) = (&ui, adding.is_null()) {
                     w.set_visible(true);
@@ -1486,35 +1570,49 @@ if (-not (Get-Command btop -ErrorAction SilentlyContinue)) {
 btop
 "#;
 
-fn resources() {
+fn resources() -> crate::Res<Value> {
     let file = std::env::temp_dir().join(if cfg!(windows) { "taskq-resources.ps1" } else { "taskq-resources.command" });
-    if fs::write(&file, if cfg!(windows) { BTOP_PS1 } else { BTOP_SH }).is_err() {
-        return;
-    }
-    // not `quiet`: the terminal window is the point; waited on its own thread, no zombie
-    let _ = if cfg!(windows) {
-        std::process::Command::new("conhost.exe").args(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]).arg(&file).status()
+    fs::write(&file, if cfg!(windows) { BTOP_PS1 } else { BTOP_SH }).map_err(|e|e.to_string())?;
+    // The terminal owns its human-driven lifetime. Submission does not claim that btop installed or appeared.
+    let mut command=if cfg!(windows) {
+        let path=file.display().to_string().replace('\'',"''");let mut c=std::process::Command::new("powershell");
+        c.args(["-NoProfile","-Command",&format!("$args=@('powershell','-NoProfile','-ExecutionPolicy','Bypass','-File','\"{path}\"'); Start-Process -FilePath 'conhost.exe' -ArgumentList $args -ErrorAction Stop")]);c
     } else {
         #[cfg(unix)]
-        let _ = fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o755));
-        std::process::Command::new("open").args(["-a", "Terminal"]).arg(&file).status()
+        fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o755)).map_err(|e|e.to_string())?;
+        let mut c=std::process::Command::new("open");c.args(["-a", "Terminal"]).arg(&file);c
     };
+    let output=crate::platform::output("tray.resources.submit",&mut command,Duration::from_secs(30))?;
+    if !output.status.success() {return Err(String::from_utf8_lossy(&output.stderr).lines().find(|line|!line.trim().is_empty()).unwrap_or("resource terminal submission failed").chars().take(160).collect());}
+    Ok(json!({"state":"submitted"}))
 }
 
 /// The OS folder picker; None on cancel.
-fn pick() -> Option<PathBuf> {
+fn pick() -> Result<Option<PathBuf>,String> {
     let mut c = if cfg!(windows) {
         let mut c = std::process::Command::new("powershell");
-        c.args(["-NoProfile", "-STA", "-Command", "Add-Type -AssemblyName System.Windows.Forms; $d = New-Object System.Windows.Forms.FolderBrowserDialog; $d.Description = 'Add project'; if ($d.ShowDialog() -eq 'OK') { $d.SelectedPath }"]);
+        c.args(["-NoProfile", "-STA", "-Command", "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); Add-Type -AssemblyName System.Windows.Forms; $d = New-Object System.Windows.Forms.FolderBrowserDialog; $d.Description = 'Add project'; if ($d.ShowDialog() -eq 'OK') { [Console]::Out.Write($d.SelectedPath) }"]);
         c
     } else {
         let mut c = std::process::Command::new("osascript");
         c.args(["-e", "activate", "-e", "POSIX path of (choose folder with prompt \"Add project\")"]);
         c
     };
-    let o = crate::platform::quiet(&mut c).output().ok().filter(|o| o.status.success())?;
-    let p = String::from_utf8_lossy(&o.stdout).trim().trim_end_matches(['/', '\\']).to_string();
-    (!p.is_empty()).then(|| PathBuf::from(p))
+    coreq::telemetry::capture::operation("tray.picker",|| {
+    let o = crate::platform::quiet(&mut c).output().map_err(|e|format!("folder picker did not start: {e}"))?;
+    pick_result(o)
+    },|_|"picker-error")
+}
+fn pick_result(o:std::process::Output)->Result<Option<PathBuf>,String> {
+    if !o.status.success() {
+        let error=String::from_utf8_lossy(&o.stderr);
+        if !cfg!(windows)&&error.trim_end().ends_with("(-128)") {return Ok(None);}
+        return Err(error.lines().find(|line|!line.trim().is_empty()).unwrap_or("folder picker failed").chars().take(160).collect());
+    }
+    let p=std::str::from_utf8(&o.stdout).map_err(|_|"folder picker returned a non-UTF-8 path; selection not applied")?;
+    let p=p.strip_suffix("\r\n").or_else(||p.strip_suffix('\n')).unwrap_or(p);
+    let p=p.to_string();
+    Ok((!p.is_empty()).then(|| PathBuf::from(p)))
 }
 
 /// `taskq selftest` in `dir`: its first error line on failure.
@@ -1558,6 +1656,14 @@ fn install_service(install: &Path, mut a: Value) -> Value {
     a["state"] = json!(if r.is_ok() { "installed" } else { "install failed" });
     a["reason"] = json!(r.err().unwrap_or_default());
     a
+}
+
+/// A picker/install result belongs only to the currently presented operation. Cancel invalidates its generation;
+/// it cannot stop an install that was already submitted.
+fn apply_added(adding:&mut Value,current:u64,generation:u64,value:Value)->bool {
+    if adding.is_null()||current!=generation||value["generation"].as_u64()!=Some(generation) {return false;}
+    if value["state"]=="cancelled" {*adding=Value::Null;return true;}
+    *adding=value;true
 }
 
 /// Write the page's capacity edit for this host; the outcome line for the page.
@@ -1788,7 +1894,7 @@ mod tests {
             fs::write(crate::dot(&root).join("focus"),"area-maps").unwrap();
             let (result_tx,result_rx)=std::sync::mpsc::channel();
             let (release_tx,release_rx)=std::sync::mpsc::channel();
-            let queue=ActionQueue::start(install.clone(),&["pause","resume","focus"],queued_focus,move |root,id,result| {
+            let queue=ActionQueue::start(install.clone(),&["pause","resume","focus"],true,queued_focus,move |root,id,result| {
                 result_tx.send((root,id,result)).unwrap();
                 release_rx.recv_timeout(Duration::from_secs(3)).unwrap();
             }).unwrap();
@@ -1798,9 +1904,11 @@ mod tests {
                 assert!(queue.submit(&message("pause",&invalid)).unwrap_err().contains("correlation id"));
                 assert_eq!(crate::data::focus(&root).unwrap(),["area-maps"]);
             }
-            queue.submit(&message("pause","first")).unwrap();
+            queue.submit(&message("pause","tray.1")).unwrap();
             let (reported,id,result)=result_rx.recv_timeout(Duration::from_secs(3)).unwrap();
-            assert_eq!(reported,root);assert_eq!(id,"first");let applied=result.unwrap()["applied_receipt"].as_str().unwrap().to_string();
+            assert_eq!(reported,root);assert_eq!(id,"tray.1");let applied=result.unwrap()["applied_receipt"].as_str().unwrap().to_string();
+            assert!(queue.submit(&message("pause","tray.1")).is_ok(),"the same pending operation coalesces");
+            assert!(queue.submit(&message("resume","tray.1")).unwrap_err().contains("different request"),"an id cannot be repurposed while pending");
             let snapshot=crate::control::snapshot(&root,&mut None,&mut None).unwrap();
             assert_eq!(snapshot.command["applied_receipt"],applied);
             let status=json!({"focus_command":snapshot.command,"focus":snapshot.focus,"tasks":[],"complete":true});
@@ -1848,7 +1956,7 @@ mod tests {
                 "policy_schema":"taskq.host-capacity/1","expected_revision":policy.revision().unwrap(),"changes":{"runtime_limit":3}}]});
             let lock=coreq::file_lock::lock(&install.join("resources/lock")).unwrap();
             let (capacity_tx,capacity_rx)=std::sync::mpsc::channel();
-            let blocked=ActionQueue::start(install.clone(),&["capacity"],|install,root,message| {
+            let blocked=ActionQueue::start(install.clone(),&["capacity"],true,|install,root,message| {
                 crate::platform::write_atomic(&install.join("capacity-entered"),"")?;
                 capacity(install,root,message)
             },move |_,_,result|capacity_tx.send(result).unwrap()).unwrap();
@@ -1857,13 +1965,31 @@ mod tests {
             while !install.join("capacity-entered").exists() && Instant::now()<until {std::thread::yield_now();}
             assert!(install.join("capacity-entered").exists());assert!(capacity_rx.try_recv().is_err());
             let (pause_tx,pause_rx)=std::sync::mpsc::channel();
-            let focus=ActionQueue::start(install.clone(),&["pause","resume","focus"],queued_focus,move |_,_,result|pause_tx.send(result).unwrap()).unwrap();
+            let focus=ActionQueue::start(install.clone(),&["pause","resume","focus"],true,queued_focus,move |_,_,result|pause_tx.send(result).unwrap()).unwrap();
             focus.submit(&json!({"a":"pause","root":root,"id":"pause"})).unwrap();
             assert!(pause_rx.recv_timeout(Duration::from_secs(3)).unwrap().unwrap()["applied_receipt"].is_string());
             assert!(crate::data::focus(&root).unwrap().is_empty());assert!(capacity_rx.try_recv().is_err());
             drop(lock);
             assert_eq!(capacity_rx.recv_timeout(Duration::from_secs(3)).unwrap().unwrap()["state"],"saved");
             for queue in [blocked,focus] {let ActionQueue{sender,worker,..}=queue;drop(sender);worker.join().unwrap();}
+        });
+    }
+
+    #[test]
+    fn blocked_answer_does_not_block_pause() {
+        crate::with_test_capture(|_store,dir| {
+            let root=dir.join("project");let install=dir.join("install");
+            fs::create_dir_all(crate::dot(&root)).unwrap();fs::create_dir_all(&install).unwrap();
+            fs::write(install.join("projects"),format!("{}\n",root.display())).unwrap();
+            fs::write(crate::dot(&root).join("focus"),"all").unwrap();
+            let (entered_tx,entered_rx)=std::sync::mpsc::channel();let (release_tx,release_rx)=std::sync::mpsc::channel();
+            let answer=ActionQueue::start(install.clone(),&["answer"],true,move |_,_,_| {entered_tx.send(()).unwrap();release_rx.recv_timeout(Duration::from_secs(3)).unwrap();Ok(json!({"answerReceipt":{"state":"accepted"}}))},|_,_,_|{}).unwrap();
+            answer.submit(&json!({"a":"answer","root":root,"id":"tray.1","op":{"id":"tray.1"}})).unwrap();entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            let (pause_tx,pause_rx)=std::sync::mpsc::channel();let focus=ActionQueue::start(install.clone(),&["pause","resume","focus"],true,queued_focus,move |_,_,result|pause_tx.send(result).unwrap()).unwrap();
+            focus.submit(&json!({"a":"pause","root":root,"id":"pause"})).unwrap();
+            assert!(pause_rx.recv_timeout(Duration::from_secs(3)).unwrap().unwrap()["applied_receipt"].is_string());assert!(crate::data::focus(&root).unwrap().is_empty());
+            release_tx.send(()).unwrap();
+            for queue in [answer,focus] {let ActionQueue{sender,worker,..}=queue;drop(sender);worker.join().unwrap();}
         });
     }
 
@@ -2360,6 +2486,79 @@ mod tests {
         assert_eq!(kind(&pass).0, "taskq");
         assert_eq!(kind(&|_: &Path| Err("taskq.json: repo is required".into())), ("old".into(), "taskq.json: repo is required".into()), "the verified reason");
         let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn add_generation_ignores_late_picker_or_install_results_after_cancel() {
+        let mut adding=json!({"state":"picking","generation":4});
+        assert!(apply_added(&mut adding,4,4,json!({"state":"picked","generation":4,"path":"/picked"})));
+        assert_eq!(adding["state"],"picked");
+        adding=Value::Null;
+        assert!(!apply_added(&mut adding,5,4,json!({"state":"picked","generation":4})),"cancelled picker cannot restore a selection");
+        adding=json!({"state":"installing","generation":6});
+        assert!(!apply_added(&mut adding,6,5,json!({"state":"installed","generation":5})),"another generation cannot claim this install");
+        assert!(apply_added(&mut adding,6,6,json!({"state":"installed","generation":6})));assert_eq!(adding["state"],"installed");
+        assert!(apply_added(&mut adding,6,6,json!({"state":"cancelled","generation":6})));assert!(adding.is_null(),"a matching picker cancel clears its presentation");
+    }
+
+    #[test]
+    fn add_owner_keeps_picker_admission_after_cancel_until_its_result() {
+        let (sender,receiver)=std::sync::mpsc::sync_channel(1);let state=std::sync::Arc::new(std::sync::atomic::AtomicU8::new(ADD_IDLE));
+        let job=|generation|AddJob::Pick(QueuedAction {id:format!("add-{generation}"),root:PathBuf::new(),message:json!({"a":"add","generation":generation}),context:None,dispatch:tracing::dispatcher::get_default(Clone::clone)});
+        add_submit(&sender,&state,job(4)).unwrap();
+        let mut adding=json!({"state":"picking dismissed","generation":5});
+        assert!(!apply_added(&mut adding,5,4,json!({"state":"picked","generation":4})),"cancelled presentation cannot take a late picker result");
+        assert!(add_submit(&sender,&state,job(6)).unwrap_err().contains("already in progress"),"cancel did not release the owned picker");
+        assert!(matches!(receiver.recv().unwrap(),AddJob::Pick(_)));state.store(ADD_IDLE,std::sync::atomic::Ordering::Release);
+        add_submit(&sender,&state,job(6)).unwrap();
+    }
+
+    #[test]
+    fn owned_effect_reports_keep_their_observable_outcomes() {
+        let answer=answer_reply(PathBuf::from("registered"),"tray.1".into(),Err("registration changed".into()));
+        assert_eq!(answer["answerReceipt"]["root"],"registered");assert_eq!(answer["answerReceipt"]["id"],"tray.1");assert_eq!(answer["answerReceipt"]["state"],"unknown");
+        assert_eq!(resources_reply(Ok(json!({}))),json!({"resources_receipt":{"state":"submitted","reason":"Resources terminal submitted"}}));
+        assert_eq!(resources_reply(Err("launcher unavailable".into()))["resources_receipt"]["state"],"unknown");
+        assert_eq!(resources_reply(Err("tray.resources.submit: timed out; outcome unknown".into()))["resources_receipt"]["state"],"unknown");
+    }
+
+    // A caught effect panic is visible and cannot silently reopen native admission.
+    #[test]
+    fn add_outcomes_capture_failures_and_hold_unknown_ownership() {
+        crate::with_test_capture(|store,_| {
+            for state in ["picked","cancelled","pick failed","install failed"] {
+                let (value,owner)=add_outcome("tray.add.fixture",||json!({"state":state}));
+                assert_eq!(value["state"],state);assert_eq!(owner,ADD_IDLE);
+            }
+            let (value,owner)=add_outcome("tray.add.fixture",||panic!("owned fixture panic"));
+            assert_eq!(value["state"],"add failed");assert_eq!(owner,ADD_UNAVAILABLE);
+            let (sender,receiver)=std::sync::mpsc::sync_channel(1);
+            let state=std::sync::Arc::new(std::sync::atomic::AtomicU8::new(owner));
+            let job=AddJob::Pick(QueuedAction {id:"after-panic".into(),root:PathBuf::new(),message:json!({"generation":2}),context:None,dispatch:tracing::dispatcher::get_default(Clone::clone)});
+            assert!(add_submit(&sender,&state,job).unwrap_err().contains("unavailable"));assert!(receiver.try_recv().is_err());
+            let worker=std::thread::spawn(||{});let until=Instant::now()+Duration::from_secs(3);
+            while !worker.is_finished() {assert!(Instant::now()<until);std::thread::yield_now();}
+            let owner=AddOwner {sender,state,_worker:worker};
+            assert!(owner.submit(3,None).unwrap_err().contains("worker stopped"));
+            tracing::dispatcher::get_default(|d|d.downcast_ref::<coreq::telemetry::capture::Capture>().unwrap().flush().unwrap());
+            let page=store.export(0,0,1024).unwrap();
+            let terminals:Vec<_>=page["events"].as_array().unwrap().iter().map(|r|&r["observation"]).filter(|r|r["operation"]=="taskq.operation.tray.add.fixture"&&r["kind"]=="method").collect();
+            assert_eq!(terminals.len(),5);assert_eq!(terminals.iter().filter(|r|r["outcome"]=="failed").count(),3);
+            assert_eq!(terminals.last().unwrap()["error"],"add-panic");
+            assert!(page["events"].as_array().unwrap().iter().any(|r|r["observation"]["operation"]=="taskq.operation.tray.add.dispatch"&&r["observation"]["error"]=="add-admission"));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn picker_result_keeps_roots_and_distinguishes_native_cancel_from_error() {
+        use std::os::unix::process::ExitStatusExt;
+        let output=|code,stdout:&[u8],stderr:&[u8]|std::process::Output {status:std::process::ExitStatus::from_raw(code),stdout:stdout.into(),stderr:stderr.into()};
+        assert_eq!(pick_result(output(0,b"/\n",b"")),Ok(Some(PathBuf::from("/"))));
+        assert_eq!(pick_result(output(0,b" /picked \r\n",b"")),Ok(Some(PathBuf::from(" /picked "))),"only the protocol newline is removed");
+        assert!(pick_result(output(0,&[0xff,b'\n'],b"")).unwrap_err().contains("non-UTF-8"));
+        assert_eq!(pick_result(output(1<<8,b"",b"execution error: User canceled. (-128)\n")),Ok(None));
+        assert!(pick_result(output(1<<8,b"",b"execution error: denied. (-10004)\n")).is_err());
     }
     // Chain: canonical session -> native row -> shared task link (#1204). Risk: a Codex thread opens off its host,
     // a remote Claude row loses its account-scoped link, or a starting observation opens anything.

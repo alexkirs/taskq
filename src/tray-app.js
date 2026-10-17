@@ -3,7 +3,7 @@ const ui=require('./ui-runtime.js');
 const execution=ui.execution;
 
 const {createState,create}=execution.module("tray",{
-createState:function(snapshot=null){return {manualSize:null,aiText:null,aiMenu:false,aiConfirm:null,addConfirm:false,S:snapshot,page:'home',taskFilter:null,working:null,workCard:null,ask:null,noted:null,pending:{},hostCommand:null,confirming:null,updating:null,draft:null,disclosures:[],pressedAt:null,stale:false,resizing:null};},
+createState:function(snapshot=null){return {manualSize:null,aiText:null,aiMenu:false,aiConfirm:null,addConfirm:false,resourceNotice:null,S:snapshot,page:'home',taskFilter:null,working:null,workCard:null,ask:null,noted:null,pending:{},hostCommand:null,confirming:null,updating:null,draft:null,disclosures:[],pressedAt:null,stale:false,resizing:null};},
 create:function(view,ports){
 const api=execution.module("tray.create",{
 gutter:function(){if(ports.measureScrollbar)return ports.measureScrollbar();const d=document.createElement('div');d.style.cssText='position:absolute;top:-99px;width:60px;height:60px;overflow:scroll;scrollbar-width:thin';document.body.append(d);const g=d.offsetWidth-d.clientWidth;d.remove();return Math.ceil(g);},
@@ -226,7 +226,10 @@ ai:function(){
 addProject:function(){
   const A=view.S.add;
   if(!A)return '<button class="project" data-a="add">Add project…</button>';
-  if(A.state==='picking')return '<div class="row meta">Choose a folder…</div>';
+  if(A.state==='picking')return '<div class="row meta">Choose a folder…</div><button class="project" data-a="add-cancel">Hide picker result</button>';
+  if(A.state==='picking dismissed')return '<div class="body meta">Folder selection is still being processed; its result will be ignored.</div>';
+  if(A.state==='installing dismissed')return '<div class="body meta">Installation was submitted; its result is hidden.</div>';
+  if(A.state==='pick failed'||A.state==='add failed')return '<div class="body alert" role="alert">'+esc(A.state==='pick failed'?'Folder picker failed':'Add project unavailable')+(A.reason?': '+esc(A.reason):'')+'</div><button class="project" data-a="add-cancel">Done</button>';
   const failed=A.state==='install failed',known=view.S.projects.some(p=>p.root===A.path);
   let h='<div class="body"><div class="meta">Folder: '+esc(A.path)+'</div><div role="status" class="'+(A.kind==='old'||failed?'alert':'')+'">'+(failed?'Install failed':esc(addKinds[A.kind]))+(A.reason?': '+esc(A.reason):'')+'</div></div>';
   if(A.kind==='old')h+='<a class="project" href="'+cutover+'" data-url="'+cutover+'"><span>Repair or cutover: taskq.md § 9 ↗</span><span></span><span></span></a>';
@@ -238,7 +241,7 @@ addProject:function(){
     else if(!failed)h+='<button class="project" data-a="add-ask">Install service…</button>';
   }
   if(A.kind==='new'||A.kind==='plain')h+=view.S.ai.target?'<button class="project" data-a="add-setup">Set up with AI…</button>':'<div class="body meta">Setup needs one running project service</div>';
-  return h+'<button class="project" data-a="add-cancel">'+(A.state==='installed'?'Done':'Cancel')+'</button>';},
+  return h+(A.state==='installing'?'<button class="project" data-a="add-cancel">Hide result; install continues</button>':'<button class="project" data-a="add-cancel">'+(A.state==='installed'?'Done':'Cancel')+'</button>');},
 bulk:function(run,held){
   const pausing=run.length>0;
 const {state}=execution.module("tray.create.bulk.helpers",{state:p=>({run:pausing?'pause':'admitting, unchanged',paused:pausing?'paused, unchanged':'resume',watch:'observation, unchanged'}[mode(p)])});
@@ -283,7 +286,7 @@ routeBody:function(){
     case 'cadence':return history();
     case 'notifications':return notifications();
     case 'agents':return agents();
-    case 'services':return '<button class="project" data-a="resources" title="btop in its own terminal window">◔ Resources</button>'+view.S.projects.map(p=>'<div class="body">'+esc(p.name)+' · '+esc(p.host||'host unknown')+'<span class="meta"> · '+esc(p.age==null?'status unknown':age(p.age)+' old')+'</span></div>'+problem(p)+incidentNotice(p)+service(p)).join('');
+    case 'services':return '<button class="project" data-a="resources" title="btop in its own terminal window">◔ Resources</button>'+(view.resourceNotice?'<div class="body '+(view.resourceNotice.state==='submitted'?'meta':'alert')+'" role="status">Resources: '+esc(view.resourceNotice.reason)+'</div>':'')+view.S.projects.map(p=>'<div class="body">'+esc(p.name)+' · '+esc(p.host||'host unknown')+'<span class="meta"> · '+esc(p.age==null?'status unknown':age(p.age)+' old')+'</span></div>'+problem(p)+incidentNotice(p)+service(p)).join('');
     case 'about':return about();
     default:return home();
   }
@@ -405,6 +408,7 @@ receive:function(s){
   if(s.action_error){actionReceipt(s.action_error);return;}
   if(s.focus_receipt){focusReceipt(s.focus_receipt);return;}
   if(s.answerReceipt){answerReceipt(s.answerReceipt);return;}
+  if(s.resources_receipt){view.resourceNotice=s.resources_receipt;present();return;}
   if(s.capmsg){if(view.hostCommand?.id===s.capmsg.id)api.lifecycleReceipt(s.capmsg);else resourceReceipt(s.capmsg);return;}
   if(s.open){openCard(s.open);return;}
   view.S=s;focusReadback();answerReadback();api.lifecycleReadback();

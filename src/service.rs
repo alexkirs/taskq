@@ -780,8 +780,14 @@ impl<'a> Service<'a> {
     /// counts their children; a failed write only matters to Auto, whose next request refuses.
     pub fn sync_host(&mut self) {
         if let Some(host) = &self.host {
+            let recovered=self.handoff_waits().is_empty();
+            let held=self.entry().held;
             match host.lock() {
-                Ok(mut h) => self.host_used = Some(h.sync(&self.cfg.root, self.entry().held) as u32),
+                Ok(mut h) => {
+                    if recovered {h.recovered.insert(self.cfg.root.clone());}else {h.recovered.remove(&self.cfg.root);}
+                    if h.rebuilding&&self.ownership_known {h.rebuild_slots(&self.cfg.root,held);}else {h.sync(&self.cfg.root,held);}
+                    self.host_used=(!h.rebuilding).then(||h.used().values().sum::<usize>() as u32);
+                }
                 Err(e) => {
                     self.host_used = None;
                     self.refused = Some(("host", "host admission poisoned; rebuilding from owned handles".into()));
@@ -827,7 +833,9 @@ impl<'a> Service<'a> {
         }
         let last = self.gate.last.filter(|_| self.gate.enabled());
         let (host_policy,host_used,host_command)=self.host.as_ref().and_then(|h|h.lock().ok().map(|h| {
-            (h.policy.as_ref().map(|p|p.cap.json()).unwrap_or(Value::Null),json!(h.used()),json!(h.capacity_command))
+            if h.rebuilding {gate="unknown";reasons.push(("host","host occupancy recovery pending".into()));}
+            if let Some(reason)=&h.held {gate="unknown";reasons.push(("host",reason.clone()));}
+            (h.policy.as_ref().map(|p|p.cap.json()).unwrap_or(Value::Null),if h.rebuilding {Value::Null}else{json!(h.used())},json!(h.capacity_command))
         })).unwrap_or((Value::Null,Value::Null,Value::Null));
         json!({"host_policy":host_policy,"host_runtime_used":host_used,"host_command":host_command,"project_limits":self.cap.as_ref().ok().map(|_| &self.cfg.limits),"limits": limits, "used": used, "load_gate": self.cap.as_ref().map(|c| c.json()["load_gate"].clone()).unwrap_or(Value::Null),
             "admission": self.cap.as_ref().map(|c| c.json()["admission"].clone()).unwrap_or(Value::Null), "host_used": self.host_used,

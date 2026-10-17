@@ -442,7 +442,7 @@ fn project(install: &Path, root: &str) -> Value {
         "log": s["log"].is_string(), "alive": age.is_some_and(|a| a < 300), "age": age,
         "complete": crate::snapshot::complete(&s) && age.is_some_and(|a| a < 300),
         "error": bad.map(Value::from).or_else(|| [&s["error"], &s["focus_error"]].into_iter().find(|e| e.is_string()).cloned()).unwrap_or(Value::Null), "focus": s["focus"].as_array().cloned().unwrap_or_default(), "saved": saved, "labels": crate::status_labels(r),
-        "focus_command": s["focus_command"], "request": s["request"], "since": since, "events": events, "tasks": tasks, "host": s["host"], "version": s["version"], "update": s["update"],
+        "focus_command": s["focus_command"],"service_pid":s["pid"],"host_instance":s["host_instance"],"restart_waits":s["restart_waits"], "request": s["request"], "since": since, "events": events, "tasks": tasks, "host": s["host"], "version": s["version"], "update": s["update"],
         "resources": resources, "cap_host": cap_host, "cap_saved": cap_saved, "agents": s["agents"],
         "incident": s["incident"], "incident_line": s.get("incident").map(crate::incident::line), "incident_notice": s["incident_notice"],
         "incident_repo": crate::platform::RELEASE_REPO})
@@ -544,9 +544,10 @@ struct ActionQueue {
 impl ActionQueue {
     fn start(install: PathBuf,allowed:&'static [&'static str],execute:fn(&Path,&Path,&Value)->crate::Res<Value>,report: impl Fn(PathBuf, String, crate::Res<Value>) + Send + 'static) -> crate::Res<Self> {
         let (sender, receiver)=std::sync::mpsc::sync_channel::<QueuedAction>(16);
-        let operation=if allowed==["capacity"] {"tray.capacity.execute"}else{"tray.focus.execute"};
+        let operation=if allowed.contains(&"capacity") {"tray.capacity.execute"}else{"tray.focus.execute"};
         let worker=std::thread::Builder::new().name(operation.into()).spawn(move || {
             while let Ok(job)=receiver.recv() {
+                let operation=if job.message["a"]=="restart" {"tray.restart.execute"}else{operation};
                 tracing::dispatcher::with_default(&job.dispatch,|| {
                     let _context=job.context.as_ref().map(|c|c.span().entered());
                     let result=coreq::telemetry::capture::operation(operation,||std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -563,7 +564,7 @@ impl ActionQueue {
     }
     fn submit(&self,message:&Value) -> crate::Res<()> {
         let action=message["a"].as_str().unwrap_or("");let id=message["id"].as_str().unwrap_or("");
-        let name=match action {"pause"=>"tray.pause.dispatch","resume"=>"tray.resume.dispatch","focus"=>"tray.focus.dispatch","capacity"=>"tray.capacity.dispatch",_=>"tray.invalid.dispatch"};
+        let name=match action {"pause"=>"tray.pause.dispatch","resume"=>"tray.resume.dispatch","focus"=>"tray.focus.dispatch","capacity"=>"tray.capacity.dispatch","restart"=>"tray.restart.dispatch",_=>"tray.invalid.dispatch"};
         coreq::telemetry::capture::operation(name,|| {
             if !self.allowed.contains(&action) {return Err(("invalid-command","Unsupported queued command"));}
             if id.is_empty() || id.len()>64 || !id.bytes().all(|b|b.is_ascii_alphanumeric()||b==b'-') {
@@ -750,7 +751,7 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
         let _=coreq::telemetry::capture::operation("tray.focus.report",||replies.send_event(Ev::Answer(json!({"focus_receipt":reply}))),|_|"ui-closed");
     })?;
     let replies=proxy.clone();
-    let capacity_actions=ActionQueue::start(install.clone(),&["capacity"],capacity,move |root,id,result| {
+    let capacity_actions=ActionQueue::start(install.clone(),&["capacity","restart"],capacity,move |root,id,result| {
         let mut reply=result.unwrap_or_else(|error|json!({"state":"unknown","reason":error}));reply["root"]=json!(root);reply["id"]=json!(id);
         let _=coreq::telemetry::capture::operation("tray.capacity.report",||replies.send_event(Ev::Answer(json!({"capmsg":reply}))),|_|"ui-closed");
     })?;
@@ -1042,7 +1043,7 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
                         push(&mut web,&ui, &st);
                     }
                     // `Edit limits` after the page's confirm: the same write as `service capacity` (§ 5), this host only
-                    "capacity" => {
+                    "capacity" | "restart" => {
                         let root = m["root"].as_str().unwrap_or("");
                         if let Err(error)=capacity_actions.submit(&m) {
                             push(&mut web,&ui, &json!({"capmsg": {"root": root, "id": m["id"], "state":"rejected","reason":error}}));
@@ -1242,7 +1243,7 @@ fn state(install: &Path, s: &Settings, dark: bool, snap: Option<(&str, &str)>, a
     let url = |rgba: &Rgba| format!("data:image/png;base64,{}", base64(&rgba.png()));
     let mut st = json!({"platform": if cfg!(windows) { "windows" } else { "macos" }, "version": crate::platform::VERSION,
         "host": ps.iter().find_map(|p| p["host"].as_str()).unwrap_or("?"), "view": s.view, "font": s.font, "period": s.period, "pinned": s.pin.pinned, "top": s.pin.top, "size": s.pin.size,
-        "now": now(), "service":crate::host::service_status(install),"projects": ps, "notify": notify_state(&s.notify, &ps), "agents": agents(&ps), "ai": {"target": target(install), "request": newest(install), "draft": requests_file(install)["draft"], "history": requests_file(install)["history"]}, "add": add, "history": {"start": start, "end": end, "tz": s.tz, "bins": sum.bins, "since": sum.since},
+        "now": now(), "service":crate::host::service_status(install),"restart":crate::restart::status(install,None),"restart_review":crate::restart::review(install,"review").unwrap_or_else(|reason|json!({"state":"unknown","reason":reason})),"projects": ps, "notify": notify_state(&s.notify, &ps), "agents": agents(&ps), "ai": {"target": target(install), "request": newest(install), "draft": requests_file(install)["draft"], "history": requests_file(install)["history"]}, "add": add, "history": {"start": start, "end": end, "tz": s.tz, "bins": sum.bins, "since": sum.since},
         // § 4 Data: a corrupt tray.json names its reason while the defaults show
         "settings_error": crate::data::json(&install.join("tray.json")).err()});
     if cfg!(target_os = "macos") {
@@ -1434,8 +1435,7 @@ fn act(action: &str, root: &Path, label: Option<&str>) -> crate::Res<Option<Stri
             crate::poke(root)?;
         }
         "restart" => {
-            fs::write(d.join("restart"), "").map_err(|e| e.to_string())?;
-            crate::poke(root)?;
+            return Err("Restart needs a reviewed host request; refresh the Services panel".into());
         }
         "log" => {
             let s: Value = fs::read_to_string(d.join("status.json")).ok().and_then(|x| serde_json::from_str(&x).ok()).unwrap_or_default();
@@ -1577,6 +1577,11 @@ fn install_service(install: &Path, mut a: Value) -> Value {
 
 /// Write the page's capacity edit for this host; the outcome line for the page.
 fn capacity(install:&Path,_root: &Path,m: &Value) -> crate::Res<Value> {
+    if m["a"]=="restart" {
+        let mut request=m.clone();let object=request.as_object_mut().ok_or("invalid restart message")?;
+        for key in ["context","a","root"] {object.remove(key);}
+        return crate::restart::submit(install,&request);
+    }
     let mut input=m.clone();input.as_object_mut().ok_or("invalid capacity message")?.remove("context");
     if !crate::resources::keys(&input,&["a","root","id","ops","issued_at","expires_at"]) {
         return Ok(json!({"state":"rejected","reason":"Unsupported host capacity payload; refresh and review current settings"}));

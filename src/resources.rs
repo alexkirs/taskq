@@ -88,6 +88,8 @@ pub struct Op {
     pub sent: bool,
 }
 
+fn local(o:&Op)->bool {o.bound.get("local_capacity").is_some()||o.bound.get("local_restart").is_some()}
+
 pub fn dir(install: &Path) -> PathBuf {
     install.join("resources")
 }
@@ -165,6 +167,19 @@ pub(crate) fn with<T>(install: &Path, f: impl FnOnce(&mut State) -> Res<T>) -> R
         save(install, &s)?;
     }
     r
+}
+
+/// Host/UI observers retry on a later tick; they must not wait behind a policy writer.
+pub(crate) fn try_with<T>(install:&Path,f:impl FnOnce(&mut State)->Res<T>)->Res<T> {
+    try_locked(install,|| {
+        let mut state=read(install)?;let before=state.clone();let result=f(&mut state);
+        if state!=before {save(install,&state)?;}result
+    })
+}
+pub(crate) fn try_locked<T>(install:&Path,f:impl FnOnce()->Res<T>)->Res<T> {
+    fs::create_dir_all(dir(install)).map_err(|e|format!("resources: {e}"))?;
+    let _lock=coreq::file_lock::try_lock(&dir(install).join("lock")).map_err(|e|format!("resources lock unavailable: {e}"))?;
+    f()
 }
 
 fn token(prefix: &str) -> String {
@@ -346,7 +361,7 @@ fn decide(install: &Path, s: &mut State, v: &Value, conn: Conn, clock: bool, now
     };
     let op = op.to_string();
     if let Some(o) = s.ops.get_mut(&op) {
-        if o.bound.get("local_capacity").is_some() {return Ok(Some(format!("resources: {op} belongs to a local command; ignored")));}
+        if local(o) {return Ok(Some(format!("resources: {op} belongs to a local command; ignored")));}
         // the host deduplicates by op ID: the same submit (or the cancellation that came first) repeats its receipt
         let same = o.bound == *v || (o.bound.get("changes").is_none() && ["schema", "actor_id", "grant_id", "target"].iter().all(|k| o.bound[k] == v[k]));
         if !same {
@@ -447,7 +462,7 @@ fn cancel(s: &mut State, c: &Value, now: u64) -> Option<String> {
         && ["op_id", "actor_id", "grant_id"].iter().all(|k| c[k].as_str().is_some_and(id)) && target_ok(&c["target"]);
     let op = c["op_id"].as_str().filter(|_| valid)?.to_string();
     let full = s.ops.len() >= MAX_OPS;
-    if s.ops.get(&op).is_some_and(|o|o.bound.get("local_capacity").is_some()) {return Some(format!("resources: cancellation of local command {op} ignored"));}
+    if s.ops.get(&op).is_some_and(|o|local(o)) {return Some(format!("resources: cancellation of local command {op} ignored"));}
     match s.ops.get_mut(&op) {
         Some(o) if ["schema", "actor_id", "grant_id", "target"].iter().all(|k| o.bound[k] == c[k]) => o.sent = false,
         Some(_) => return Some(format!("resources: cancellation of {op} does not match it; ignored")),
@@ -462,7 +477,7 @@ fn cancel(s: &mut State, c: &Value, now: u64) -> Option<String> {
 /// Saved operations become applied on a fresh service readback of the saved revision (§ 4 `status.json`).
 fn readback(s: &mut State, now: u64) {
     for o in s.ops.values_mut() {
-        if o.bound.get("local_capacity").is_some() {continue;}
+        if local(o) {continue;}
         let Some(at) = o.saved_at.filter(|t| o.receipt["state"] == "saved" && now < t + RECONCILE) else { continue };
         let Some(p) = o.receipt["target"]["project_id"].as_str().and_then(|pid| s.projects.get(pid)) else { continue };
         if o.receipt["saved_revision"] != p.revision.as_str() {
@@ -490,7 +505,8 @@ pub(crate) fn prepare(s: &mut State, install: &Path, now: u64) -> Res<()> {
         o.receipt["state"] = json!("unknown");
         o.sent = false;
     }
-    s.ops.retain(|_, o| now < o.expires_at + RETAIN);
+    s.ops.retain(|_,o|now<o.expires_at.saturating_add(RETAIN)
+        ||(o.bound.get("local_restart").is_some()&&o.receipt["state"]!="observed"));
     readback(s, now);
     Ok(())
 }
@@ -498,7 +514,7 @@ pub(crate) fn prepare(s: &mut State, install: &Path, now: u64) -> Res<()> {
 /// Whether there is anything to exchange: an active host grant for this connection, or a receipt DashQ has not taken.
 fn wanted(s: &State, conn: Conn, now: u64) -> bool {
     s.grants.values().any(|g| !g.revoked && now < g.expires_at && g.installation_id == conn.0 && g.generation == conn.1)
-        || s.ops.values().any(|o| !o.sent && o.bound.get("local_capacity").is_none())
+        || s.ops.values().any(|o| !o.sent && !local(o))
 }
 
 /// One exchange with DashQ over the active connection: up to 8 receipts out, up to 8 operations and cancellations
@@ -515,7 +531,7 @@ pub fn exchange(install: &Path, active: &Value, w: &mut dyn Wire, now: u64) -> R
     }
     let sent: Vec<Value> = with(install, |s| {
         prepare(s, install, now)?;
-        Ok(if wanted(s, conn, now) { s.ops.values().filter(|o| !o.sent && o.bound.get("local_capacity").is_none()).take(ITEMS).map(|o| o.receipt.clone()).collect() } else { vec![json!(null)] })
+        Ok(if wanted(s, conn, now) { s.ops.values().filter(|o| !o.sent && !local(o)).take(ITEMS).map(|o| o.receipt.clone()).collect() } else { vec![json!(null)] })
     })?;
     if sent.first().is_some_and(Value::is_null) {
         return Ok((vec![], false));
@@ -559,7 +575,7 @@ pub fn exchange(install: &Path, active: &Value, w: &mut dyn Wire, now: u64) -> R
         if !clock && !ops.is_empty() {
             log.push(format!("resources: host clock differs from DashQ's by {} s", now.abs_diff(server)));
         }
-        let more = !ops.is_empty() || !cancels.is_empty() || s.ops.values().any(|o| !o.sent && o.bound.get("local_capacity").is_none());
+        let more = !ops.is_empty() || !cancels.is_empty() || s.ops.values().any(|o| !o.sent && !local(o));
         Ok((log, more))
     })
 }
@@ -777,6 +793,14 @@ mod tests {
         assert_eq!(read(&t.install).unwrap().ops["local-op"],before);
         assert_eq!(fs::read(t.install.join("host.json")).unwrap(),policy);
         assert_eq!(log.len(),2,"remote cancel and ID reuse must both be explicitly refused");
+        with(&t.install,|state| {
+            state.ops.insert("local-restart".into(),Op {bound:json!({"local_restart":{"request":{"id":"local-restart"}}}),
+                receipt:json!({"id":"local-restart","state":"queued"}),expires_at:0,saved_at:Some(0),writing:false,sent:true});Ok(())
+        }).unwrap();
+        let original=read(&t.install).unwrap().ops["local-restart"].clone();
+        let mut cancel=fix()["cancel"].clone();cancel["op_id"]=json!("local-restart");
+        let (sent,log)=go(&t,&[submit("local-restart",json!({"runtime_limit":0}))],&[cancel],100);
+        assert!(sent.is_empty());assert_eq!(log.len(),2);assert_eq!(read(&t.install).unwrap().ops["local-restart"],original);
         capture.flush().unwrap();drop(guard);drop(capture);fs::remove_dir_all(t.base).unwrap();
     }
 

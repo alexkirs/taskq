@@ -21,6 +21,7 @@ mod requests;
 mod platform;
 mod policy;
 mod resources;
+mod restart;
 #[cfg(target_os = "linux")]
 mod linux_sandbox;
 #[cfg(windows)]
@@ -914,7 +915,7 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
         for (k, v) in [("focus", if focus_error.is_some() { Value::Null } else { json!(s.focus) }), ("focus_error", json!(focus_error)), ("focus_command",command), ("kids", json!(kids)), ("issues", json!(issues)), ("log", json!(log)),
             ("tasks_age_seconds", json!(s.tasks_read.map(|t| t.elapsed().as_secs()))), ("request", json!(request)), ("events_since", json!(s.events_since)),
             ("execution_waits", json!(s.execution_waits)), ("capacity", s.capacity_json()), ("hold", json!(s.hold)), ("access", json!(access.iter().map(|e| e.json()).collect::<Vec<_>>())), ("agents", json!(agents.as_ref().map(|a| &a.1))),
-            ("restart_waits", json!(d.join("restart").exists().then(|| restart_waits(&s, &cfg.root)))),
+            ("restart_waits", json!((d.join("restart").exists()||host.as_ref().is_some_and(|h|h.lock().is_ok_and(|h|h.restart))).then(|| restart_waits(&s, &cfg.root)))),
             ("incident", incident::status(&cfg.root)), ("incident_notice", json!(incident::notice(&cfg.root))),
             ("requests", requests_json), ("connection", json!(dashq.outcome)), ("telemetry",telemetry::diagnostic::health())]
         {
@@ -1695,9 +1696,12 @@ fn service_report(a:&Args)->Res<()> {
     if a.flags.contains_key("json") {
         let projects:Vec<_>=rows.into_iter().map(|(root,status)|json!({"root":root,"host_binding":binding(&status),
             "status":status.as_ref().ok().and_then(Option::as_ref),"error":status.as_ref().err()})).collect();
-        println!("{}",json!({"schema":"taskq.service/1","service":service,"projects":projects,"registry_error":registry.as_ref().err()}));
+        println!("{}",json!({"schema":"taskq.service/1","service":service,"projects":projects,"registry_error":registry.as_ref().err(),"restart":restart::status(&install,a.one("request"))}));
     } else {
         println!("{}",host::service_line(&service));
+        let restart=restart::status(&install,a.one("request"));
+        if let Some(id)=restart["id"].as_str() {println!("Restart: {id} {}",restart["state"].as_str().unwrap_or("unknown"));}
+        if let Some(reason)=restart["reason"].as_str() {println!("Restart: unknown ({reason})");}
         if let Err(error)=&registry {println!("Projects: unknown ({error})");}
         for (root,status) in rows {
             let owner=binding(&status);
@@ -1725,6 +1729,23 @@ fn service(args: &Args) -> Res<()> {
     let projects = platform::default_install().join("projects");
     if matches!(sub,"status"|"list") {return service_report(args);}
     if sub == "capacity" {return capacity_cmd(args);}
+    if sub == "restart" {
+        if args.all("request").len()>1||args.flags.keys().any(|key|!["request","json","diagnose","diagnose-ms","diagnose-limit"].contains(&key.as_str())) {
+            return Err("usage: taskq service restart [--request ID] [--json]".into());
+        }
+        let install=platform::default_install();
+        let id=args.one("request").map(str::to_owned).unwrap_or_else(runtime::uuid);
+        let result=if let Some(receipt)=restart::receipt(&install,&id)? {receipt} else {
+            let reviewed=restart::review(&install,&id)?;
+            if !args.flags.contains_key("json") {
+                println!("Scope: host service; all registered projects");
+                for root in reviewed["roots"].as_array().into_iter().flatten() {println!("Project: {}",root.as_str().unwrap_or("unknown"));}
+            }
+            restart::submit(&install,&reviewed)?
+        };
+        if args.flags.contains_key("json") {println!("{result}");}else {println!("Restart: {id} {}",result["state"].as_str().unwrap_or("unknown"));}
+        return Ok(());
+    }
     if sub == "run" {
         let install=platform::default_install();
         let in_install=std::env::current_dir().and_then(|p|p.canonicalize()).ok()
@@ -1742,7 +1763,6 @@ fn service(args: &Args) -> Res<()> {
         return host::run(&install);
     }
     let root = find_root()?;
-    let d = dot(&root);
     match sub {
         "focus" => {
             let f = args.pos[2..].join(" ");
@@ -1778,13 +1798,6 @@ fn service(args: &Args) -> Res<()> {
         "resources" => resources_cmd(&root, args),
         "hold" | "release" => hold_cmd(sub == "hold", args.one("text")),
         "recover" => recover_cmd(&root, args.flags.contains_key("apply"), args.flags.contains_key("json")),
-        "restart" => {
-            fs::create_dir_all(&d).map_err(|e| e.to_string())?;
-            fs::write(d.join("restart"), "").map_err(|e| e.to_string())?;
-            poke(&root)?;
-            println!("Restart requested for {}", project_name(&root));
-            Ok(())
-        }
         "install" | "uninstall" | "stop" => {
             let (cfg, _) = load(&root)?;
             let u = platform::unit(&platform::tool(&cfg.install), &root, &project_name(&root));

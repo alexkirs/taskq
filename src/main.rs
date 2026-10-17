@@ -588,10 +588,12 @@ fn report(b: &dyn Board, cfg: &Config, raw: &Value, only: &[String]) -> Res<Stri
 }
 
 fn inbox(b: &dyn Board, n: u64) -> Res<String> {
-    let (issue, t, _) = current(b, n)?;
-    let mut out = vec![format!("#{n} {}\n{}", issue.title, b.url(n)), issue.body.trim().to_string(), format!("Folded: {}", serde_json::to_string(&t).unwrap_or_default())];
+    let issue = b.issue(n)?;
     let log = entries(b, n)?;
-    out.extend([format!("Revision: {}", core::revision(n, &log)), "Log:".into()]);
+    let projection = core::project(n, &log, deps_open(b, &issue.body));
+    let t = &projection.task;
+    let mut out = vec![format!("#{n} {}\n{}", issue.title, b.url(n)), issue.body.trim().to_string(), format!("Folded: {}", serde_json::to_string(&t).unwrap_or_default())];
+    out.extend([format!("Revision: {}", projection.revision), "Log:".into()]);
     for e in log {
         out.push(format!("[{}{}] {}", e.id, if e.edited { " edited, ignored" } else { "" }, e.body.trim()));
     }
@@ -726,7 +728,7 @@ fn adopt(s: &mut Service, install:&Path, root: &Path) -> Res<()> {
         }
         if k.runtime=="claude" {
             let proc=runtime::recover(root,install,k.task,&execution)?;
-            s.adopt(Kid {execution:k.execution,task:k.task,attempt:k.attempt,rt:k.runtime,proc})?;
+            s.adopt(Kid { unknown:None, stopping:false, session_url:None,execution:k.execution,task:k.task,attempt:k.attempt,rt:k.runtime,proc})?;
             continue;
         }
         #[cfg(windows)]
@@ -743,7 +745,7 @@ fn adopt(s: &mut Service, install:&Path, root: &Path) -> Res<()> {
             _=>return Err("kids: native attempt log missing or ambiguous; file kept".into()),
         };
         let proc=runtime::CliTurn {proc:native,log,pos:k.offset,start:k.offset,stopping:false,accepted:false,read_error:None,native:Some(k.process),recovery:None};
-        s.adopt(Kid { execution:k.execution,task:k.task,attempt:k.attempt,rt:k.runtime,proc:Box::new(proc) })?;
+        s.adopt(Kid { unknown:None, stopping:false, session_url:None, execution:k.execution,task:k.task,attempt:k.attempt,rt:k.runtime,proc:Box::new(proc) })?;
     }
     Ok(())
 }
@@ -913,7 +915,7 @@ fn service_run(c: &Ctx, host: Option<host::Shared>,legacy:Option<&host_control::
         }
         let at = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let kids: Vec<Value> = s.kids.iter().map(|k| {
-            let unknown = s.unknown.get(&k.attempt);
+            let unknown = k.unknown.as_ref();
             json!({"task": k.task, "attempt": k.attempt, "rt": k.rt, "pid": k.proc.id(), "live": if unknown.is_some() { "unknown" } else { "running" }, "reason": unknown})
         }).collect();
         let request = fs::read_to_string(d.join("focus.request")).ok();
@@ -2166,8 +2168,8 @@ fn run(argv: &[String]) -> Res<()> {
                 let (views, hosts) = service::views(c.board.as_ref(), &mut Default::default(), &mut Default::default())?;
                 let now = c.board.now()?;
                 let live = views.iter().filter_map(|v| {
-                    let a = v.task.attempt?;
-                    let h = service::host_of(&v.task)?;
+                    let a = v.projection.task.attempt?;
+                    let h = service::host_of(&v.projection.task)?;
                     (hosts.iter().any(|hb| hb.title == format!("taskq host {h}")
                         && now - hb.updated <= c.cfg.ttl && hb.body.lines().any(|l| l == format!("#{} {a}", v.issue.number))))
                         .then(|| (c.cfg.repo.clone(), a))
@@ -2256,8 +2258,9 @@ fn claimed_create(b: &dyn Board, raw: &Value, title: &str, body: &str, labels: &
             return Err(unknown(i.number, "created issue conflicts with the immutable request".into()));
         }
         let log = entries(b, i.number).map_err(read)?;
-        let state = if !i.open { State::Closed } else if service::is_held(&i) { State::Held } else { fold(i.number, &log, deps_open(b, &i.body)).state };
-        Ok(Receipt::accepted(i.number, op, state, core::revision(i.number, &log)))
+        let projection = core::project(i.number, &log, deps_open(b, &i.body));
+        let state = if !i.open { State::Closed } else if service::is_held(&i) { State::Held } else { projection.task.state };
+        Ok(Receipt::accepted(i.number, op, state, projection.revision))
     };
     if let Some(first) = first().map_err(read)? {
         if first.body != claim {
@@ -2307,9 +2310,10 @@ fn start_one(b: &dyn Board, root: &Path, n: u64, op: &Op) -> Receipt {
     let initialize = || -> Res<Option<Receipt>> {
         let issue = b.issue(n)?;
         let log = entries(b, n)?;
-        if op.revision.is_some_and(|r| r != core::revision(n, &log)) { return Ok(None) }
-        if issue.open && service::is_held(&issue) && core::revision(n, &log) == 0 {
-            let hold = Op { id: op.id.as_ref().map(|id| format!("{id}.hold")), revision: Some(core::revision(n, &log)) };
+        let revision = core::project(n, &log, false).revision;
+        if op.revision.is_some_and(|r| r != revision) { return Ok(None) }
+        if issue.open && service::is_held(&issue) && revision == 0 {
+            let hold = Op { id: op.id.as_ref().map(|id| format!("{id}.hold")), revision: Some(revision) };
             let r = act(b, root, n, "hold", &[], "", &hold);
             return Ok(Some(Receipt { op_id: op.id.clone(), ..r }));
         }
@@ -3112,7 +3116,7 @@ mod tests {
         assert_eq!(issues[0].labels, vec!["q-held"]);
         assert!(!service::is_task(&issues[0]) && service::is_held(&issues[0]));
         let (views, _) = service::views(b, &mut HashMap::new(), &mut HashMap::new()).unwrap();
-        assert_eq!(views[0].task.state, State::Held);
+        assert_eq!(views[0].projection.task.state, State::Held);
         assert_eq!(fold(n, &entries(b, n).unwrap(), false).state, State::Held);
         run(&["add", "U", "--goal", "G", "--acceptance", "a", "--op-id", "req.1.1"]).unwrap();
         assert_eq!(b.issues(None).unwrap().len(), 3, "each item has its own receipt, plus the claim issue");
@@ -3529,7 +3533,7 @@ mod tests {
                 .args(["--exact","tests::handover_native_child","--ignored","--nocapture"])
                 .env("TASKQ_IMAGE_ROOT",&root).stdin(std::process::Stdio::null()).stdout(output).stderr(std::process::Stdio::null()).spawn().unwrap();
             let native=coreq::process::identity(child.id()).unwrap();
-            s.kids.push(Kid {execution,task:n,attempt:a,rt:"codex".into(),proc:Box::new(runtime::CliTurn {
+            s.kids.push(Kid { unknown:None, stopping:false, session_url:None,execution,task:n,attempt:a,rt:"codex".into(),proc:Box::new(runtime::CliTurn {
                 proc:Box::new(child),log,pos:old.len() as u64,start:old.len() as u64,stopping:false,accepted:false,read_error:None,native,recovery:None
             })});
             let launch=runtime::Launch {execution:None,task:n,title:String::new(),attempt:a,role:"worker".into(),rt:"codex".into(),session:"session".into(),url:String::new(),resume:Some("continue".into())};
@@ -3565,7 +3569,7 @@ mod tests {
         fs::write(root.join("observe"),"").unwrap();
         let until=Instant::now()+Duration::from_secs(5);
         while s.delivered(a)!=input {
-            s.reap_owned(); assert!(Instant::now()<until,"acceptance not observed: {:?}",s.unknown);
+            s.reap_owned(); assert!(Instant::now()<until,"acceptance not observed: {:?}",s.kids.iter().map(|k|&k.unknown).collect::<Vec<_>>());
             std::thread::sleep(Duration::from_millis(10));
         }
         if cold=="cancel" { s.kids[0].proc.kill().unwrap(); }
@@ -3579,7 +3583,7 @@ mod tests {
             assert_eq!(fs::read_to_string(kids_path(&c.install,&root).unwrap()).unwrap(),saved,"recovery record survives a failed terminal receipt");
         }
         while !s.kids.is_empty() {
-            s.reap_owned(); assert!(Instant::now()<until,"native exit not observed: {:?}",s.unknown);
+            s.reap_owned(); assert!(Instant::now()<until,"native exit not observed: {:?}",s.kids.iter().map(|k|&k.unknown).collect::<Vec<_>>());
             std::thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(coreq::process::identity(pid).unwrap(),None);
@@ -3634,7 +3638,7 @@ mod tests {
         let b = Fake::default();
         let c = Config { root: root.clone(), ..cfg() };
         let mut s = Service::new(&b, &c, "test", Box::new(|_| unreachable!()));
-        s.kids.push(Kid { execution: 41, task: 7, attempt: 41, rt: "codex-app".into(), proc: Box::new(runtime::Adopted::new(coreq::process::identity(pid).unwrap().unwrap())) });
+        s.kids.push(Kid { unknown:None, stopping:false, session_url:None, execution: 41, task: 7, attempt: 41, rt: "codex-app".into(), proc: Box::new(runtime::Adopted::new(coreq::process::identity(pid).unwrap().unwrap())) });
         reexec(&s, &c).unwrap();
         assert!(dot(&root).join("restart").exists());
         assert_eq!(lifecycle_waits(&s, &root, false), ["#7","ownership unknown"], "status names the active task and missing ownership read");

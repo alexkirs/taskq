@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 import traceback
+import tomllib
 
 
 def manager():
@@ -84,7 +85,8 @@ def run_case(phase):
     (install / 'token').write_text('owned-fixture-not-a-credential\n')
     (install / 'token').chmod(0o600)
     (home / 'Library/LaunchAgents').mkdir(parents=True)
-    candidate = install / 'releases/4.5.0/taskq'
+    version = tomllib.loads((repo / 'Cargo.toml').read_text())['package']['version']
+    candidate = install / 'releases' / version / 'taskq'
     candidate.parent.mkdir(parents=True)
     shutil.copy2(binary, candidate)
     executable = install / 'fixture test'

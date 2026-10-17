@@ -72,6 +72,7 @@ pub fn host(name: &str) {
     HOST.set(Some(name.chars().filter(|c| c.is_ascii_alphanumeric() || "-_.".contains(*c)).take(128).collect()));
 }
 
+// Compatibility String errors have no structured cause; unclassified text stays other.
 fn error(text: &str) -> &'static str {
     if text.contains("ENAMETOOLONG") { "argument-too-long" }
     else if text.contains("HTTP 4") { "http4xx" }
@@ -84,6 +85,23 @@ fn error(text: &str) -> &'static str {
 
 pub fn measure<T, E: std::fmt::Display>(op: &'static str, f: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
     measure_at(LOG.get().map(PathBuf::as_path), TRACE.get().copied().unwrap_or(false), op, f)
+}
+
+pub(crate) fn measure_classified<T,E>(op:&'static str,f:impl FnOnce()->Result<T,E>,class:impl FnOnce(&E)->&'static str)->Result<T,E> {
+    observe(LOG.get().map(PathBuf::as_path),TRACE.get().copied().unwrap_or(false),op,f,class)
+}
+
+pub(crate) fn io_class(error:&std::io::Error)->&'static str {
+    #[cfg(unix)]
+    if matches!(error.raw_os_error(),Some(libc::ENAMETOOLONG)|Some(libc::E2BIG)) {return "argument-too-long";}
+    #[cfg(windows)]
+    if error.raw_os_error()==Some(206) {return "argument-too-long";}
+    match error.kind() {
+        std::io::ErrorKind::PermissionDenied=>"permission",
+        std::io::ErrorKind::TimedOut=>"timeout",
+        std::io::ErrorKind::InvalidInput|std::io::ErrorKind::InvalidData=>"invalid",
+        _=>"other",
+    }
 }
 
 struct Observation<'a> { path: Option<&'a Path>, began: Instant, record: Record }
@@ -102,6 +120,10 @@ impl Drop for Observation<'_> {
 }
 
 fn measure_at<T, E: std::fmt::Display>(path: Option<&Path>, detailed: bool, op: &'static str, f: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
+    observe(path,detailed,op,f,|e|error(&e.to_string()))
+}
+
+fn observe<T,E>(path:Option<&Path>,detailed:bool,op:&'static str,f:impl FnOnce()->Result<T,E>,class:impl FnOnce(&E)->&'static str)->Result<T,E> {
     let trace = detailed.then(|| {
         let span = SPAN.fetch_add(1, Ordering::Relaxed);
         Trace { run: *RUN.get_or_init(|| SystemTime::now().duration_since(UNIX_EPOCH).ok().and_then(|d| d.as_nanos().try_into().ok())),
@@ -110,7 +132,7 @@ fn measure_at<T, E: std::fmt::Display>(path: Option<&Path>, detailed: bool, op: 
     let mut observation = Observation { path, began: Instant::now(), record: Record { op: op.into(), us: 0, error: "panic".into(),
         at_ms: now_ms(), trace } };
     let result = f();
-    observation.record.error = result.as_ref().err().map_or("none", |e| error(&e.to_string())).into();
+    observation.record.error = result.as_ref().err().map_or("none", class).into();
     result
 }
 

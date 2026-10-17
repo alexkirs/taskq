@@ -194,10 +194,27 @@ pub struct Execution {
     pub release: Option<Release>,
 }
 
-pub fn executions(n: u64, entries: &[Entry]) -> Vec<Execution> { replay(n, entries, false).4 }
+/// All derived facts for one immutable board read; dependency blocking only adjusts the current task.
+pub struct Projection {
+    pub task: Task,
+    pub owner_comments: Vec<u64>,
+    pub revision: u64,
+    accepted: Vec<u64>,
+    pub executions: Vec<Execution>,
+    pub changes: Vec<(u64, Task, Task)>,
+    pub worker_runtime: Option<String>,
+}
+
+impl Projection {
+    pub fn delivered(&self, attempt: u64) -> Option<u64> {
+        self.executions.iter().filter(|x| x.attempt == attempt && x.accepted).map(|x| x.through).max()
+    }
+}
+
+pub fn executions(n: u64, entries: &[Entry]) -> Vec<Execution> { project(n, entries, false).executions }
 
 pub fn delivered(n: u64, entries: &[Entry], attempt: u64) -> Option<u64> {
-    executions(n, entries).into_iter().filter(|x| x.attempt == attempt && x.accepted).map(|x| x.through).max()
+    project(n, entries, false).delivered(attempt)
 }
 
 struct Line<'a> {
@@ -298,7 +315,7 @@ pub fn handed_in(n: u64, entries: &[Entry], a: u64, after: u64) -> bool {
 /// The kind of attempt `a`'s last `ask`, `result`, `requeue` or `close` after entry `after` that `fold` accepted:
 /// invalid, duplicate and wrong-state entries change nothing and count as no hand-in.
 fn hand_in(n: u64, entries: &[Entry], a: u64, after: u64) -> Option<&'static str> {
-    let accepted = replay(n, entries, false).3;
+    let accepted = project(n, entries, false).accepted;
     let mut log: Vec<&Entry> = entries.iter().filter(|e| e.id > after && accepted.contains(&e.id)).collect();
     log.sort_by_key(|e| e.id);
     log.into_iter().filter_map(|e| parse(n, &e.body)).filter(|l| l.attempt == Some(a))
@@ -353,43 +370,34 @@ fn invalidate(t: &mut Task) {
 }
 
 pub fn fold(n: u64, entries: &[Entry], deps_open: bool) -> Task {
-    replay(n, entries, deps_open).0
+    project(n, entries, deps_open).task
 }
 
 /// Logged state changes (§ 4 Profiling): per accepted entry that changed the folded state, its id and the task
-/// before and after it. `ponytail:` refolds each prefix, O(entries²); a running fold is the upgrade if logs grow long.
+/// before and after it, collected during the same replay.
 pub fn changes(n: u64, entries: &[Entry]) -> Vec<(u64, Task, Task)> {
-    let mut log: Vec<Entry> = entries.iter().filter(|e| !e.edited).cloned().collect();
-    log.sort_by_key(|e| e.id);
-    let (mut out, mut before) = (vec![], Task::default());
-    for i in 0..log.len() {
-        let after = fold(n, &log[..=i], false);
-        if after.state != before.state {
-            out.push((log[i].id, before, after.clone()));
-        }
-        before = after;
-    }
-    out
+    project(n, entries, false).changes
 }
 
 /// The task's revision (§ 2): the entry that set its open card, else its attempt, else its last accepted entry; 0: none.
 pub fn revision(n: u64, entries: &[Entry]) -> u64 {
-    replay(n, entries, false).2
+    project(n, entries, false).revision
 }
 
 /// Owner comments (§ 4): ids of the bare comments that the open `ask` ignored, i.e. that name no option of its card.
 pub fn owner_comments(n: u64, entries: &[Entry]) -> Vec<u64> {
-    replay(n, entries, false).1
+    project(n, entries, false).owner_comments
 }
 
-/// The folded task, the ignored owner comments, the revision and the ids of the entries that changed the task.
-fn replay(n: u64, entries: &[Entry], deps_open: bool) -> (Task, Vec<u64>, u64, Vec<u64>, Vec<Execution>) {
+/// Parse and reduce once, retaining facts needed by the service and command surfaces.
+pub fn project(n: u64, entries: &[Entry], deps_open: bool) -> Projection {
     let mut log: Vec<&Entry> = entries.iter().filter(|e| !e.edited).collect();
     log.sort_by_key(|e| e.id);
     let mut t = Task::default();
     let mut resume = None; // the state an `ask` entry left; None when a retry limit asked
     let (mut free, mut accepted) = (vec![], vec![]);
     let mut executions: Vec<Execution> = vec![];
+    let (mut changes, mut worker_runtime) = (vec![], None);
     let (mut ops, mut card_at, mut last) = (std::collections::HashSet::new(), None, 0);
     for e in log {
         if let Some(l) = parse(n, &e.body) {
@@ -401,6 +409,9 @@ fn replay(n: u64, entries: &[Entry], deps_open: bool) -> (Task, Vec<u64>, u64, V
             let before = t.clone();
             step(&mut t, &mut resume, e.id, &l, last == 0);
             if l.kind == "spawn" && t.attempt == Some(e.id) && before.attempt != t.attempt {
+                if t.role.as_deref() == Some("worker") {
+                    worker_runtime = t.session.as_deref().and_then(|s| s.split_once(':')).map(|s| s.0.to_string());
+                }
                 executions.push(Execution { id:e.id, attempt:e.id, through:e.id, host:l.args[2].into(),
                     runtime:l.args[1].split(':').next().unwrap_or("").into(), accepted:false, release:None });
             } else if l.kind == "executing" && l.args.len() == 1 && l.attempt.is_some() && l.attempt == t.attempt
@@ -435,6 +446,7 @@ fn replay(n: u64, entries: &[Entry], deps_open: bool) -> (Task, Vec<u64>, u64, V
                     card_at = Some(e.id);
                 }
             }
+            if t.state != before.state { changes.push((e.id, before, t.clone())); }
             match (asked, t.state == State::Ask) {
                 (true, true) if l.bare && !e.body.trim().is_empty() => free.push(e.id),
                 (_, false) => free.clear(),
@@ -447,7 +459,7 @@ fn replay(n: u64, entries: &[Entry], deps_open: bool) -> (Task, Vec<u64>, u64, V
         t.state = State::Waiting;
     }
     let rev = t.card.as_ref().and(card_at).or(t.attempt).unwrap_or(last);
-    (t, free, rev, accepted, executions)
+    Projection { task:t, owner_comments:free, revision:rev, accepted, executions, changes, worker_runtime }
 }
 
 fn step(t: &mut Task, resume: &mut Option<State>, id: u64, l: &Line, first: bool) {
@@ -702,6 +714,47 @@ mod tests {
         assert!(super::golden(super::GOLDEN).unwrap() > 20);
         let wrong = super::GOLDEN.replacen("\"retries\": 2}", "\"retries\": 1}", 1);
         assert!(super::golden(&wrong).is_err(), "a wrong expectation must fail");
+    }
+
+    // Chain: historical prefix semantics, including ignored entries; timings are observations, not a gate.
+    #[test]
+    fn projection_preserves_prefix_transitions() {
+        use super::*;
+        let check = |n, entries: &[Entry]| {
+            let mut log: Vec<_> = entries.iter().filter(|e| !e.edited).cloned().collect();
+            log.sort_by_key(|e| e.id);
+            let (mut expected, mut before) = (vec![], Task::default());
+            for i in 0..log.len() {
+                let after = fold(n, &log[..=i], false);
+                if before.state != after.state { expected.push((log[i].id, before, after.clone())); }
+                before = after;
+            }
+            assert_eq!(changes(n, entries), expected);
+        };
+        for tr in serde_json::from_str::<Vec<Trace>>(GOLDEN).unwrap() {
+            check(tr.task, &tr.entries);
+            let mut log = tr.entries.clone();
+            log.reverse();
+            check(tr.task, &log);
+            log.extend(tr.entries.iter().cloned());
+            check(tr.task, &log);
+        }
+        for cycles in [4, 128] {
+            let mut log = vec![];
+            for i in 0..cycles {
+                let a = i * 4 + 1;
+                for (id, body) in [(a, entry("spawn", &["worker", "codex:s", "mac"], None, "")),
+                    (a+1, entry("ask", &[], Some(a), "Problem: detail\n1. continue ★\n2. later")),
+                    (a+2, entry("answer", &["1"], None, "")),
+                    (a+3, entry("requeue", &[], None, "fresh attempt"))] {
+                    log.push(Entry {id, body, edited:false});
+                }
+            }
+            check(7, &log);
+            let began = std::time::Instant::now();
+            for _ in 0..3 { std::hint::black_box(changes(7, &log)); }
+            eprintln!("changes entries={} mean_us={}", log.len(), began.elapsed().as_micros()/3);
+        }
     }
 
     // Chain: § 2 limit card (#1123). Risk: a card below the limit, a card added twice, or fix lines read as options.

@@ -65,7 +65,7 @@ pub struct Project {
     pub root: String,
     /// Opaque; new on every change of `policy` and on every canonical write.
     pub revision: String,
-    /// This host's capacity (`service::Capacity::json`) at `revision`; null when the config is unreadable.
+    /// Saved authority's capacity; host policy on host installs, legacy project policy otherwise. Null: unreadable.
     pub policy: Value,
     pub since: u64,
 }
@@ -192,10 +192,21 @@ pub(crate) fn id(s: &str) -> bool {
     !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
-/// This host's capacity of the project at `root`.
-fn policy(root: &Path) -> Res<(String, Value)> {
+fn host_authority(install:&Path)->bool {
+    ["host.json","host.json.pending"].iter().any(|name|match fs::symlink_metadata(install.join(name)) {
+        Err(e) if e.kind()==std::io::ErrorKind::NotFound=>false,
+        _=>true,
+    })
+}
+
+/// Observe the actual saved authority; an unreadable host policy never falls back to legacy settings.
+fn policy(install:&Path, root: &Path) -> Res<(Value, Option<String>)> {
+    if host_authority(install) {
+        let host=crate::host::Policy::read(install)?;
+        return Ok((host.cap.json(),Some(host.revision()?)));
+    }
     let (cfg, v) = crate::load(root)?;
-    Ok((cfg.me.clone(), crate::service::capacity(&v, &cfg.me)?.json()))
+    Ok((crate::service::capacity(&v, &cfg.me)?.json(),None))
 }
 
 fn registered(install: &Path, root: &str) -> Res<bool> {
@@ -224,9 +235,9 @@ fn sync(s: &mut State, install: &Path, now: u64) -> Res<()> {
         }
     }
     for p in s.projects.values_mut() {
-        let now_policy = policy(Path::new(&p.root)).map(|x| x.1).unwrap_or(Value::Null);
-        if p.revision.is_empty() || now_policy != p.policy {
-            *p = Project { root: p.root.clone(), revision: token("r"), policy: now_policy, since: now };
+        let (now_policy,revision) = policy(install,Path::new(&p.root)).unwrap_or((Value::Null,None));
+        if p.revision.is_empty() || now_policy != p.policy || revision.as_ref().is_some_and(|r|r!=&p.revision) {
+            *p = Project { root: p.root.clone(), revision: revision.unwrap_or_else(||token("r")), policy: now_policy, since: now };
         }
     }
     Ok(())
@@ -308,7 +319,7 @@ fn authorize(s: &State, v: &Value, conn: Conn, now: u64) -> Result<String, &'sta
         return Err("scope");
     }
     let Some(pid) = t["project_id"].as_str() else {
-        // TaskQ keeps capacity per project config; no host-wide store exists to write
+        // The legacy remote profiles have no qualified host mutation authority.
         return if g.host_policy { Err("unsupported") } else { Err("scope") };
     };
     if !s.projects.contains_key(pid) || !g.project_ids.iter().any(|x| x == pid) {
@@ -398,10 +409,7 @@ fn decide(install: &Path, s: &mut State, v: &Value, conn: Conn, clock: bool, now
         return Ok(record(s, "rejected", Some("conflict")));
     }
     // These wire profiles own legacy project policy, never fallback authority for host.json.
-    if ["host.json","host.json.pending"].iter().any(|name|match fs::symlink_metadata(install.join(name)) {
-        Err(e) if e.kind()==std::io::ErrorKind::NotFound=>false,
-        _=>true,
-    }) {return Ok(record(s,"rejected",Some("unsupported")));}
+    if host_authority(install) {return Ok(record(s,"rejected",Some("unsupported")));}
     let root = PathBuf::from(&p.root);
     let Ok((cfg, cv)) = crate::load(&root) else { return Ok(record(s, "rejected", Some("unsupported"))) };
     let Ok(cur) = crate::service::capacity(&cv, &cfg.me) else { return Ok(record(s, "rejected", Some("unsupported"))) };
@@ -443,7 +451,7 @@ fn decide(install: &Path, s: &mut State, v: &Value, conn: Conn, clock: bool, now
         return Ok(Some(format!("resources: {op} unknown: {x}")));
     }
     let wake = crate::poke(&root);
-    let saved = policy(&root).ok().map(|x| x.1);
+    let saved = policy(install,&root).ok().map(|x| x.0);
     let Some(saved) = saved.filter(|x| Some(x) == want.as_ref()) else {
         return Ok(Some(format!("resources: {op} unknown: readback differs")));
     };
@@ -475,10 +483,16 @@ fn cancel(s: &mut State, c: &Value, now: u64) -> Option<String> {
 }
 
 /// Saved operations become applied on a fresh service readback of the saved revision (§ 4 `status.json`).
-fn readback(s: &mut State, now: u64) {
+fn readback(s: &mut State, install:&Path, now: u64) {
     for o in s.ops.values_mut() {
         if local(o) {continue;}
         let Some(at) = o.saved_at.filter(|t| o.receipt["state"] == "saved" && now < t + RECONCILE) else { continue };
+        if host_authority(install) {
+            o.receipt["state"]=json!("unknown");
+            o.receipt["reason"]=json!("unsupported");
+            o.sent=false;
+            continue;
+        }
         let Some(p) = o.receipt["target"]["project_id"].as_str().and_then(|pid| s.projects.get(pid)) else { continue };
         if o.receipt["saved_revision"] != p.revision.as_str() {
             continue;
@@ -508,7 +522,7 @@ pub(crate) fn prepare(s: &mut State, install: &Path, now: u64) -> Res<()> {
     s.ops.retain(|_,o|now<o.expires_at.saturating_add(RETAIN)
         ||((o.bound.get("local_restart").is_some()||(o.bound.get("local_stop").is_some()||o.bound.get("local_uninstall").is_some()))&&o.receipt["state"]!="observed")
         ||(o.bound.get("local_install").is_some()&&!matches!(o.receipt["state"].as_str(),Some("observed"|"failed"))));
-    readback(s, now);
+    readback(s, install, now);
     Ok(())
 }
 
@@ -685,6 +699,12 @@ pub fn report(install: &Path, now: u64) -> Res<Vec<String>> {
             Some(a) => format!("Connection: {} generation {}", a["destination"].as_str().unwrap_or("?"), a["generation"]),
             None => "Connection: none (grants need an active DashQ connection)".into(),
         }];
+        if host_authority(install) {
+            out.push(match crate::host::Policy::read(install).and_then(|p|p.revision()) {
+                Ok(revision)=>format!("Host policy: revision {revision}; local edits only; remote writes unsupported"),
+                Err(e)=>format!("Host policy: unknown ({e}); remote writes unsupported"),
+            });
+        }
         for (k, p) in &s.projects {
             let name = names.get(&p.root).map_or("?", String::as_str);
             out.push(format!("Project {name}: {k} revision {}{}", p.revision, if p.policy.is_null() { " (config unreadable)" } else { "" }));
@@ -774,6 +794,44 @@ mod tests {
         assert_eq!(receipt_of(&t,"host-profile")["state"],"rejected");
         assert_eq!(receipt_of(&t,"host-profile")["reason"],"unsupported");
         assert_eq!(config(&t),before);assert_eq!(fs::read_to_string(t.install.join("host.json")).unwrap(),host);
+        with(&t.install,|s|prepare(s,&t.install,101)).unwrap();
+        let observed=read(&t.install).unwrap().projects["project-1"].clone();
+        let authority=crate::host::Policy::read(&t.install).unwrap();
+        assert_eq!(observed.policy,authority.cap.json());
+        assert_eq!(observed.revision,authority.revision().unwrap());
+        assert_ne!(observed.policy,crate::service::capacity(&serde_json::from_str(&before).unwrap(),&t.me).unwrap().json());
+        assert!(report(&t.install,101).unwrap().iter().any(|s|s.contains("remote writes unsupported")));
+        let mut remote=submit("host-schema",json!({"runtime_limit":0}));
+        remote["expected_revision"]=json!(observed.revision);
+        remote["policy_schema"]=json!("taskq.host-capacity/1");
+        with(&t.install,|s|decide(&t.install,s,&remote,(INST,1),true,101,&fence)).unwrap();
+        assert_eq!(receipt_of(&t,"host-schema")["reason"],"unsupported");
+        fs::write(t.install.join("host.json"),"{\"limits\":{\"codex\":5}}").unwrap();
+        with(&t.install,|s|prepare(s,&t.install,102)).unwrap();
+        let changed=read(&t.install).unwrap().projects["project-1"].clone();
+        assert_ne!(changed.revision,observed.revision);
+        assert_eq!(changed.revision,crate::host::Policy::read(&t.install).unwrap().revision().unwrap());
+        for (file,body) in [("host.json","broken"),("host.json.pending","retained")] {
+            fs::write(t.install.join(file),body).unwrap();
+            with(&t.install,|s|prepare(s,&t.install,103)).unwrap();
+            assert!(read(&t.install).unwrap().projects["project-1"].policy.is_null(),"no legacy fallback from {file}");
+        }
+        assert_eq!(config(&t),before);
+        fs::remove_dir_all(t.base).unwrap();
+    }
+
+    // Chain: legacy saved write -> host cutover -> matching old project readback cannot imply host application.
+    #[test]
+    fn host_cutover_keeps_legacy_saved_outcome_unknown() {
+        let t=setup("host-cutover");let fence=Fence {clock:&||100,live:&||true};
+        with(&t.install,|s|decide(&t.install,s,&submit("old",json!({"runtime_limit":0})),(INST,1),true,100,&fence)).unwrap();
+        assert_eq!(receipt_of(&t,"old")["state"],"saved");
+        let old=read(&t.install).unwrap().projects["project-1"].policy.clone();
+        fs::write(crate::dot(&t.root).join("status.json"),json!({"at":101,"host":t.me,"capacity":old}).to_string()).unwrap();
+        fs::write(t.install.join("host.json"),"{\"limits\":{\"codex\":0}}").unwrap();
+        with(&t.install,|s|prepare(s,&t.install,101)).unwrap();
+        assert_eq!(receipt_of(&t,"old")["state"],"unknown");
+        assert!(receipt_of(&t,"old")["effective_revision"].is_null());
         fs::remove_dir_all(t.base).unwrap();
     }
 

@@ -92,31 +92,31 @@ pub struct Snapshot {
 
 /// The one snapshot function: open tasks by priority then number, plus host heartbeats.
 pub fn from_views(source: &'static str, b: &dyn Board, cfg: &Config, observed: i64, views: &[View], hosts: &[board::Issue]) -> Snapshot {
-    let mut open: Vec<&View> = views.iter().filter(|v| v.task.state != State::Closed).collect();
+    let mut open: Vec<&View> = views.iter().filter(|v| v.projection.task.state != State::Closed).collect();
     open.sort_by_key(|v| (service::priority(&v.issue), v.issue.number));
     let urls = session_urls(hosts);
     let tasks = open.into_iter().map(|v| {
-        let executions:Vec<_>=crate::core::executions(v.issue.number,&v.log).iter().filter(|x|x.release.is_none())
+        let executions:Vec<_>=v.projection.executions.iter().filter(|x|x.release.is_none())
             .map(|x|execution_status(v.issue.number,x,hosts,observed,cfg.ttl)).collect();
         Row {
         n: v.issue.number,
         title: v.issue.title.clone(),
         labels: v.issue.labels.clone(),
         url: b.url(v.issue.number),
-        task: v.task.clone(),
-        revision: crate::core::revision(v.issue.number, &v.log),
-        execution_wait: executions.iter().find(|x|x["state"]!="running" || x["attempt"].as_u64()!=v.task.attempt)
+        task: v.projection.task.clone(),
+        revision: v.projection.revision,
+        execution_wait: executions.iter().find(|x|x["state"]!="running" || x["attempt"].as_u64()!=v.projection.task.attempt)
             .map(|x|format!("execution {} on {}: {}: {}",x["id"],x["host"].as_str().unwrap_or("?"),
                 x["state"].as_str().unwrap_or("unknown"),x["reason"].as_str().unwrap_or("observation unavailable")))
-            .or_else(|| crate::core::executions(v.issue.number, &v.log).into_iter().find(|x| Some(x.attempt) == v.task.attempt && !v.task.inbox.is_empty()
+            .or_else(|| v.projection.executions.iter().find(|x| Some(x.attempt) == v.projection.task.attempt && !v.projection.task.inbox.is_empty()
                 && x.release == Some(crate::core::Release::Exit) && !x.accepted)
                 .map(|x| format!("execution {} on {}: input acceptance unknown; reconcile native input", x.id, x.host))),
         executions,
         deps: v.blockers.clone(),
-        session_url: v.task.attempt.zip(v.task.session.as_deref().and_then(|s| s.rsplit(' ').next()))
-            .filter(|_| v.task.session.as_deref().is_some_and(|s| s.starts_with("claude:")))
+        session_url: v.projection.task.attempt.zip(v.projection.task.session.as_deref().and_then(|s| s.rsplit(' ').next()))
+            .filter(|_| v.projection.task.session.as_deref().is_some_and(|s| s.starts_with("claude:")))
             .and_then(|(a, h)| urls.get(&(h.to_string(), a)).cloned()),
-        failed: (v.task.state == State::Failed).then(|| v.comments.iter().rev().find(|c| c.trusted && c.body.starts_with("taskq: failed")).and_then(|c| c.body.split_once('\n')).map(|x| x.1.to_string()).unwrap_or_default()),
+        failed: (v.projection.task.state == State::Failed).then(|| v.comments.iter().rev().find(|c| c.trusted && c.body.starts_with("taskq: failed")).and_then(|c| c.body.split_once('\n')).map(|x| x.1.to_string()).unwrap_or_default()),
     }}).collect();
     let hosts = hosts.iter().map(|h| Host {
         name: h.title.trim_start_matches("taskq host ").to_string(),

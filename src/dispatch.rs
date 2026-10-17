@@ -132,8 +132,8 @@ fn act_as(b: &dyn Board, root: &Path, n: u64, kind: &str, args: &[&str], text: &
         Ok(x) => x,
         Err(e) => return Receipt { outcome: "unknown", ..Receipt::rejected(n, op, e) },
     };
-    let before = fold(n, &log, deps);
-    let rev = core::revision(n, &log);
+    let projection = core::project(n, &log, deps);
+    let (before, rev) = (projection.task, projection.revision);
     let accepted = |s: State, rev: u64| Receipt::accepted(n, op, s, rev);
     if let Some(id) = &op.id
         && log.iter().any(|e| !e.edited && core::op_id(n, &e.body) == Some(id.as_str()))
@@ -174,16 +174,19 @@ fn act_as(b: &dyn Board, root: &Path, n: u64, kind: &str, args: &[&str], text: &
     log.sort_by_key(|e| e.id);
     let Some(i) = log.iter().position(|e| e.id == id) else { return unknown(format!("comment {id} not read back")) };
     // lost: an earlier entry moved the revision, or `fold` ignores this one (a raced op id included)
-    if op.revision.is_some_and(|r| r != core::revision(n, &log[..i])) || fold(n, &log[..i], deps) == fold(n, &log[..=i], deps) {
+    let before_write = core::project(n, &log[..i], deps);
+    if op.revision.is_some_and(|r| r != before_write.revision) || before_write.task == fold(n, &log[..=i], deps) {
         // the losing entry edits itself: an edited entry is ignored by this and older versions alike (§ 2, § 8)
         if let Err(e) = b.edit_comment(n, id, &format!("{body}\n\nignored: another write won")) {
             return unknown(e);
         }
         log[i].edited = true;
-        let (t, rev) = (fold(n, &log, deps), core::revision(n, &log));
+        let projection = core::project(n, &log, deps);
+        let (t, rev) = (projection.task, projection.revision);
         return Receipt { state: Some(t.state.name()), revision: Some(rev), ..Receipt::new(n, op, "stale", "another write won; this entry is ignored", format!("Read `taskq inbox {n}`; current revision is {rev}.")) };
     }
-    let (t, rev) = (fold(n, &log, deps), core::revision(n, &log));
+    let projection = core::project(n, &log, deps);
+    let (t, rev) = (projection.task, projection.revision);
     if let Err(e) = service::project(b, &issue, &t) {
         return unknown(e);
     }
@@ -379,7 +382,8 @@ pub fn proposal(b: &dyn Board, me: &str, kids: &Result<Vec<serde_json::Value>, S
     for i in b.issues(None)?.iter().filter(|i| service::is_task(i)) {
         let n = i.number;
         let log = entries(b, n)?;
-        let t = fold(n, &log, false);
+        let projection = core::project(n, &log, false);
+        let t = &projection.task;
         let (Some(a), Some(h)) = (t.attempt, service::host_of(&t)) else { continue };
         if h != me || !matches!(t.state, State::Doing | State::Review) {
             continue;
@@ -392,7 +396,7 @@ pub fn proposal(b: &dyn Board, me: &str, kids: &Result<Vec<serde_json::Value>, S
             Ok(Some(k)) => Ok(format!("running pid {}", k["pid"])),
         };
         let (live, revision) = match live {
-            Ok(l) => (l, Some(core::revision(n, &log))),
+            Ok(l) => (l, Some(projection.revision)),
             Err(e) => (format!("unknown ({e})"), None),
         };
         rows.push(Row { task: n, state: t.state.name(), attempt: a, live, revision });

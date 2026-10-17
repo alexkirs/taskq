@@ -637,7 +637,7 @@ fn specq_dir(root: &Path, revision: &str) -> PathBuf {
 }
 
 fn refused(what: &str, e: impl std::fmt::Display) -> StartError {
-    StartError { message: format!("rules {what}: {e}"), reportable: false, no_start: true }
+    StartError::from(format!("rules {what}: {e}"))
 }
 
 fn revision_id(text: &str) -> bool {
@@ -928,7 +928,7 @@ fn turn_input(root: &Path, text: &str, launch:Option<&Launch>) -> Result<(PathBu
     let mut file = options.open(&path).map_err(|e| e.to_string())?;
     file.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
     file.sync_all().map_err(|e| e.to_string())?;
-    let file = crate::data::InputLock::new(file).map_err(|e| e.to_string())?;
+    let file = coreq::file_lock::try_lock_shared_file(file).map_err(|e| e.to_string())?;
     Ok((path, file))
 }
 
@@ -972,7 +972,7 @@ fn recovery_binding(root:&Path,task:u64,x:&crate::core::Execution)->Result<(Path
     }
     let binding=binding.ok_or("exact execution input binding missing; inspect original submission")?;
     let file=File::open(&path).map_err(|e|e.to_string())?;
-    let lock=crate::data::InputLock::new(file).map_err(|e|e.to_string())?;
+    let lock=coreq::file_lock::try_lock_shared_file(file).map_err(|e|e.to_string())?;
     Ok((log,binding,lock))
 }
 
@@ -1010,21 +1010,23 @@ fn turn_text(env: &Env, l: &Launch, fetch: impl FnMut(&str) -> Result<String, St
 #[derive(Debug)]
 pub struct StartError {
     message: String,
+    class: &'static str,
     pub reportable: bool,
     pub no_start: bool,
 }
 
 impl StartError {
+    pub fn class(&self)->&'static str {self.class}
     pub fn io(error: std::io::Error, runtime: Option<&str>) -> Self {
         use std::io::ErrorKind;
         let reportable = matches!(error.kind(), ErrorKind::Other | ErrorKind::InvalidData | ErrorKind::UnexpectedEof | ErrorKind::BrokenPipe);
         let message = runtime.map_or_else(|| error.to_string(), |rt| format!("{rt}: {error}"));
-        Self { message, reportable, no_start: true }
+        Self { message, class:crate::profile::io_class(&error), reportable, no_start: true }
     }
 }
 
 impl From<String> for StartError {
-    fn from(message: String) -> Self { Self { message, reportable: false, no_start: true } }
+    fn from(message: String) -> Self { Self { class:crate::profile::class(&message), message, reportable: false, no_start: true } }
 }
 impl From<&str> for StartError {
     fn from(message: &str) -> Self { message.to_string().into() }
@@ -1038,7 +1040,7 @@ impl std::fmt::Display for StartError {
 /// Prepare stdin before spawn: a child that never reads cannot block its execution owner.
 pub fn start_command(command: &mut Command, root: &Path, text: &str) -> Result<Box<dyn Proc>, StartError> {
     coreq::telemetry::capture::operation("runtime.launch", || {
-        let (path, _input) = turn_input(root, text, None).map_err(|message| StartError { message, reportable: false, no_start: true })?;
+        let (path, _input) = turn_input(root, text, None).map_err(StartError::from)?;
         let input = File::open(path).map_err(|e| StartError::io(e, None))?;
         coreq::telemetry::capture::inherit_context(command);
         command.stdin(input);
@@ -1052,14 +1054,14 @@ pub fn access(env: &Env, rt: &str) -> Result<crate::policy::Effective, StartErro
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from).unwrap_or_default();
     let a = crate::policy::resolve(&crate::policy::load(env.install), &crate::policy::Host::here(env.install, env.root, &home), rt, env.permission_mode, env.codex);
     match &a.refused {
-        Some(r) => Err(StartError { message: format!("access refused: {r}"), reportable: false, no_start: true }),
+        Some(r) => Err(StartError { message: format!("access refused: {r}"), class:"permission", reportable: false, no_start: true }),
         None => Ok(a),
     }
 }
 
 /// Start the child with its stdout and stderr in the attempt log; `codex-app` starts its handshake child (§ 8).
 pub fn spawn(env: &Env, l: &Launch) -> Result<Box<dyn Proc>, StartError> {
-    crate::profile::measure("spawn", || spawn_inner(env, l))
+    crate::profile::measure_classified("spawn", || spawn_inner(env, l),StartError::class)
 }
 
 fn spawn_inner(env: &Env, l: &Launch) -> Result<Box<dyn Proc>, StartError> {
@@ -1071,7 +1073,7 @@ fn spawn_inner(env: &Env, l: &Launch) -> Result<Box<dyn Proc>, StartError> {
     let log = log_path(env.root, l);
     rules_line(&log, phase, &text).map_err(|e| StartError::io(e, None))?;
     if l.rt == "codex-app" {
-        let (text, input_file, path) = app_input(env.root, &text, Some(l)).map_err(|message| StartError { message, reportable: false, no_start: true })?;
+        let (text, input_file, path) = app_input(env.root, &text, Some(l)).map_err(StartError::from)?;
         let binding=bind_input(&log,l,&path,&text,serde_json::json!({"thread":l.session}))?;
         let mut turn = AppTurn { root: env.root.canonicalize().map_err(|e| StartError::io(e,None))?, history:AppHistory::default(), hand: None, log, text, _input: Some(input_file), binding:Some(binding), thread: l.session.clone(), done: 0, rollout: None, running: app_running, control:app_cancel, cancelled: false, queue_error: None, accepted: false };
         match &l.resume {
@@ -1082,7 +1084,7 @@ fn spawn_inner(env: &Env, l: &Launch) -> Result<Box<dyn Proc>, StartError> {
         }
         return Ok(Box::new(turn));
     }
-    if l.rt == "claude" && (l.resume.is_none() || claude_background(env.root, &l.session).map_err(|message| StartError { message, reportable: false, no_start: true })?) {
+    if l.rt == "claude" && (l.resume.is_none() || claude_background(env.root, &l.session).map_err(StartError::from)?) {
         return ClaudeTurn::start(env, l, &log, &text, &access).map(|p| Box::new(p) as Box<dyn Proc>);
     }
     let pos = std::fs::metadata(&log).map_or(0, |m| m.len());
@@ -1110,7 +1112,7 @@ fn start(env: &Env, l: &Launch, log: &Path, text: &str, access: &crate::policy::
     std::fs::create_dir_all(log.parent().unwrap()).map_err(|e| StartError::io(e, None))?;
     let out = File::options().create(true).append(true).open(log).map_err(|e| StartError::io(e, None))?;
     let err = out.try_clone().map_err(|e| StartError::io(e, None))?;
-    let mut c = command(env, l, access).map_err(|message| StartError { message, reportable: false, no_start: true })?;
+    let mut c = command(env, l, access).map_err(StartError::from)?;
     start_command(c.stdout(out).stderr(err), env.root, text)
 }
 
@@ -1371,7 +1373,8 @@ impl ClaudeTurn {
             Err(e)=>{
                 use coreq::process::Failure;
                 if matches!(e,Failure::InvalidDeadline|Failure::Capacity|Failure::Owner(_)|Failure::Spawn(_)|Failure::InputLimit) {
-                    return Err(StartError {message:format!("Claude background launch: {e}"),reportable:false,no_start:true});
+                    let class=match &e {Failure::Spawn(error)=>crate::profile::io_class(error),Failure::InvalidDeadline|Failure::InputLimit=>"invalid",_=>"other"};
+                    return Err(StartError {message:format!("Claude background launch: {e}"),class,reportable:false,no_start:true});
                 }
                 self.launch_error=Some(format!("Claude background launch outcome unknown: {e}; reconcile the original input"));
                 return Ok(());
@@ -2028,7 +2031,7 @@ mod tests {
             let launch=Launch {execution:Some(attempt),task,title:String::new(),attempt,role:"worker".into(),rt:"codex".into(),session:"fixture".into(),url:String::new(),resume:None};
             let mut proc=CliTurn {proc:child,log,pos:0,start:0,stopping:false,accepted:false,read_error:None,native:Some(native.clone()),recovery:None};
             proc.checkpoint(&cfg,&launch,attempt).unwrap();
-            service.kids.push(crate::service::Kid {task,attempt,execution:attempt,rt:"codex".into(),proc:Box::new(proc)});
+            service.kids.push(crate::service::Kid { unknown:None, stopping:false, session_url:None,task,attempt,execution:attempt,rt:"codex".into(),proc:Box::new(proc)});
             crate::data::kids(&std::fs::read_to_string(crate::kids_path(&cfg.install,&root).unwrap()).unwrap()).unwrap();
             coreq::write_durable(&root.join("ready"),&serde_json::json!({"pid":native.pid,"started":native.started}).to_string()).unwrap();
             let until=std::time::Instant::now()+std::time::Duration::from_secs(10);
@@ -2205,7 +2208,7 @@ mod tests {
             assert!(!execution_live(&saved[0]).unwrap());assert_eq!(sentinel.exited(),Ok(None),"another execution's job must remain live");
             sentinel.kill().unwrap();
             while sentinel.exited().unwrap().is_none() {assert!(std::time::Instant::now()<until,"sentinel cleanup not confirmed");std::thread::sleep(std::time::Duration::from_millis(10));}
-            service.kids.push(crate::service::Kid {task,attempt,execution:attempt,rt:"codex".into(),proc});
+            service.kids.push(crate::service::Kid { unknown:None, stopping:false, session_url:None,task,attempt,execution:attempt,rt:"codex".into(),proc});
             board.state.borrow_mut().fail_comments=1;service.reap_owned();assert_eq!(service.kids.len(),1,"failed terminal receipt retains ownership");
             service.reap_owned();assert!(service.kids.is_empty());assert!(crate::kids_file(&cfg.install,&root).unwrap().is_empty());
             assert_eq!(crate::core::executions(task,&crate::board::entries(&board,task).unwrap())[0].release,Some(crate::core::Release::Exit));
@@ -2325,6 +2328,11 @@ mod tests {
             let error = StartError::io(Error::new(kind, "unchanged diagnostic"), Some("claude"));
             assert!(!error.reportable, "{kind:?}");
             assert_eq!(error.to_string(), "claude: unchanged diagnostic");
+            let expected=match kind {ErrorKind::PermissionDenied=>"permission",ErrorKind::TimedOut=>"timeout",ErrorKind::InvalidInput=>"invalid",_=>"other"};
+            crate::profile::take_report();
+            let result=crate::profile::measure_classified("spawn",||Err::<(),_>(error),StartError::class).unwrap_err();
+            assert_eq!(result.to_string(),"claude: unchanged diagnostic");
+            assert!(crate::profile::take_report().contains(&format!("{expected}:1")));
         }
         assert!(StartError::io(Error::other("internal launch fault"), None).reportable);
     }
@@ -2793,7 +2801,7 @@ mod tests {
         let input_path=evidence.join("input.txt");let input=std::fs::read_to_string(&input_path).unwrap();
         let log=evidence.join("candidate-readback.log");File::create(&log).unwrap();
         let mut turn=ClaudeTurn {root,log,session:String::new(),id:String::new(),announced:false,accepted:false,history:ClaudeHistory::default(),before:0,
-            mode:"inherited-probe".into(),input,_input_file:crate::data::InputLock::new(File::open(input_path).unwrap()).unwrap(),pid,native:Some(coreq::process::Identity {pid,started:identity["started"].as_str().unwrap().into()}),recovery:None,done:false,failure:None,launch_error:Some("fixture: launch reply lost".into())};
+            mode:"inherited-probe".into(),input,_input_file:coreq::file_lock::try_lock_shared_file(File::open(input_path).unwrap()).unwrap(),pid,native:Some(coreq::process::Identity {pid,started:identity["started"].as_str().unwrap().into()}),recovery:None,done:false,failure:None,launch_error:Some("fixture: launch reply lost".into())};
         assert_eq!(turn.exited(),Ok(Some(0)));
         assert_eq!(turn.accepted(),Ok(true));assert_eq!(turn.id,result["job"].as_str().unwrap());
         assert_eq!(turn.session,result["session"].as_str().unwrap());
@@ -2885,7 +2893,7 @@ mod tests {
         File::create(&log).unwrap();
         let mut t = ClaudeTurn { root:root.clone(), log, session:uuid(),
             id: "c37eb75a".into(), announced: false, accepted:false, history:ClaudeHistory::default(), before: 0, mode: "dontAsk".into(),
-            input: "invented input".into(), _input_file: crate::data::InputLock::new(File::open(std::env::current_exe().unwrap()).unwrap()).unwrap(), pid: 0, native:None, recovery:None, done: false, failure: None, launch_error:None };
+            input: "invented input".into(), _input_file: coreq::file_lock::try_lock_shared_file(File::open(std::env::current_exe().unwrap()).unwrap()).unwrap(), pid: 0, native:None, recovery:None, done: false, failure: None, launch_error:None };
         assert!(native_job_id(&t.id));
         assert!(native_job_id(&uuid()));
         for id in ["--all","../c37eb75a","c37eb75a --all","invented-job",""] {assert!(!native_job_id(id));}

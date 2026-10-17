@@ -16,21 +16,7 @@ pub const INCIDENTS: usize = 50;
 /// `<root>/.taskq/inputs/*.txt`: newest by mtime plus locked Claude/App files; CLI stdin owns an open read handle.
 pub const INPUTS: usize = 50;
 /// A turn owns the lock, even when a forked child still holds a copy of its descriptor.
-pub struct InputLock(fs::File);
-
-impl InputLock {
-    pub fn new(file: fs::File) -> std::io::Result<Self> {
-        file.try_lock_shared()?;
-        Ok(Self(file))
-    }
-}
-
-impl Drop for InputLock {
-    fn drop(&mut self) {
-        // Closing alone leaves the lock held by descriptors inherited across fork.
-        let _ = self.0.unlock();
-    }
-}
+pub type InputLock = coreq::file_lock::Lock;
 
 /// Lines of `<root>/.taskq/requests/comments`: past it the newest half and every comment still pending stay.
 pub const COMMENT_IDS: usize = 1000;
@@ -308,7 +294,7 @@ mod tests {
                 std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(i)).unwrap();
         }
         let active = fs::File::options().read(true).write(true).open(dir.join("0.txt")).unwrap();
-        let active = InputLock::new(active).unwrap();
+        let active = coreq::file_lock::try_lock_shared_file(active).unwrap();
         fs::write(root.join(".taskq/T7-42.log"),format!("{}\n",serde_json::json!({"type":"taskq.input","task":7,"attempt":42,"execution":44,"runtime":"claude","path":dir.join("1.txt")}))).unwrap();
         prune(&root, &root.join("install"), "p", &[42]);
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 52);
@@ -340,7 +326,7 @@ mod tests {
         let root = temp("inputs-fork");
         let path = root.join("input.txt");
         let file = fs::File::options().read(true).write(true).create_new(true).open(&path).unwrap();
-        let held = InputLock::new(file).unwrap();
+        let held = coreq::file_lock::try_lock_shared_file(file).unwrap();
         let mut pipe = [0; 2];
         assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
         let pid = unsafe { libc::fork() };

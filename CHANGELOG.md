@@ -3,6 +3,12 @@
 Per release: what changed on the board and what each open issue needs. A cutover agent reads this (taskq.md § 9);
 there is no migration code. Releases without a **Board** section need nothing.
 
+## v4.6.0
+
+Host service policy, exact execution ownership and command receipts share the supported CLI/tray paths. Host resource observations use the actual host revision; remote host mutation remains unsupported. Board comments remain task truth.
+
+JavaScript uses ordinary shared modules with built-in bounded telemetry. Live capture and reports use the shared CoreQ store, preserving legacy import and original receipt-clock retention. Closed diagnostic output cannot interrupt native cleanup. Board snapshots reduce each unchanged history once. No board format change.
+
 ## v4.5.0
 
 Local telemetry uses bundled SQLite/WAL, with FULL durability, 30 days from receipt and a 64 MiB total bound including database sidecars. All five record kinds, reports and JSONL export keep their schemas. `taskq profile guide` prints the embedded offline analysis guide. Collection needs no server connection. No board change.

@@ -373,27 +373,29 @@ impl Api {
         }
         self.budget.borrow_mut().count(op.into());
         crate::requests::tally(op);
-        crate::profile::measure("forge.call", || {
+        crate::profile::measure_classified("forge.call", || {
             #[cfg(test)]
-            let r = match &self.transport { Some(transport) => transport(method, &url, body)?, None => curl(method, &url, &self.auth, body.as_ref())? };
+            let r = match &self.transport { Some(transport) => transport(method, &url, body), None => curl(method, &url, &self.auth, body.as_ref()) };
             #[cfg(not(test))]
-            let r = curl(method, &url, &self.auth, body.as_ref())?;
+            let r = curl(method, &url, &self.auth, body.as_ref());
+            let r=r.map_err(|message|(crate::profile::class(&message),message))?;
             if let Some(t) = r.header("date").and_then(http_date) {
                 *self.clock.borrow_mut() = t;
             }
             // GitHub GraphQL refuses an exhausted budget with HTTP 200 and a RATE_LIMITED error
             let status = if url.ends_with("/graphql") && r.status == 200 && r.body.contains("\"RATE_LIMITED\"") { 403 } else { r.status };
+            let class=match status {400..=499=>"http4xx",500..=599=>"http5xx",_=>"other"};
             let paused = self.budget.borrow_mut().observe(status, |n| r.header(n).map(String::from), *self.clock.borrow(), std::time::Instant::now());
             if let Some(reset) = paused {
-                return Err(format!("{method} {url}: HTTP {status} {}", crate::requests::paused_text(reset)));
+                return Err((class,format!("{method} {url}: HTTP {status} {}", crate::requests::paused_text(reset))));
             }
             if !(200..300).contains(&r.status) {
                 // one log line: a multi-line error body folds into it (§ 4)
                 let body = r.body.split_whitespace().collect::<Vec<_>>().join(" ");
-                return Err(format!("{method} {url}: HTTP {} {}", r.status, body.chars().take(300).collect::<String>()));
+                return Err((class,format!("{method} {url}: HTTP {} {}", r.status, body.chars().take(300).collect::<String>())));
             }
             Ok(r)
-        })
+        },|error|error.0).map_err(|(_,message)|message)
     }
 
     /// The full path of `repo` in a `Depends on <repo>#N` (§ 1); a bare name is under this board's owner. `sep` ends the
@@ -1030,7 +1032,7 @@ mod tests {
     fn forge_outcomes_reach_profile_report() {
         crate::profile::take_report();
         for (status, body, limited) in [(200, "{}", false), (204, "", false), (404, "private response", false),
-            (503, "private response", false), (200, "{\"errors\":[{\"type\":\"RATE_LIMITED\"}]}", true)] {
+            (503, "private response HTTP 404", false), (200, "{\"errors\":[{\"type\":\"RATE_LIMITED\"}]}", true)] {
             let mut api = (github::KIND.api)("github.com", "o/r", "private token");
             api.transport = Some(Box::new(move |_, _, _| Ok(Reply { status, body: body.into(), operation: "read",
                 headers: if limited { vec![("retry-after".into(), "60".into())] } else { vec![] } })));

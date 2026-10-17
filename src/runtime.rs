@@ -396,7 +396,7 @@ pub fn which(name: &str) -> PathBuf {
 }
 
 /// An npm launcher is not the executor: SIGKILL cannot reach the native child through Node.
-fn codex_native(bin: PathBuf) -> Result<PathBuf,String> {
+pub(crate) fn codex_native(bin: PathBuf) -> Result<PathBuf,String> {
     if cfg!(windows) || !bin.exists() { return Ok(bin); }
     let bin=bin.canonicalize().map_err(|e|format!("Codex executable unavailable: {e}"))?;
     let native=|path:&Path|->Result<bool,String> {

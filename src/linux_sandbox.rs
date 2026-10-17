@@ -44,7 +44,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         .ok_or("linux sandbox: explicit project grant required")?;
     if g.mode != *mode && !(g.mode == "workspace" && mode == "restricted") { return Err("linux sandbox: grant changed or does not permit this mode".into()); }
     let bin = Path::new(&args[3]).canonicalize().map_err(|e| e.to_string())?;
-    if bin != crate::runtime::which("codex").canonicalize().map_err(|e| e.to_string())? || args[4] != "exec" || args[5..].iter().any(|a| ["danger-full-access", "--yolo", "--dangerously-bypass-approvals-and-sandbox"].contains(&a.as_str())) {
+    if bin != crate::runtime::codex_native(crate::runtime::which("codex"))?.canonicalize().map_err(|e| e.to_string())? || args[4] != "exec" || args[5..].iter().any(|a| ["danger-full-access", "--yolo", "--dangerously-bypass-approvals-and-sandbox"].contains(&a.as_str())) {
         return Err("linux sandbox: only bounded Codex exec allowed".into());
     }
     let home = PathBuf::from(std::env::var_os("HOME").ok_or("linux sandbox: HOME missing")?);

@@ -950,9 +950,10 @@ mod tests {
         let original = format!("canary-{}\n", crate::runtime::uuid());
         fs::write(root.join("input.txt"), &original).unwrap();
         fs::create_dir_all(dir(&root)).unwrap();
-        let install = root.join("fixture-install");
+        let install = crate::platform::default_install();
+        assert!(std::env::var_os("TASKQ_INSTALL").is_some() && (install == root.join("fixture-install") || install == root.parent().unwrap().join("install")), "set TASKQ_INSTALL to this fixture's nested or sibling installation");
         fs::create_dir_all(&install).unwrap();
-        assert_eq!(crate::platform::default_install(), install, "set TASKQ_INSTALL to the isolated fixture-install path");
+        if !install.join("token").exists() { fs::write(install.join("token"), "owned-fixture-not-a-credential").unwrap(); }
         fs::write(install.join("host.json"), json!({"limits": {rt.clone():1}, "permission_mode":"dontAsk", "codex":["-s","workspace-write","-c","sandbox_workspace_write.network_access=true"]}).to_string()).unwrap();
         fs::write(install.join("projects"), format!("{}\n", root.display())).unwrap();
         let exe = std::env::current_exe().unwrap();
@@ -985,6 +986,9 @@ mod tests {
         let mut config = read(&install.join("host.json"));
         config["limits"][&rt] = json!(0);
         fs::write(install.join("host.json"), config.to_string()).unwrap();
+        let mut project = read(&root.join("taskq.json"));
+        project["limits"][&rt] = json!(0);
+        fs::write(root.join("taskq.json"), project.to_string()).unwrap();
         fs::write(dir(&root).join("3.json"), json!({"after":"2", "text":"Read input.txt again."}).to_string()).unwrap();
         step(&root, &install, &exe, Some(&rt));
         let disabled = wait("3");

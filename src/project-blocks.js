@@ -55,7 +55,8 @@ task:function(p,row,global=false){
     // Adapters supply session URLs: an account-scoped https link on any host, a codex:// thread only on its owning host.
     const target=url(row.session_url,!!row.local_session);
     const session=target?link(row.session_url,icon('terminal'),'Open '+(rt||'agent')+' session',true):row.host?'<small'+(row.session_reason?' title="'+esc(row.session_reason)+'"':'')+'>'+(remote?'Session unavailable':'Session starting or unavailable')+'</small>':'';
-    return '<div class="tqp tqp-task"><div class="tqp-task-head"><span class="'+kind+'" title="'+esc(name)+'" aria-label="'+esc(name)+'">'+icon(mark)+'</span> '+link(row.url,icon(p.board.kind)+' #'+esc(row.n),'Open task #'+row.n)+' <span class="tqp-meta">'+metadata+'</span> '+session+'</div><div class="tqp-task-title">'+esc(row.title)+'</div></div>';
+    const wait=row.execution_wait?'<small class="tqp-execution-wait" role="status">'+esc(row.execution_wait)+'</small>':'';
+    return '<div class="tqp tqp-task"><div class="tqp-task-head"><span class="'+kind+'" title="'+esc(name)+'" aria-label="'+esc(name)+'">'+icon(mark)+'</span> '+link(row.url,icon(p.board.kind)+' #'+esc(row.n),'Open task #'+row.n)+' <span class="tqp-meta">'+metadata+'</span> '+session+' '+wait+'</div><div class="tqp-task-title">'+esc(row.title)+'</div></div>';
   },
 handle:function(event,adapter){
     const el=event.target.closest('[data-tqp],.tqp a[data-url]');

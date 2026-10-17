@@ -19,6 +19,11 @@ assert(q.task(p,{...row,title:'<script>alert(1)</script>',url:'javascript:alert(
 assert(!q.task(p,{...row,url:'javascript:alert(1)'}).includes('href="javascript:'));
 assert(!q.task(p,{...row,local_session:false}).includes('codex://'));
 assert(q.task(p,{...row,local_session:false,session_reason:'Codex session opens only on WIN'}).includes('title="Codex session opens only on WIN">Session unavailable'));
+// R6/R12: the native snapshot's unresolved execution must remain visible in every shared task block.
+const waiting=require('./fixtures/status-snapshot.json').tasks.find(t=>t.n===2),waitRow=q.task(p,waiting);
+assert(waitRow.includes(waiting.execution_wait),'unknown execution reason is visible, not only a missing session link');
+assert(waitRow.indexOf(waiting.execution_wait)<waitRow.indexOf('tqp-task-title'),'execution status stays with metadata');
+assert(!q.task(p,{...row,execution_wait:'<script>secret</script>'}).includes('<script>'),'execution reason is escaped');
 // Chain: #1204 remote Claude row. Risk: the account-scoped link is dropped, or the remote mark follows the runtime mark or adds text.
 const remoteClaude=q.task(p,{...row,runtime:'claude',local_session:false,session_url:'https://claude.ai/code/session_014abc'});
 assert(remoteClaude.includes('href="https://claude.ai/code/session_014abc"'));

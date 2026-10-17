@@ -100,3 +100,23 @@ context.S.lifecycle.origin_instance='origin';context.S.lifecycle.native_exit=fal
 context.S.lifecycle.native_exit=true;context.lifecycleReadback();assert.equal(context.hostCommand.state,'observed');
 assert.match(context.lifecycleControl(context.S.projects[0],'stop'),/Recorded host exit observed/);
 console.log('PASS shared Stop scope, immutable action, no overlapping Restart, exact exit/origin receipts and retained autostart');
+// H-A5: a removed project must retain its exact result, including after its row disappears.
+context.hostCommand=null;context.S.lifecycle={state:'unknown'};
+const project=context.S.projects[0],uninstallReview={id:'review',action:'uninstall',project:project.root,instance:'origin',roots:context.S.projects.map(p=>p.root),issued_at:1000,expires_at:1300};
+project.uninstall_review=uninstallReview;
+assert.match(context.lifecycleControl(project,'uninstall'),/files and other projects stay/);
+context.lifecycleStart(project.root,'uninstall');const uninstall=sent.at(-1);
+assert.equal(uninstall.a,'uninstall');assert.equal(uninstall.project,project.root);assert.deepEqual(uninstall.roots,uninstallReview.roots);
+const removed={id:uninstall.id,action:'uninstall',project:project.root,origin_instance:'origin',service_instance:'origin',state:'observed',unregistered:true,received_receipt:receipt,applied_receipt:other,observed_receipt:observed};
+context.lifecycleReceipt({...removed,project:'/foreign'});assert.equal(context.hostCommand.state,'unknown');
+context.lifecycleReceipt({...removed,unregistered:false});assert.equal(context.hostCommand.state,'unknown');
+context.lifecycleReceipt(removed);assert.equal(context.hostCommand.state,'observed');
+context.S.projects=context.S.projects.slice(1);assert.match(context.actionNotices(),/Project removal observed/);
+context.hostCommand=null;context.S.lifecycle=removed;assert.match(context.actionNotices(),/Uninstall .*observed/,'reopened tray retains result without the project');
+const last=context.S.projects[0];last.uninstall_review={...uninstallReview,project:last.root,roots:[last.root]};
+assert.match(context.lifecycleControl(last,'uninstall'),/last host unit after exact exit/);
+context.lifecycleStart(last.root,'uninstall');const lastRequest=sent.at(-1),lastResult={...removed,id:lastRequest.id,project:last.root};
+context.lifecycleReceipt(lastResult);assert.equal(context.hostCommand.state,'unknown','last project also requires native exit and unit absence');
+context.lifecycleReceipt({...lastResult,native_exit:true,native_pid:731,native_started:'12345',unit_revision:'a'.repeat(64),unit_removed:true});
+assert.equal(context.hostCommand.state,'observed');assert.match(context.actionNotices(),/Host unit removal and exact exit observed/);
+console.log('PASS exact project Uninstall, foreign/partial refusal, last-unit exit proof and result after row removal');

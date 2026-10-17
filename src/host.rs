@@ -490,6 +490,7 @@ struct ServiceRecord {
     schema:u8,pid:u32,started:String,instance:String,at:u64,version:String,
     #[serde(default)] restart_protocol:Option<u8>,
     #[serde(default)] stop_protocol:Option<u8>,
+    #[serde(default)] uninstall_protocol:Option<u8>,
 }
 enum OwnerRecord { Legacy(u32), Current(ServiceRecord) }
 
@@ -509,14 +510,14 @@ fn service_record(install:&Path)->Res<Option<OwnerRecord>> {
     }
     let r:ServiceRecord=serde_json::from_str(&text).map_err(|_|"host service owner unknown: malformed record")?;
     if r.schema!=1||r.pid==0||r.pid>i32::MAX as u32||r.started.is_empty()||r.started.len()>128
-        ||!r.started.bytes().all(|c|c.is_ascii_alphanumeric()||c==b'-')||!crate::resources::id(&r.instance)||r.version.is_empty()||r.version.len()>80||r.restart_protocol.is_some_and(|v|v!=1)||r.stop_protocol.is_some_and(|v|v!=1) {
+        ||!r.started.bytes().all(|c|c.is_ascii_alphanumeric()||c==b'-')||!crate::resources::id(&r.instance)||r.version.is_empty()||r.version.len()>80||r.restart_protocol.is_some_and(|v|v!=1)||r.stop_protocol.is_some_and(|v|v!=1)||r.uninstall_protocol.is_some_and(|v|v!=1) {
         return Err("host service owner unknown: unsupported record; kept".into());
     }
     Ok(Some(OwnerRecord::Current(r)))
 }
 
 fn publish_service(install:&Path,native:&coreq::process::Identity,instance:&str)->Res<()> {
-    let record=ServiceRecord {schema:1,pid:native.pid,started:native.started.clone(),instance:instance.into(),at:wall()?,version:crate::platform::VERSION.into(),restart_protocol:Some(1),stop_protocol:Some(1)};
+    let record=ServiceRecord {schema:1,pid:native.pid,started:native.started.clone(),instance:instance.into(),at:wall()?,version:crate::platform::VERSION.into(),restart_protocol:Some(1),stop_protocol:Some(1),uninstall_protocol:Some(1)};
     crate::platform::write_atomic(&install.join("service"),&(serde_json::to_string(&record).map_err(|e|e.to_string())?+"\n"))
 }
 
@@ -542,7 +543,7 @@ pub fn service_status(install:&Path)->Value {
         let age=wall()?.checked_sub(r.at);
         let fresh=live&&age.is_some_and(|age|age<=60);
         Ok(json!({"state":if live {"running"}else{"exited"},"pid":r.pid,"started":r.started,"instance":r.instance,"version":r.version,
-            "at":r.at,"age_seconds":age,"fresh":fresh,"restart_protocol":r.restart_protocol,"stop_protocol":r.stop_protocol,"reason":if !live {Some("recorded host process exited; worker outcomes remain separate")}else if !fresh {Some("host observation stale or clock unknown")}else{None}}))
+            "at":r.at,"age_seconds":age,"fresh":fresh,"restart_protocol":r.restart_protocol,"stop_protocol":r.stop_protocol,"uninstall_protocol":r.uninstall_protocol,"reason":if !live {Some("recorded host process exited; worker outcomes remain separate")}else if !fresh {Some("host observation stale or clock unknown")}else{None}}))
     },|_|"owner-unknown");
     result.unwrap_or_else(|reason|json!({"state":"unknown","fresh":false,"reason":reason}))
 }
@@ -612,6 +613,7 @@ pub fn run(install: &Path) -> Res<()> {
     let mut threads: BTreeMap<PathBuf, std::thread::JoinHandle<Res<()>>> = BTreeMap::new();
     let mut roots = vec![];
     let mut stopped = BTreeSet::new();
+    let mut drained_roots = BTreeSet::new();
     let mut checked: Option<Instant> = None;
     let began = Instant::now();
     let mut hour = (Instant::now(), crate::requests::totals());
@@ -629,17 +631,19 @@ pub fn run(install: &Path) -> Res<()> {
         roots.clone_from(&registry.roots);
         let old = legacy(&roots);
         let policy = match &old { Ok(()) => migrate(install, &roots).and_then(|_| Policy::read(install)), Err(e) => Err(e.clone()) };
+        let removal=restart.current.as_ref().ok().and_then(Option::as_ref).and_then(|p|p.removal().map(Path::to_path_buf));
+        drained_roots.retain(|root|removal.as_ref()==Some(root));
         {
             let mut h = shared.lock().unwrap_or_else(|e| e.into_inner());
             h.reload(policy);
             h.held = registry.error.clone().or_else(|| old.as_ref().err().cloned()).or_else(||restart.current.as_ref().err().cloned())
                 .or_else(||publication.as_ref().map(|e|format!("host publication unavailable: {e}")));
             if let Some(p)=restart.current.as_ref().ok().and_then(Option::as_ref) {
-                if p.action()==crate::lifecycle::Action::Stop {
+                if p.stops() {
                     if !h.stopping {h.prepared.clear();}
                     h.restart=true;h.stopping=true;
                     if p.origin()!=instance {h.held=Some("Stop belongs to another host generation; reconcile original owner via service status --request".into());}
-                } else if p.origin()==instance {h.restart=true;}
+                } else if p.action()==crate::lifecycle::Action::Restart&&p.origin()==instance {h.restart=true;}
             }
             let now = h.elapsed();
             if h.gate.last.is_none_or(|l| now.saturating_sub(l.0) >= 30) {
@@ -649,8 +653,8 @@ pub fn run(install: &Path) -> Res<()> {
             }
             for root in threads.keys().filter(|p| !roots.contains(p)) { h.draining.insert(root.clone()); }
             for root in &roots {
-                h.draining.remove(root);
-                if threads.contains_key(root) || stopped.contains(root) { continue; }
+                if removal.as_ref()==Some(root) {h.draining.insert(root.clone());}else{h.draining.remove(root);}
+                if threads.contains_key(root) || stopped.contains(root)||drained_roots.contains(root) { continue; }
                 h.attach(root);
                 let root = root.clone();
                 let install = install.to_path_buf();
@@ -705,7 +709,7 @@ pub fn run(install: &Path) -> Res<()> {
             let drained = matches!(&outcome, Ok(Err(e)) if e == "project drained");
             let mut h = shared.lock().unwrap_or_else(|e| e.into_inner());
             h.publication(&root, false);
-            if drained { h.busy.remove(&root); h.prepared.remove(&root);h.recovered.remove(&root); }
+            if drained { h.busy.remove(&root); h.prepared.remove(&root);h.recovered.remove(&root);drained_roots.insert(root.clone()); }
             else {
                 // A reduced loop failed: its attempts expire on other hosts, and local launches hold for inspection.
                 stopped.insert(root.clone());
@@ -713,6 +717,14 @@ pub fn run(install: &Path) -> Res<()> {
                 h.recovered.remove(&root);
                 h.ready(&root, false);
                 append_project(install, &root, "project thread stopped; leases expire on other hosts; retained slots have unknown liveness");
+            }
+        }
+        if let Some(p)=restart.current.as_ref().ok().and_then(Option::as_ref).filter(|p|p.action()==crate::lifecycle::Action::Uninstall&&!p.stops()) {
+            let drained=p.removal().is_some_and(|root|drained_roots.contains(root));
+            if drained||p.removal().is_some_and(|root|!roots.iter().any(|p|p==root)) {
+                if let Err(error)=crate::lifecycle::finish_project_uninstall(install,p.id(),&instance,drained) {
+                    let _=crate::lifecycle::failed(install,p.id(),&error);if reported!=error {crate::platform::log(&error);reported=error;}
+                }
             }
         }
         let h = shared.lock().unwrap_or_else(|e| e.into_inner());
@@ -765,7 +777,7 @@ pub fn run(install: &Path) -> Res<()> {
                     std::thread::sleep(std::time::Duration::from_secs(1));continue;
                 }
                 if stopping {
-                    match crate::lifecycle::pending(install).and_then(|p|p.filter(|p|p.action()==crate::lifecycle::Action::Stop).ok_or("prepared Stop binding unavailable".into())) {
+                    match crate::lifecycle::pending(install).and_then(|p|p.filter(|p|p.stops()).ok_or("prepared Stop binding unavailable".into())) {
                         Ok(p)=>match crate::host_control::dispatch(install,&p) {
                         Ok(control)=>{shared.lock().unwrap_or_else(|e|e.into_inner()).stop_controller=Some(control);},
                         Err(e)=>{let _=crate::lifecycle::failed(install,p.id(),&e);crate::platform::log(&e);}
@@ -861,9 +873,15 @@ pub struct ProjectEdit {
 impl ProjectEdit {
     #[tracing::instrument(name="host.projects.prepare",skip_all)]
     pub fn new(install:&Path,root:&Path,adding:bool)->Res<Self> {
+        Self::with_guard(install,root,adding,||crate::lifecycle::registry_guard(install))
+    }
+    pub fn for_uninstall(install:&Path,root:&Path,id:&str)->Res<Self> {
+        Self::with_guard(install,root,false,||crate::lifecycle::uninstall_guard(install,id,root))
+    }
+    fn with_guard(install:&Path,root:&Path,adding:bool,guard:impl FnOnce()->Res<()>)->Res<Self> {
         fs::create_dir_all(install).map_err(|e|e.to_string())?;
         let lock=coreq::file_lock::try_lock(&install.join("projects.lock")).map_err(|e|format!("project registry busy or lock unavailable: {e}"))?;
-        crate::lifecycle::registry_guard(install)?;
+        guard()?;
         let path=install.join("projects");
         let original=project_text(install)?;
         if original.is_none() && !adding {return Err(format!("{}: project registry missing; nothing changed",path.display()));}
@@ -1038,7 +1056,7 @@ fn migrate_locked(install: &Path, roots: &[PathBuf]) -> Res<()> {
 }
 
 #[cfg(unix)]
-fn ownership(path: &Path) -> Res<Value> {
+pub(crate) fn ownership(path: &Path) -> Res<Value> {
     use std::os::unix::fs::MetadataExt;
     let m = fs::metadata(path).map_err(|e| e.to_string())?;
     if m.uid() != unsafe { libc::geteuid() } { return Err("migration needs owner: cannot preserve another user's file ownership".into()); }
@@ -1057,7 +1075,7 @@ fn stage_owner(path: &Path, owner: &Value) -> Res<()> {
 fn replace_project(path: &Path, stage: &Path) -> Res<()> { fs::rename(stage, path).map_err(|e| e.to_string()) }
 
 #[cfg(windows)]
-fn ownership(path: &Path) -> Res<Value> {
+pub(crate) fn ownership(path: &Path) -> Res<Value> {
     use std::os::windows::ffi::OsStrExt;
     #[link(name = "advapi32")]
     unsafe extern "system" { fn GetFileSecurityW(path: *const u16, info: u32, descriptor: *mut u8, size: u32, needed: *mut u32) -> i32; }

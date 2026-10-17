@@ -9,34 +9,36 @@ const api=execution.module("tray.create",{
 gutter:function(){if(ports.measureScrollbar)return ports.measureScrollbar();const d=document.createElement('div');d.style.cssText='position:absolute;top:-99px;width:60px;height:60px;overflow:scroll;scrollbar-width:thin';document.body.append(d);const g=d.offsetWidth-d.clientWidth;d.remove();return Math.ceil(g);},
 fit:function(){const size=view.manualSize||view.S.size,w=size?size[0]:view.S.font>=18?360:320;document.body.style.width='100%';menu.style.width=w+'px';send({a:'size',d:window.devicePixelRatio,g:size?0:gutter(),w,h:size?size[1]:Math.ceil(menu.getBoundingClientRect().height)});menu.style.width='100%';},
 actionReceipt:function(r){if(!view.S?.projects.some(p=>p.root===r.root))return;actionErrors.set(r.root,{text:r.text});present();},
-actionNotices:function(){return view.S.projects.filter(p=>actionErrors.has(p.root)).map(p=>'<div class="body alert" role="alert">'+esc(p.name)+': '+esc(actionErrors.get(p.root).text)+'</div>').join('');},
+actionNotices:function(){const r=view.hostCommand||view.S?.lifecycle;return view.S.projects.filter(p=>actionErrors.has(p.root)).map(p=>'<div class="body alert" role="alert">'+esc(p.name)+': '+esc(actionErrors.get(p.root).text)+'</div>').join('')+(r?.action==='uninstall'?'<div class="body meta" role="status">Uninstall '+esc(r.id||'')+': '+esc(r.state||'unknown')+(r.reason?' · '+esc(r.reason):'')+'</div>':'');},
 lifecycleStart:function(root,action='restart'){
   if(view.hostCommand&&!view.hostCommand.unknown&&view.hostCommand.state!=='observed')return;
-  const review=action==='stop'?view.S.stop_review:view.S.restart_review;
+  const review=action==='uninstall'?view.S.projects.find(p=>p.root===root)?.uninstall_review:action==='stop'?view.S.stop_review:view.S.restart_review;
   if(!review||typeof review.instance!=='string'||!Array.isArray(review.roots)){actionErrors.set(root,{text:review?.reason||'Lifecycle review unavailable; check host service status.'});present();return;}
   const id=Array.from(crypto.getRandomValues(new Uint8Array(16)),b=>b.toString(16).padStart(2,'0')).join('');
-  const item={id,root,action,instance:review.instance,state:'sending',unknown:false};view.hostCommand=item;actionErrors.delete(root);
-  defer(()=>{if(view.hostCommand!==item||item.state==='observed')return;item.unknown=true;item.state='unknown';item.reason=(action==='stop'?'Stop':'Restart')+' confirmation unknown; check service status for '+id+'.';present();},30000);
+  const item={id,root,project:review.project,action,stops:action==='uninstall'&&review.roots.length===1,instance:review.instance,state:'sending',unknown:false};view.hostCommand=item;actionErrors.delete(root);
+  defer(()=>{if(view.hostCommand!==item||item.state==='observed')return;item.unknown=true;item.state='unknown';item.reason=({stop:'Stop',uninstall:'Uninstall'}[action]||'Restart')+' confirmation unknown; check service status for '+id+'.';present();},30000);
   send({...review,id,a:action,root});present();
 },
 lifecycleReceipt:function(r){
   const item=view.hostCommand;if(!item||r.id!==item.id)return;
   if(!['queued','applied','observed'].includes(r.state)){item.unknown=true;item.state='unknown';item.reason=r.reason||'Lifecycle outcome unknown; check service status.';}
-  else if(r.state==='observed'&&!api.lifecycleObserved(r,item.id,item.instance,item.action)){item.unknown=true;item.state='unknown';item.reason='Lifecycle receipt is incomplete; check service status.';}
+  else if(r.state==='observed'&&!api.lifecycleObserved(r,item.id,item.instance,item.action,item.project,item.stops)){item.unknown=true;item.state='unknown';item.reason='Lifecycle receipt is incomplete; check service status.';}
   else {item.state=r.state;item.reason=r.reason||'';}
-  api.lifecycleReadback();present();
+  api.lifecycleReadback(r);present();
 },
-lifecycleObserved:function(r,id,origin,action='restart'){
+lifecycleObserved:function(r,id,origin,action='restart',project=null,stops=false){
   const receipts=(!r?.action||r.action===action)&&r?.id===id&&r.state==='observed'&&['received_receipt','applied_receipt','observed_receipt'].every(k=>typeof r[k]==='string'&&/^[a-f0-9]{32}$/.test(r[k]));
   if(!receipts)return false;
-  if(action==='stop')return r.action==='stop'&&r.origin_instance===origin&&r.native_exit===true&&Number.isInteger(r.native_pid)&&r.native_pid>0&&typeof r.native_started==='string'&&/^[A-Za-z0-9-]{1,128}$/.test(r.native_started)&&typeof r.unit_revision==='string'&&/^[a-f0-9]{64}$/.test(r.unit_revision);
+  if(action==='uninstall'&&(r.action!=='uninstall'||r.origin_instance!==origin||r.project!==project||r.unregistered!==true))return false;
+  if(action==='uninstall'&&!stops)return typeof r.service_instance==='string'&&/^[A-Za-z0-9_-]{1,64}$/.test(r.service_instance);
+  if(action==='stop'||action==='uninstall')return r.action===action&&r.origin_instance===origin&&(action!=='uninstall'||r.unit_removed===true)&&r.native_exit===true&&Number.isInteger(r.native_pid)&&r.native_pid>0&&typeof r.native_started==='string'&&/^[A-Za-z0-9-]{1,128}$/.test(r.native_started)&&typeof r.unit_revision==='string'&&/^[a-f0-9]{64}$/.test(r.unit_revision);
   return typeof r.service_instance==='string'&&/^[A-Za-z0-9_-]{1,64}$/.test(r.service_instance)&&typeof origin==='string'&&r.service_instance!==origin;
 },
-lifecycleReadback:function(){
-  const item=view.hostCommand,r=view.S?.lifecycle;
+lifecycleReadback:function(r=view.S?.lifecycle){
+  const item=view.hostCommand;
   if(item&&r?.id===item.id&&['queued','applied'].includes(r.state)){item.state=r.state;item.reason=r.reason||'';}
-  if(item&&api.lifecycleObserved(r,item.id,item.instance,item.action)){
-    item.state='observed';item.unknown=false;item.reason=item.action==='stop'?'Recorded host exit observed; restart: '+(r.restart_condition||'check native autostart conditions')+'.':'New service generation observed.';
+  if(item&&api.lifecycleObserved(r,item.id,item.instance,item.action,item.project,item.stops)){
+    item.state='observed';item.unknown=false;item.reason=item.action==='uninstall'?'Project removal observed.'+(item.stops?' Host unit removal and exact exit observed.':' Other projects continue.'):item.action==='stop'?'Recorded host exit observed; restart: '+(r.restart_condition||'check native autostart conditions')+'.':'New service generation observed.';
   }
 },
 lifecycleWaits:function(){
@@ -48,13 +50,14 @@ lifecycleWaits:function(){
   }).join('');
 },
 lifecycleControl:function(p,action='restart'){
-  const title=action==='stop'?'Stop':'Restart',review=action==='stop'?view.S?.stop_review:view.S?.restart_review;
-  const all=view.hostCommand||view.S?.lifecycle,r=(all?.action||'restart')===action?all:null;
+  const title={stop:'Stop',uninstall:'Uninstall'}[action]||'Restart',review=action==='uninstall'?p.uninstall_review:action==='stop'?view.S?.stop_review:view.S?.restart_review;
+  const all=view.hostCommand||view.S?.lifecycle,r=(all?.action||'restart')===action&&(action!=='uninstall'||(all.root||all.project)===p.root)?all:null;
   const pending=view.hostCommand&&!view.hostCommand.unknown&&view.hostCommand.state!=='observed'||['queued','applied'].includes(view.S?.lifecycle?.state);
   const projects=Array.isArray(view.S?.projects)?view.S.projects:[];
   const targets=Array.isArray(review?.roots)&&review.roots.every(root=>typeof root==='string')?review.roots.map(root=>projects.find(p=>p.root===root)?.name||root):null;
-  const effect=action==='stop'?'Waits for all owned work to end; retains OS autostart. Explicit service install can start it again.':'Existing work is preserved; active turns can delay restart.';
-  return '<details class="host-'+action+'"><summary>'+title+' host service</summary><div class="body meta">Affects all registered projects: '+(targets?targets.length?targets.map(esc).join(', '):'none registered':'unknown')+'. '+effect+'</div>'+(!review?.instance?'<div class="body alert">'+esc(review?.reason||title+' protocol unavailable')+'</div>':'')+'<button class="project" data-a="'+action+'" data-root="'+esc(p.root)+'"'+(pending||!review?.instance||!targets?' disabled':'')+'>Confirm host '+action+'</button>'+(pending&&r?api.lifecycleWaits():'')+(r?.id||r?.reason?'<div class="body meta" role="status">'+title+' '+esc(r.id||'')+': '+esc(r.state||'unknown')+(r.reason?' · '+esc(r.reason):'')+'</div>':'')+'</details>';
+  const effect=action==='uninstall'?'Waits for this project’s owned work to end; files and other projects stay.'+(targets?.length===1?' Removes the last host unit after exact exit.':''):action==='stop'?'Waits for all owned work to end; retains OS autostart. Explicit service install can start it again.':'Existing work is preserved; active turns can delay restart.';
+  const scope=action==='uninstall'?esc(p.name):'all registered projects: '+(targets?targets.length?targets.map(esc).join(', '):'none registered':'unknown');
+  return '<details class="host-'+action+'"><summary>'+title+' '+(action==='uninstall'?esc(p.name):'host service')+'</summary><div class="body meta">Affects '+scope+'. '+effect+'</div>'+(!review?.instance?'<div class="body alert">'+esc(review?.reason||title+' protocol unavailable')+'</div>':'')+'<button class="project" data-a="'+action+'" data-root="'+esc(p.root)+'"'+(pending||!review?.instance||!targets?' disabled':'')+'>Confirm '+(action==='uninstall'?'uninstall '+esc(p.name):'host '+action)+'</button>'+(pending&&r?api.lifecycleWaits():'')+(r?.id||r?.reason?'<div class="body meta" role="status">'+title+' '+esc(r.id||'')+': '+esc(r.state||'unknown')+(r.reason?' · '+esc(r.reason):'')+'</div>':'')+'</details>';
 },
 focusStart:function(action,root,label){
   if(view.pending[root]&&!view.pending[root].unknown)return;
@@ -164,7 +167,7 @@ service:function(p){const s=view.S?.service;return '<details class="group servic
   '<button class="project" data-a="folder" data-root="'+esc(p.root)+'">Open folder</button>'+
   api.lifecycleControl(p)+
   api.lifecycleControl(p,'stop')+
-  '<details><summary>Uninstall service '+esc(p.name)+'</summary><div class="body meta">Removes this project\'s service; files and other projects stay.</div><button class="project" data-a="uninstall" data-root="'+esc(p.root)+'">Confirm uninstall '+esc(p.name)+'</button></details></details>';},
+  api.lifecycleControl(p,'uninstall')+'</details>';},
 when:function(t,tz){return new Date(t*1000).toLocaleString([],{timeZone:tz==='UTC'?'UTC':undefined,dateStyle:'short',timeStyle:'short'})+' '+(tz==='UTC'?'UTC':zone);},
 local:function(t,tz){const d=new Date(t*1000);return (tz==='UTC'?d.toISOString():new Date(d-d.getTimezoneOffset()*60000).toISOString()).slice(0,16);},
 custom:function(){
@@ -466,7 +469,7 @@ const z=t(view.draft.end);
   if(d.a==='update'){view.updating={v:d.v,at:view.S.now};}
   if(d.a==='pick'){view.ask=d.root;present();return;}
   if(d.a==='pause-all'||d.a==='resume-all'){view.confirming=null;for(const p of view.S.projects.filter(p=>mode(p)===(d.a==='pause-all'?'run':'paused')))focusStart(d.a.slice(0,-4),p.root);present();menu.querySelector('[data-a="confirm"]')?.focus();return;}
-  if(d.a==='restart'||d.a==='stop'){api.lifecycleStart(d.root,d.a);return;}
+  if(d.a==='restart'||d.a==='stop'||d.a==='uninstall'){api.lifecycleStart(d.root,d.a);return;}
   if(d.a==='pause'||d.a==='resume'||d.a==='focus'){focusStart(d.a,d.root,d.label);view.ask=null;present();return;}
   if(d.a){actionErrors.delete(d.root);send({a:d.a,root:d.root,label:d.label});}present();});
 ui.listen(menu,'input',e=>{if(e.target.id==='ai'){view.aiText=e.target.value;send({a:'ai-draft',text:view.aiText});return;}const k=e.target.dataset.draft;if(k&&view.draft)view.draft[k]=e.target.value;});

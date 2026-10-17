@@ -1696,10 +1696,10 @@ fn service_report(a:&Args)->Res<()> {
     if a.flags.contains_key("json") {
         let projects:Vec<_>=rows.into_iter().map(|(root,status)|json!({"root":root,"host_binding":binding(&status),
             "status":status.as_ref().ok().and_then(Option::as_ref),"error":status.as_ref().err()})).collect();
-        println!("{}",json!({"schema":"taskq.service/1","service":service,"projects":projects,"registry_error":registry.as_ref().err(),"restart":if lifecycle["action"]=="stop" {Value::Null}else{lifecycle.clone()},"lifecycle":lifecycle}));
+        println!("{}",json!({"schema":"taskq.service/1","service":service,"projects":projects,"registry_error":registry.as_ref().err(),"restart":if lifecycle["action"].as_str().is_some_and(|action|action!="restart") {Value::Null}else{lifecycle.clone()},"lifecycle":lifecycle}));
     } else {
         println!("{}",host::service_line(&service));
-        let restart=lifecycle;let title=if restart["action"]=="stop"{"Stop"}else{"Restart"};
+        let restart=lifecycle;let title=match restart["action"].as_str() {Some("stop")=>"Stop",Some("uninstall")=>"Uninstall",_=>"Restart"};
         if let Some(id)=restart["id"].as_str() {println!("{title}: {id} {}",restart["state"].as_str().unwrap_or("unknown"));}
         if let Some(reason)=restart["reason"].as_str() {println!("{title}: unknown ({reason})");}
         if let Err(error)=&registry {println!("Projects: unknown ({error})");}
@@ -1726,7 +1726,6 @@ fn service(args: &Args) -> Res<()> {
         // before root and config load: their errors reach the unit log stamped too (§ 4)
         platform::service_log();
     }
-    let projects = platform::default_install().join("projects");
     if matches!(sub,"status"|"list") {return service_report(args);}
     if sub == "capacity" {return capacity_cmd(args);}
     if sub=="complete-stop" {
@@ -1735,15 +1734,19 @@ fn service(args: &Args) -> Res<()> {
         let result=lifecycle::complete_stop(&platform::default_install(),args.need("request")?)?;
         if args.flags.contains_key("json") {println!("{result}");}return Ok(());
     }
-    if matches!(sub,"restart"|"stop") {
+    if matches!(sub,"restart"|"stop"|"uninstall") {
         if std::env::var_os("TASKQ_ATTEMPT").is_some() {return Err("a worker cannot restart the host service or request Stop".into());}
-        if args.pos.len()!=2||args.all("request").len()>1||args.flags.keys().any(|key|!["request","json","diagnose","diagnose-ms","diagnose-limit"].contains(&key.as_str())) {
-            return Err("usage: taskq service restart|stop [--request ID] [--json]".into());
+        if args.pos.len()!=2||args.all("request").len()>1||args.flags.keys().any(|key|!["request","json","host","diagnose","diagnose-ms","diagnose-limit"].contains(&key.as_str()))||sub!="uninstall"&&args.flags.contains_key("host") {
+            return Err("usage: taskq service restart|stop|uninstall [--host] [--request ID] [--json]".into());
         }
         let install=platform::default_install();
         let id=args.one("request").map(str::to_owned).unwrap_or_else(runtime::uuid);
         let mut result=if let Some(receipt)=lifecycle::receipt(&install,&id)? {receipt} else {
-            let reviewed=if sub=="stop" {lifecycle::stop_review(&install,&id)?}else{lifecycle::review(&install,&id)?};
+            let reviewed=match sub {
+                "stop"=>lifecycle::stop_review(&install,&id)?,
+                "uninstall"=>{let root=if args.flags.contains_key("host") {None}else{Some(find_root()?)};lifecycle::uninstall_review(&install,&id,root.as_deref())?},
+                _=>lifecycle::review(&install,&id)?,
+            };
             if !args.flags.contains_key("json") {
                 println!("Scope: host service; all registered projects");
                 for root in reviewed["roots"].as_array().into_iter().flatten() {println!("Project: {}",root.as_str().unwrap_or("unknown"));}
@@ -1751,12 +1754,13 @@ fn service(args: &Args) -> Res<()> {
             lifecycle::submit(&install,&reviewed)?
         };
         if result["action"].as_str().unwrap_or("restart")!=sub {return Err("request ID belongs to another lifecycle action".into());}
-        if sub=="stop"&&result["state"]=="applied"&&let Some(p)=lifecycle::pending(&install)? {
+        if args.flags.contains_key("host")&&result["scope"]!="host" {return Err("request ID belongs to a project Uninstall; payload unchanged".into());}
+        if matches!(sub,"stop"|"uninstall")&&result["state"]=="applied"&&let Some(p)=lifecycle::pending(&install)?.filter(|p|p.stops()) {
             if p.id()!=id {return Err("Stop replay binding changed; reconcile service status".into());}
             host_control::dispatch(&install,&p)?.wait()?;
             result=lifecycle::receipt(&install,&id)?.ok_or("Stop result no longer retained; outcome unknown")?;
         }
-        if args.flags.contains_key("json") {println!("{result}");}else {println!("{}: {id} {}",if sub=="stop"{lifecycle::Action::Stop}else{lifecycle::Action::Restart}.title(),result["state"].as_str().unwrap_or("unknown"));if let Some(condition)=result["restart_condition"].as_str() {println!("Restart condition: {condition}");}}
+        if args.flags.contains_key("json") {println!("{result}");}else {println!("{}: {id} {}",match sub {"stop"=>lifecycle::Action::Stop,"uninstall"=>lifecycle::Action::Uninstall,_=>lifecycle::Action::Restart}.title(),result["state"].as_str().unwrap_or("unknown"));if let Some(condition)=result["restart_condition"].as_str() {println!("Restart condition: {condition}");}}
         return Ok(());
     }
     if sub == "run" {
@@ -1811,7 +1815,7 @@ fn service(args: &Args) -> Res<()> {
         "resources" => resources_cmd(&root, args),
         "hold" | "release" => hold_cmd(sub == "hold", args.one("text")),
         "recover" => recover_cmd(&root, args.flags.contains_key("apply"), args.flags.contains_key("json")),
-        "install" | "uninstall" => {
+        "install" => {
             let (cfg, _) = load(&root)?;
             let u = platform::unit(&platform::tool(&cfg.install), &root, &project_name(&root));
             if sub == "install" {
@@ -1825,10 +1829,6 @@ fn service(args: &Args) -> Res<()> {
                 if off {
                     println!("Focus: off; nothing admitted until `taskq service focus all|<label..>`");
                 }
-            } else {
-                uninstall_unit(&u, &root, &projects)?;
-                println!("removed {}", u.path.display());
-                kill_service(&root);
             }
             Ok(())
         }
@@ -2051,14 +2051,6 @@ fn logged(root: &Path, source: &str, text: &str, r: Receipt, json: bool) -> Res<
         retro::record(root, source, r.task, text);
     }
     emit(&[r], json)
-}
-
-fn uninstall_unit(u: &platform::Unit, root: &Path, projects: &Path) -> Res<()> {
-    let install=projects.parent().ok_or("project registry has no parent")?;
-    let edit=host::ProjectEdit::new(install,root,false)?;
-    platform::run_all(&u.unload, false)?;
-    if let Err(e) = fs::remove_file(&u.path) && e.kind() != std::io::ErrorKind::NotFound { return Err(e.to_string()); }
-    edit.commit().map_err(|e|format!("unit unloaded; project unregistration unknown: {e}"))
 }
 
 fn golden_selftest(traces: &str, published: bool) -> Res<usize> {
@@ -3237,8 +3229,7 @@ mod tests {
     #[ignore="owned process for registry_owner_preserves_parallel_changes_before_uninstall"]
     fn registry_uninstall_fixture() {
         let base=PathBuf::from(std::env::var_os("TASKQ_REGISTRY_FIXTURE").unwrap());let install=base.join("install");
-        let unit=platform::Unit {path:install.join("fixture.unit"),text:String::new(),load:vec![],unload:vec![],stop:vec![]};
-        let result=uninstall_unit(&unit,&base.join("a"),&install.join("projects"));
+        let result=host::ProjectEdit::new(&install,&base.join("a"),false).and_then(|edit|edit.commit());
         platform::write_atomic(&base.join("result.json"),&json!({"ok":result.is_ok(),"error":result.err()}).to_string()).unwrap();
     }
 
@@ -3255,38 +3246,16 @@ mod tests {
             unload: vec![vec!["taskq-must-not-run-unload".into()]],
         };
         fs::write(&u.path, "unit contents").unwrap();
-        let error = uninstall_unit(&u, &root, &projects).unwrap_err();
+        let error = host::ProjectEdit::new(&root,&root,false).err().unwrap();
         assert!(error.contains(&projects.display().to_string()));
         assert!(!error.contains("taskq-must-not-run-unload"));
         assert_eq!(fs::read_to_string(&u.path).unwrap(), "unit contents");
         assert_eq!(fs::read(&projects).unwrap(), registered);
         fs::remove_file(&projects).unwrap();
-        assert!(uninstall_unit(&u, &root, &projects).unwrap_err().contains(&projects.display().to_string()));
+        assert!(host::ProjectEdit::new(&root,&root,false).err().unwrap().contains(&projects.display().to_string()));
         assert!(u.path.is_file());
         assert!(!projects.exists());
         fs::remove_file(&u.path).unwrap();
-        fs::remove_dir_all(&root).unwrap();
-    }
-
-    // Chain: § 4 service uninstall failure. Risk: a failed uninstall loses registration.
-    #[test]
-    fn failed_uninstall_preserves_unit_and_project_registration() {
-        let root = std::env::temp_dir().join(format!("taskq-uninstall-{}", std::process::id()));
-        fs::create_dir_all(&root).unwrap();
-        let projects = root.join("projects");
-        let other=root.join("other");fs::create_dir_all(&other).unwrap();
-        let registered = format!("{}\n{}\n", root.display(),other.display());
-        fs::write(&projects, &registered).unwrap();
-        let u = platform::Unit {
-            path: root.join("unit"), text: String::new(), load: vec![], stop: vec![],
-            unload: vec![vec![std::env::current_exe().unwrap().display().to_string(), "--invalid-taskq-test-option".into()]],
-        };
-        fs::write(&u.path, "unit contents").unwrap();
-        assert!(uninstall_unit(&u, &root, &projects).unwrap_err().contains("failed"));
-        assert_eq!(fs::read_to_string(&u.path).unwrap(), "unit contents");
-        assert_eq!(fs::read_to_string(&projects).unwrap(), registered);
-        fs::remove_file(&u.path).unwrap();
-        fs::remove_file(&projects).unwrap();
         fs::remove_dir_all(&root).unwrap();
     }
 

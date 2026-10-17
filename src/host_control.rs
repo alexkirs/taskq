@@ -30,6 +30,13 @@ fn output(name:&'static str,command:&mut Command)->Res<std::process::Output> {
         Ok(output)=>Ok(output),Err(Failure::Exit(output))=>Err(format!("{name}: {}: {}",output.status,String::from_utf8_lossy(&output.stderr))),Err(error)=>Err(format!("{name}: {error}")),
     }
 }
+fn commands(name:&'static str,commands:&[Vec<String>])->Res<()> {
+    for args in commands {
+        let (program,args)=args.split_first().ok_or("native command missing")?;
+        output(name,Command::new(program).args(args))?;
+    }
+    Ok(())
+}
 #[cfg(windows)]
 fn quote(value:&str)->String {format!("'{}'",value.replace('\'',"''"))}
 #[cfg(windows)]
@@ -48,7 +55,7 @@ fn controller_args(install:&Path,pending:&lifecycle::Pending,exe:&Path)->Res<Str
 /// Dispatch only a prepared, immutable command. Repeated dispatch is serialized again by projects.lock.
 pub fn dispatch(install:&Path,pending:&lifecycle::Pending)->Res<Control> {
     if std::env::var_os("TASKQ_ATTEMPT").is_some() {return Err("a worker cannot dispatch host Stop".into());}
-    if pending.action()!=lifecycle::Action::Stop||!pending.prepared() {return Err("Stop has no qualified prepared intent".into());}
+    if !pending.stops()||!pending.prepared() {return Err("Stop has no qualified prepared intent".into());}
     let exe=std::env::current_exe().map_err(|e|e.to_string())?;
     #[cfg(not(windows))] let context=pending.context()?;
     #[cfg(target_os="macos")] {
@@ -83,6 +90,54 @@ if($t.State -ne 4){{$null=$t.Run($null)}}"#,name=quote(&format!("TaskQ-Stop-{}",
 
 /// Never signal a replacement or use daemon exit as evidence about workers.
 pub fn stop(install:&Path,id:&str,expected:&Identity,unit_revision:&str)->Res<()> {stop_unit(&crate::platform::tool(install),id,expected,unit_revision)}
+
+pub fn remove(install:&Path,id:&str,expected:&Identity,unit_revision:&str)->Res<()> {
+    remove_unit(&crate::platform::tool(install),id,expected,unit_revision)
+}
+fn remove_unit(tool:&coreq::Tool,id:&str,expected:&Identity,unit_revision:&str)->Res<()> {
+    let install=&tool.install;let path=definition(tool)?;
+    let present=match fs::symlink_metadata(&path) {Ok(_)=>true,Err(e) if e.kind()==std::io::ErrorKind::NotFound=>false,Err(e)=>return Err(e.to_string())};
+    if present&&revision_for(&tool)?!=unit_revision {return Err("Uninstall unit definition changed; kept".into());}
+    if !native_absent(&tool)? {stop_unit(&tool,id,expected,unit_revision)?;}
+    wait_exit(expected)?;
+    if present {
+        let unit=coreq::service::unit(&tool,install,"");
+        #[cfg(target_os="linux")] commands("host.uninstall.disable",&unit.unload)?;
+        #[cfg(windows)] if !native_absent(&tool)? {commands("host.uninstall.delete",std::slice::from_ref(unit.unload.last().ok_or("native delete command missing")?))?;}
+        #[cfg(not(target_os="linux"))] if !native_absent(&tool)? {return Err("native unit remains; definition kept".into());}
+        #[cfg(target_os="macos")] let _=unit;
+        if revision_for(&tool)?!=unit_revision {return Err("Uninstall unit changed before removal; kept".into());}
+        crate::host::ownership(&path)?;fs::remove_file(&path).map_err(|e|e.to_string())?;
+    }
+    #[cfg(target_os="linux")] output("host.uninstall.reload",Command::new("systemctl").args(["--user","daemon-reload"]))?;
+    if path.try_exists().map_err(|e|e.to_string())?||!native_absent(&tool)? {return Err("host unit removal not observed; retry the same Uninstall".into());}
+    Ok(())
+}
+
+fn native_absent(tool:&coreq::Tool)->Res<bool> {
+    #[cfg(target_os="macos")] {
+        let unit=coreq::service::unit(tool,&tool.install,"");
+        let target=unit.stop.first().and_then(|command|command.last()).ok_or("native unit target missing")?;
+        let (domain,label)=target.rsplit_once('/').ok_or("launchd domain missing")?;
+        let query=output("host.uninstall.readback",Command::new("launchctl").args(["print",domain]))?;
+        return Ok(!String::from_utf8(query.stdout).map_err(|e|e.to_string())?.lines().any(|line|line.split_whitespace().any(|field|field.trim_matches('"')==label)));
+    }
+    #[cfg(windows)] {
+        let code=format!(r#"$ErrorActionPreference='Stop';$s=New-Object -ComObject 'Schedule.Service';$s.Connect();$r=$s.GetFolder('\')
+try{{$null=$r.GetTask({name});'present'}}catch{{if(($_.Exception.GetBaseException()).HResult -ne -2147024894){{throw}};'absent'}}
+exit 0"#,name=quote(tool.title));
+        let query=output("host.uninstall.readback",&mut powershell(&code))?;
+        return match String::from_utf8(query.stdout).map_err(|e|e.to_string())?.trim() {"absent"=>Ok(true),"present"=>Ok(false),_=>Err("native unit inventory unknown".into())};
+    }
+    #[cfg(target_os="linux")] {
+        let query=crate::platform::output("host.uninstall.readback",Command::new("systemctl").args(["--user","show",&format!("{}.service",tool.name),"--property=LoadState","--property=MainPID","--property=ActiveState","--no-pager"]),Duration::from_secs(30))?;
+        let text=String::from_utf8(query.stdout).map_err(|e|e.to_string())?;
+        if text.lines().any(|line|line=="LoadState=not-found")&&text.lines().any(|line|line=="MainPID=0")&&text.lines().any(|line|line=="ActiveState=inactive") {return Ok(true);}
+        if query.status.success()&&text.lines().any(|line|line=="LoadState=loaded") {return Ok(false);}
+        return Err("systemd unit inventory unknown".into());
+    }
+    #[cfg(not(any(target_os="macos",target_os="linux",windows)))] Err("native unit inventory unsupported".into())
+}
 fn stop_unit(tool:&coreq::Tool,id:&str,expected:&Identity,unit_revision:&str)->Res<()> {
     #[cfg(not(windows))] let _=id;
     let install=&tool.install;
@@ -98,7 +153,7 @@ fn stop_unit(tool:&coreq::Tool,id:&str,expected:&Identity,unit_revision:&str)->R
             let query=output("host.stop.owner",Command::new("launchctl").args(["print",target]))?;
             let text=String::from_utf8(query.stdout).map_err(|e|e.to_string())?;
             if !text.lines().any(|line|line.trim()==format!("pid = {}",expected.pid)) {return Err("launchd owner differs; Stop refused".into());}
-            coreq::service::run_all(&unit.stop,false)?;
+            commands("host.stop.effect",&unit.stop)?;
         } else {
             // A lost response can be reconciled only by a successful native-domain inventory.
             let (domain,label)=target.rsplit_once('/').ok_or("launchd domain missing")?;
@@ -114,7 +169,7 @@ fn stop_unit(tool:&coreq::Tool,id:&str,expected:&Identity,unit_revision:&str)->R
         if !text.lines().any(|l|l=="LoadState=loaded")||pid!=0&&pid!=expected.pid {return Err("systemd owner differs; Stop refused".into());}
         if pid==0&&coreq::process::identity(expected.pid).map_err(|e|e.to_string())?.as_ref()==Some(expected) {return Err("live daemon has no attributable systemd owner; Stop refused".into());}
         if pid!=0&&coreq::process::identity(pid).map_err(|e|e.to_string())?.as_ref()!=Some(expected) {return Err("systemd native incarnation differs; Stop refused".into());}
-        coreq::service::run_all(&unit.stop,false)?;
+        commands("host.stop.effect",&unit.stop)?;
         let query=output("host.stop.readback",Command::new("systemctl").args(["--user","show",name,"--property=MainPID","--property=ActiveState","--no-pager"]))?;
         let text=String::from_utf8(query.stdout).map_err(|e|e.to_string())?;
         if !text.lines().any(|l|l=="MainPID=0")||!text.lines().any(|l|l=="ActiveState=inactive") {return Err("systemd Stop not observed".into());}
@@ -174,7 +229,7 @@ fn wait_exit(expected:&Identity)->Res<()> {
 
 pub fn retire_controller(install:&Path,id:&str)->Res<()> {
     #[cfg(windows)] {
-        let pending=lifecycle::pending(install)?.filter(|p|p.id()==id&&p.action()==lifecycle::Action::Stop).ok_or("Stop controller binding unavailable")?;
+        let pending=lifecycle::pending(install)?.filter(|p|p.id()==id&&p.stops()).ok_or("Stop controller binding unavailable")?;
         let args=controller_args(install,&pending,&std::env::current_exe().map_err(|e|e.to_string())?)?;
         let code=format!(r#"$ErrorActionPreference='Stop';$s=New-Object -ComObject 'Schedule.Service';$s.Connect();$r=$s.GetFolder('\');$name={name}
 try{{$t=$r.GetTask($name)}}catch{{if(($_.Exception.GetBaseException()).HResult -ne -2147024894){{throw}};$t=$null}}
@@ -232,7 +287,15 @@ if($allowed.Count -eq 0){{throw 'limited controller cannot retire its own task'}
         assert_ne!(coreq::process::identity(native.pid).unwrap().as_ref(),Some(&native));
         stop_unit(&tool,id,&native,&revision).unwrap();
         assert_eq!(fs::read(&definition).unwrap(),original,"Stop retains the native definition");
+        let uninstall=std::env::var("TASKQ_NATIVE_UNINSTALL").as_deref()==Ok("1");
+        if uninstall {
+            assert!(remove_unit(&tool,id,&native,&"0".repeat(64)).is_err());
+            assert_eq!(fs::read(&definition).unwrap(),original,"refused Uninstall keeps the definition");
+            remove_unit(&tool,id,&native,&revision).unwrap();
+            assert!(!definition.try_exists().unwrap());assert!(native_absent(&tool).unwrap());
+            remove_unit(&tool,id,&native,&revision).unwrap();
+        }
         capture.flush().unwrap();drop(guard);drop(capture);
-        fs::write(install.join("adapter-result.json"),json!({"unit":name,"native_pid":native.pid,"native_started":native.started,"unit_revision":revision,"exit":true,"replay":true,"definition_retained":true}).to_string()).unwrap();
+        fs::write(install.join("adapter-result.json"),json!({"unit":name,"native_pid":native.pid,"native_started":native.started,"unit_revision":revision,"exit":true,"replay":true,"definition_retained_after_stop":true,"definition_retained":!uninstall,"unit_removed":uninstall}).to_string()).unwrap();
     }
 }

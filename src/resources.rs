@@ -88,7 +88,7 @@ pub struct Op {
     pub sent: bool,
 }
 
-fn local(o:&Op)->bool {o.bound.get("local_capacity").is_some()||o.bound.get("local_restart").is_some()||o.bound.get("local_stop").is_some()}
+fn local(o:&Op)->bool {o.bound.get("local_capacity").is_some()||o.bound.get("local_restart").is_some()||(o.bound.get("local_stop").is_some()||o.bound.get("local_uninstall").is_some())}
 
 pub fn dir(install: &Path) -> PathBuf {
     install.join("resources")
@@ -506,7 +506,7 @@ pub(crate) fn prepare(s: &mut State, install: &Path, now: u64) -> Res<()> {
         o.sent = false;
     }
     s.ops.retain(|_,o|now<o.expires_at.saturating_add(RETAIN)
-        ||((o.bound.get("local_restart").is_some()||o.bound.get("local_stop").is_some())&&o.receipt["state"]!="observed"));
+        ||((o.bound.get("local_restart").is_some()||(o.bound.get("local_stop").is_some()||o.bound.get("local_uninstall").is_some()))&&o.receipt["state"]!="observed"));
     readback(s, now);
     Ok(())
 }
@@ -793,7 +793,7 @@ mod tests {
         assert_eq!(read(&t.install).unwrap().ops["local-op"],before);
         assert_eq!(fs::read(t.install.join("host.json")).unwrap(),policy);
         assert_eq!(log.len(),2,"remote cancel and ID reuse must both be explicitly refused");
-        for (key,id) in [("local_restart","local-restart"),("local_stop","local-stop")] {
+        for (key,id) in [("local_restart","local-restart"),("local_stop","local-stop"),("local_uninstall","local-uninstall")] {
             with(&t.install,|state| {
                 state.ops.insert(id.into(),Op {bound:json!({(key):{"request":{"id":id}}}),
                     receipt:json!({"id":id,"state":"queued"}),expires_at:0,saved_at:Some(0),writing:false,sent:true});Ok(())

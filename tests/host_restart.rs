@@ -68,11 +68,13 @@ fn real_host_restart_preserves_request_after_the_caller_exits() {
     fs::remove_dir(install.join("service")).unwrap();fs::rename(saved,install.join("service")).unwrap();
     let until=Instant::now()+Duration::from_secs(20);
     let id="native-restart";
-    let denied=coreq::process::output("test.restart-worker",command(&install,&proxy,&outside,&["service","restart","--request","denied-worker","--json"])
-        .env("TASKQ_ATTEMPT","42").env("TASKQ_TASK","1"),Duration::from_secs(20));
-    let denied=match denied {Err(coreq::process::Failure::Exit(out))=>out,other=>panic!("worker restart did not refuse: {other:?}")};
-    assert!(String::from_utf8_lossy(&denied.stderr).contains("worker cannot restart"));
-    assert!(json(&install.join("resources/state.json")).is_none_or(|s|s["ops"].get("denied-worker").is_none()));
+    for action in ["restart","stop","uninstall"] {
+        let denied=coreq::process::output("test.lifecycle-worker",command(&install,&proxy,&outside,&["service",action,"--request","denied-worker","--json"])
+            .env("TASKQ_ATTEMPT","42").env("TASKQ_TASK","1"),Duration::from_secs(20));
+        let denied=match denied {Err(coreq::process::Failure::Exit(out))=>out,other=>panic!("worker {action} did not refuse: {other:?}")};
+        assert!(String::from_utf8_lossy(&denied.stderr).contains("worker cannot restart"));
+        assert!(json(&install.join("resources/state.json")).is_none_or(|s|s["ops"].get("denied-worker").is_none()));
+    }
     let accepted=run(&install,&proxy,&outside,&["service","restart","--request",id,"--json"]);
     assert_eq!(accepted["id"],id);assert_eq!(accepted["state"],"queued");
     let final_receipt=loop {

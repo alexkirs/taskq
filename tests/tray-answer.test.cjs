@@ -47,6 +47,17 @@ const plain=x=>JSON.parse(JSON.stringify(x));
   context.S.projects=[];
   assert.equal((await call('answerSend',board,op)).state,'rejected');
   assert.equal(sent.length,7,'unregistered board writes nothing');
+  context.S.projects=[project];project.tasks=[{n:841,state:'ask',revision:4}];
+  const late={...op,id:'late-native-receipt'},latePromise=call('answerSend',board,late),lateSent=sent.length;
+  [...timers.values()].find(t=>t.ms===30000).f();assert.equal((await latePromise).state,'unknown');
+  project.tasks=[];
+  call('answerReceipt',{root:'other',id:late.id,state:'accepted',reason:'foreign'});
+  call('answerReceipt',{root:'project',id:late.id,state:'accepted',reason:'late native receipt'});
+  assert(call('answerNotices').includes('late native receipt'),'late receipt must replace timeout without a retry');
+  assert(!call('answerNotices').includes('Check delivery'));
+  assert.equal((await latePromise).state,'unknown','an already settled promise stays one-shot');
+  assert.equal(sent.length,lateSent,'late receipt must not resend the answer');
+  context.S.projects=[];
   // Run the consumer's capability across shared stale/lost-response fixtures; component owns draft and op state.
   const fx=JSON.parse(fs.readFileSync('tests/fixtures/answer-card.json','utf8'));
   for(const c of fx.cases.filter(c=>/stale|lost|duplicate|sending/.test(c.name))){

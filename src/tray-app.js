@@ -100,10 +100,14 @@ answerCapability:function(board){const p=view.S&&view.S.projects.find(p=>p.issue
 
 answerReceipt:function(r){
   const key=r.root+'#'+r.id,request=answerRequests.get(key);
-  if(!request)return;
-  cancel(request.timer);answerRequests.delete(key);
-  answerFeedback.set(key,{board:request.board,op:request.op,state:r.state,reason:r.reason,next:r.next});
-  request.resolve({state:r.state,reason:r.reason,next:r.next});
+  const previous=answerFeedback.get(key);
+  if(!request&&previous?.state!=='unknown')return;
+  const item=request||previous;
+  answerFeedback.set(key,{board:item.board,op:item.op,state:r.state,reason:r.reason,next:r.next});
+  if(request){
+    cancel(request.timer);answerRequests.delete(key);
+    request.resolve({state:r.state,reason:r.reason,next:r.next});
+  }else answerCards.get(item.board+'/'+item.op.task)?.ui.receiveReceipt(item.board,r.id,r);
   present();
   defer(fit,0);
 },

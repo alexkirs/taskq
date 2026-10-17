@@ -149,6 +149,11 @@ paint:function() {
     ui.listen(el,'submit', e => { e.preventDefault(); const k = e.target.closest('[data-qac-key]')?.dataset.qacKey; if (k) apply(k, {type: 'submit'}); });
     ui.listen(el,'input', e => { const k = e.target.dataset.qac === 'input' && e.target.closest('[data-qac-key]')?.dataset.qacKey; if (k) apply(k, {type: 'input', text: e.target.value}); });
     return execution.module("answer-card.mount.controller",{
+      receiveReceipt(board, opId, reply) {
+        for (const [k, card] of cards) if (card.board === board && locals.get(k)?.op?.id === opId) {
+          apply(k, {...reply, type: 'receipt', opId});
+        }
+      },
       // rows: [{board, row}] of open questions; a row that left keeps no state
       update(rows) {
         cards.clear();

@@ -367,18 +367,17 @@ fn revision(v: &Value) -> Value {
 }
 
 /// Host policy and occupancy are distinct from this project's narrowing ceilings.
-/// shortcut: observation only until host edits have qualified operation identity and receipt replay.
-fn resource_group(cap: &Value, saved: &Value, project_limits: &Value, observed_at: Option<i64>, installation: Option<String>, project: &str) -> Value {
+fn resource_group(cap: &Value, saved: &Value, saved_revision:&Value, project_limits: &Value, observed_at: Option<i64>, installation: Option<String>, project: &str) -> Value {
     let host = crate::service::host_capacity(cap).unwrap_or(Value::Null);
     let ok = host.is_object();
     let saved = if saved["error"].is_null() { saved } else { &Value::Null };
     let target = |p: bool, rt: Option<&str>| json!({"installation_id": installation, "generation": 1, "project_id": if p { json!(project) } else { Value::Null }, "runtime_id": rt});
-    let entry = |t: Value, current: Value, effective: Value| json!({"target": t, "service_version": null,
-        "supported": [{"policy_schema": "taskq.host-capacity/1", "modes": [], "fields": [], "scopes": []}],
-        "current_revision": if saved.is_null() { Value::Null } else { revision(&current) },
-        "effective_revision": if ok { revision(&effective) } else { Value::Null },
+    let entry = |t: Value, current: Value, effective: Value| {let project=!t["project_id"].is_null();let runtime=!t["runtime_id"].is_null();json!({"target": t, "service_version": crate::platform::VERSION,
+        "supported": [{"policy_schema": "taskq.host-capacity/1", "modes": [], "fields": if project||saved.is_null() {json!([])}else if runtime {json!(["runtime_limit"])}else{json!(["maximum","load_gate"])}, "scopes": if project {json!([])}else if runtime {json!(["runtime"])}else{json!(["host"])} }],
+        "current_revision": if saved.is_null() { Value::Null } else if project {revision(&current)}else{saved_revision.clone()},
+        "effective_revision": if !ok {Value::Null}else if project {revision(&effective)}else{cap["host_command"].clone()},
         "current_policy": current, "effective_policy": effective,
-        "sample": null, "runtime_usage": [], "blockers": [], "completeness": if ok { "complete" } else { "unknown" }});
+        "sample": null, "runtime_usage": [], "blockers": [], "completeness": if ok { "complete" } else { "unknown" }})};
     let pol = |c: &Value| json!({"maximum": c["admission"]["max"], "load_gate": c["load_gate"]});
     let mut h = entry(target(false, None), pol(saved), pol(&host));
     let mut rts: Vec<String> = crate::service::RUNTIMES.iter().map(|rt| rt.to_string()).collect();
@@ -427,15 +426,17 @@ fn project(install: &Path, root: &str) -> Value {
         Some(json!([w.first()?.parse::<i64>().ok()?, w.get(2)?, w.get(3)?, w.get(1)?.strip_prefix('#')?.parse::<u64>().ok()?]))
     }).collect();
     // the local host's saved capacity, for `Edit limits` and its readback (§ 4 Capacity)
-    let (cap_host, cap_saved, board_kind, project_limits) = match crate::load(r) {
-        Ok((c, raw)) => (json!(c.me), crate::host::Policy::read(install).map(|p|p.cap.json()).unwrap_or_else(|e| json!({"error": e})), json!(c.board.name), if raw["limits"].is_null() {json!({})} else {raw["limits"].clone()}),
-        Err(e) => (Value::Null, json!({"error": e}), Value::Null, Value::Null),
+    let (cap_host, cap_saved, cap_revision,board_kind, project_limits) = match crate::load(r) {
+        Ok((c, raw)) => {let policy=crate::host::Policy::read(install);let rev=policy.as_ref().ok().and_then(|p|p.revision().ok());let host=policy.as_ref().map(|p|json!(p.me)).unwrap_or(Value::Null);
+            (host, policy.map(|p|p.cap.json()).unwrap_or_else(|e| json!({"error": e})),json!(rev), json!(c.board.name), if raw["limits"].is_null() {json!({})} else {raw["limits"].clone()})},
+        Err(e) => (Value::Null, json!({"error": e}), Value::Null,Value::Null, Value::Null),
     };
     let mut tasks = s["tasks"].as_array().cloned().unwrap_or_default();
     for task in &mut tasks { task_session(r, cap_host.as_str().unwrap_or(""), task); }
     let installation = fs::read_to_string(install.join("installation-id")).ok().filter(|i| i.len() == 64 && i.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)));
     let id: String = crate::project_name(r).chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' }).take(64).collect();
-    let resources = resource_group(&s["capacity"], &cap_saved, &project_limits, age.map(|a| now() - a as i64), installation, &id);
+    let observed_at=s["at"].as_i64().filter(|at|*at<=now()&&now()-*at<=60).and(age.map(|a|now()-a as i64));
+    let resources = resource_group(&s["capacity"], &cap_saved,&cap_revision, &project_limits, observed_at, installation, &id);
     json!({"root": root, "name": s["project"].as_str().map(String::from).unwrap_or_else(|| crate::project_name(r)),
         "issues": s["issues"].as_str().unwrap_or(""), "board_kind": board_kind, "closed": Value::Null,
         "log": s["log"].is_string(), "alive": age.is_some_and(|a| a < 300), "age": age,
@@ -528,46 +529,50 @@ fn summary(ps: &[Value], (start, end): (i64, i64)) -> Summary {
     Summary { counts: [t["doing"] + t["review"], t["ask"], t["ready"], t["failed"]], known, run: ps.iter().any(|p| p["focus"].as_array().is_some_and(|f| !f.is_empty())), bins, since }
 }
 
-struct FocusAction {
+struct QueuedAction {
     id: String,
-    action: String,
     root: PathBuf,
-    label: Option<String>,
+    message:Value,
     context: Option<coreq::telemetry::capture::TraceContext>,
     dispatch: tracing::Dispatch,
 }
-struct FocusQueue {
-    sender: std::sync::mpsc::SyncSender<FocusAction>,
+struct ActionQueue {
+    sender: std::sync::mpsc::SyncSender<QueuedAction>,
     worker: std::thread::JoinHandle<()>,
+    allowed:&'static [&'static str],
 }
-impl FocusQueue {
-    fn start(install: PathBuf, report: impl Fn(PathBuf, String, crate::Res<Option<String>>) + Send + 'static) -> crate::Res<Self> {
-        let (sender, receiver)=std::sync::mpsc::sync_channel::<FocusAction>(16);
-        let worker=std::thread::Builder::new().name("taskq-focus-actions".into()).spawn(move || {
+impl ActionQueue {
+    fn start(install: PathBuf,allowed:&'static [&'static str],execute:fn(&Path,&Path,&Value)->crate::Res<Value>,report: impl Fn(PathBuf, String, crate::Res<Value>) + Send + 'static) -> crate::Res<Self> {
+        let (sender, receiver)=std::sync::mpsc::sync_channel::<QueuedAction>(16);
+        let operation=if allowed==["capacity"] {"tray.capacity.execute"}else{"tray.focus.execute"};
+        let worker=std::thread::Builder::new().name(operation.into()).spawn(move || {
             while let Ok(job)=receiver.recv() {
-                let result=tracing::dispatcher::with_default(&job.dispatch,|| {
+                tracing::dispatcher::with_default(&job.dispatch,|| {
                     let _context=job.context.as_ref().map(|c|c.span().entered());
-                    coreq::telemetry::capture::operation("tray.focus.execute",||std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        if !roots(&install).iter().any(|r|Path::new(r)==job.root) {
+                    let result=coreq::telemetry::capture::operation(operation,||std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        if !crate::host::project_paths(&install)?.iter().any(|r|r==&job.root) {
                             return Err("Project is no longer registered; command not applied".into());
                         }
-                        act(&job.action,&job.root,job.label.as_deref())
-                    })).unwrap_or_else(|_|Err("Command panicked; result unknown; check service status before retry".into())),|_|"command-failed")
+                        execute(&install,&job.root,&job.message)
+                    })).unwrap_or_else(|_|Err("Command panicked; result unknown; check service status before retry".into())),|_|"command-failed");
+                    report(job.root.clone(),job.id.clone(),result);
                 });
-                report(job.root,job.id,result);
             }
-        }).map_err(|e|format!("Cannot start focus command worker: {e}"))?;
-        Ok(Self{sender,worker})
+        }).map_err(|e|format!("Cannot start command worker: {e}"))?;
+        Ok(Self{sender,worker,allowed})
     }
-    fn submit(&self, action: &str, root: &Path, label: Option<&str>, id: &str) -> crate::Res<()> {
-        let name=match action {"pause"=>"tray.pause.dispatch","resume"=>"tray.resume.dispatch","focus"=>"tray.focus.dispatch",_=>"tray.invalid.dispatch"};
+    fn submit(&self,message:&Value) -> crate::Res<()> {
+        let action=message["a"].as_str().unwrap_or("");let id=message["id"].as_str().unwrap_or("");
+        let name=match action {"pause"=>"tray.pause.dispatch","resume"=>"tray.resume.dispatch","focus"=>"tray.focus.dispatch","capacity"=>"tray.capacity.dispatch",_=>"tray.invalid.dispatch"};
         coreq::telemetry::capture::operation(name,|| {
-            if !matches!(action,"focus"|"pause"|"resume") {return Err(("invalid-command","Unsupported focus command"));}
+            if !self.allowed.contains(&action) {return Err(("invalid-command","Unsupported queued command"));}
             if id.is_empty() || id.len()>64 || !id.bytes().all(|b|b.is_ascii_alphanumeric()||b==b'-') {
                 return Err(("invalid-id","Invalid command correlation id; action not submitted"));
             }
+            if serde_json::to_vec(message).map_or(true,|bytes|bytes.len()>20<<10) {return Err(("request-too-large","Command payload too large; action not submitted"));}
+            let root=message["root"].as_str().filter(|root|!root.is_empty()).ok_or(("invalid-root","Project root missing; action not submitted"))?;
             if self.worker.is_finished() {return Err(("worker-unavailable","Command worker unavailable; action not submitted"));}
-            self.sender.try_send(FocusAction {id:id.into(),action:action.into(),root:root.into(),label:label.map(String::from),
+            self.sender.try_send(QueuedAction {id:id.into(),root:root.into(),message:message.clone(),
                 context:coreq::telemetry::capture::TraceContext::current(),dispatch:tracing::dispatcher::get_default(Clone::clone)})
                 .map_err(|error|match error {
                     std::sync::mpsc::TrySendError::Full(_)=>("queue-full","Command queue full; action not submitted"),
@@ -575,6 +580,11 @@ impl FocusQueue {
                 })
         },|(code,_)|*code).map_err(|(_,message)|message.into())
     }
+}
+
+fn queued_focus(_install:&Path,root:&Path,message:&Value)->crate::Res<Value> {
+    let receipt=act(message["a"].as_str().unwrap_or(""),root,message["label"].as_str())?.ok_or("Command confirmation unavailable; check service status")?;
+    Ok(json!({"applied_receipt":receipt}))
 }
 
 // The page owns asynchronous work; a submission result cannot acknowledge its execution.
@@ -735,13 +745,14 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
     });
     let proxy = event_loop.create_proxy();
     let replies=proxy.clone();
-    let focus_actions=FocusQueue::start(install.clone(),move |root,id,result| {
-        let reply=match result {
-            Ok(Some(receipt))=>json!({"root":root,"id":id,"applied_receipt":receipt}),
-            Ok(None)=>json!({"root":root,"id":id,"text":"Command confirmation unavailable; check service status"}),
-            Err(error)=>json!({"root":root,"id":id,"text":error}),
-        };
-        let _=replies.send_event(Ev::Answer(json!({"focus_receipt":reply})));
+    let focus_actions=ActionQueue::start(install.clone(),&["pause","resume","focus"],queued_focus,move |root,id,result| {
+        let mut reply=result.unwrap_or_else(|error|json!({"text":error}));reply["root"]=json!(root);reply["id"]=json!(id);
+        let _=coreq::telemetry::capture::operation("tray.focus.report",||replies.send_event(Ev::Answer(json!({"focus_receipt":reply}))),|_|"ui-closed");
+    })?;
+    let replies=proxy.clone();
+    let capacity_actions=ActionQueue::start(install.clone(),&["capacity"],capacity,move |root,id,result| {
+        let mut reply=result.unwrap_or_else(|error|json!({"state":"unknown","reason":error}));reply["root"]=json!(root);reply["id"]=json!(id);
+        let _=coreq::telemetry::capture::operation("tray.capacity.report",||replies.send_event(Ev::Answer(json!({"capmsg":reply}))),|_|"ui-closed");
     })?;
     let mut settings = Settings::load(&install);
     let mut ui: Option<(Window, WebView)> = None;
@@ -1033,9 +1044,8 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
                     // `Edit limits` after the page's confirm: the same write as `service capacity` (§ 5), this host only
                     "capacity" => {
                         let root = m["root"].as_str().unwrap_or("");
-                        if roots(&install).iter().any(|r| r == root) {
-                            let msg = capacity(Path::new(root), &m);
-                            push(&mut web,&ui, &json!({"capmsg": {"root": root, "id": m["id"], "text": msg}}));
+                        if let Err(error)=capacity_actions.submit(&m) {
+                            push(&mut web,&ui, &json!({"capmsg": {"root": root, "id": m["id"], "state":"rejected","reason":error}}));
                         }
                     }
                     // Add project (§ 4): the folder comes only from the OS picker, never from the page
@@ -1077,7 +1087,7 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
                         let root = m["root"].as_str().unwrap_or("");
                         if roots(&install).iter().any(|r| r == root) {
                             let result=if matches!(a,"pause"|"resume"|"focus") {
-                                focus_actions.submit(a,Path::new(root),m["label"].as_str(),m["id"].as_str().unwrap_or(""))
+                                focus_actions.submit(&m)
                             } else {act(a,Path::new(root),m["label"].as_str()).map(|_|())};
                             if let Err(error) = result {
                                 let key=if matches!(a,"pause"|"resume"|"focus") {"focus_receipt"} else {"action_error"};
@@ -1566,8 +1576,15 @@ fn install_service(install: &Path, mut a: Value) -> Value {
 }
 
 /// Write the page's capacity edit for this host; the outcome line for the page.
-fn capacity(_root: &Path, _m: &Value) -> String {
-    "Error: host editing unavailable here; use taskq service capacity".into()
+fn capacity(install:&Path,_root: &Path,m: &Value) -> crate::Res<Value> {
+    let mut input=m.clone();input.as_object_mut().ok_or("invalid capacity message")?.remove("context");
+    if !crate::resources::keys(&input,&["a","root","id","ops","issued_at","expires_at"]) {
+        return Ok(json!({"state":"rejected","reason":"Unsupported host capacity payload; refresh and review current settings"}));
+    }
+    let request=json!({"id":input["id"],"ops":input["ops"],"issued_at":input["issued_at"],"expires_at":input["expires_at"]});
+    if let Err(error)=crate::host::capacity_request(&request) {return Ok(json!({"state":"rejected","reason":error}));}
+    let policy=crate::host::Policy::read(install)?;
+    crate::host::local_capacity(install,&policy.me,&request)
 }
 
 fn open(arg: &str) {
@@ -1779,25 +1796,26 @@ mod tests {
             fs::write(crate::dot(&root).join("focus"),"area-maps").unwrap();
             let (result_tx,result_rx)=std::sync::mpsc::channel();
             let (release_tx,release_rx)=std::sync::mpsc::channel();
-            let queue=FocusQueue::start(install.clone(),move |root,id,result| {
+            let queue=ActionQueue::start(install.clone(),&["pause","resume","focus"],queued_focus,move |root,id,result| {
                 result_tx.send((root,id,result)).unwrap();
                 release_rx.recv_timeout(Duration::from_secs(3)).unwrap();
             }).unwrap();
+            let message=|action:&str,id:&str|json!({"a":action,"root":root,"id":id});
             let _click=tracing::info_span!("fixture.click").entered();
             for invalid in [String::new(),"../outside".into(),"x".repeat(65)] {
-                assert!(queue.submit("pause",&root,None,&invalid).unwrap_err().contains("correlation id"));
+                assert!(queue.submit(&message("pause",&invalid)).unwrap_err().contains("correlation id"));
                 assert_eq!(crate::data::focus(&root).unwrap(),["area-maps"]);
             }
-            queue.submit("pause",&root,None,"first").unwrap();
+            queue.submit(&message("pause","first")).unwrap();
             let (reported,id,result)=result_rx.recv_timeout(Duration::from_secs(3)).unwrap();
-            assert_eq!(reported,root);assert_eq!(id,"first");let applied=result.unwrap().unwrap();
+            assert_eq!(reported,root);assert_eq!(id,"first");let applied=result.unwrap()["applied_receipt"].as_str().unwrap().to_string();
             let snapshot=crate::control::snapshot(&root,&mut None,&mut None).unwrap();
             assert_eq!(snapshot.command["applied_receipt"],applied);
             let status=json!({"focus_command":snapshot.command,"focus":snapshot.focus,"tasks":[],"complete":true});
             fs::write(crate::dot(&root).join("status.json"),status.to_string()).unwrap();
             assert_eq!(project(&install,root.to_str().unwrap())["focus_command"],status["focus_command"]);
-            for n in 0..16 {queue.submit("resume",&root,None,&format!("queued-{n}")).unwrap();}
-            assert!(queue.submit("resume",&root,None,"overflow").unwrap_err().contains("queue full"));
+            for n in 0..16 {queue.submit(&message("resume",&format!("queued-{n}"))).unwrap();}
+            assert!(queue.submit(&message("resume","overflow")).unwrap_err().contains("queue full"));
             assert!(crate::data::focus(&root).unwrap().is_empty());
             // Queued intent cannot act on a project removed after submission.
             fs::write(install.join("projects"),"").unwrap();
@@ -1807,7 +1825,7 @@ mod tests {
                 assert_eq!(reported,root);assert_eq!(id,format!("queued-{n}"));assert!(result.unwrap_err().contains("no longer registered"));
             }
             release_tx.send(()).unwrap();
-            let FocusQueue{sender,worker}=queue;drop(sender);worker.join().unwrap();
+            let ActionQueue{sender,worker,..}=queue;drop(sender);worker.join().unwrap();
             assert!(crate::data::focus(&root).unwrap().is_empty());
             let page=store.export(0,0,1024).unwrap();
             let rows:Vec<_>=page["events"].as_array().unwrap().iter().map(|r|&r["observation"]).collect();
@@ -1817,6 +1835,43 @@ mod tests {
             assert_eq!(receipts[0]["trace"],click["trace"]);assert_eq!(receipts[1]["trace"],click["trace"]);
             assert_eq!(receipts[1]["kind"],"command.applied");
             assert_eq!(receipts[2]["kind"],"command.observed");
+        });
+    }
+
+    // H-A2: a blocked host-policy write cannot delay the independent restrictive Pause command.
+    #[test]
+    fn blocked_capacity_does_not_block_pause() {
+        crate::with_test_capture(|_store,dir| {
+            let root=dir.join("project");let install=dir.join("install");
+            fs::create_dir_all(crate::dot(&root)).unwrap();fs::create_dir_all(install.join("resources")).unwrap();
+            fs::write(root.join("taskq.json"),"{\"repo\":\"fixture/project\"}").unwrap();
+            fs::write(install.join("projects"),format!("{}\n",root.display())).unwrap();
+            fs::write(install.join("host.json"),json!({"hosts":{crate::hostname():"capacity-host"},"limits":{"codex":2}}).to_string()).unwrap();
+            fs::write(crate::dot(&root).join("focus"),"all").unwrap();
+            let policy=crate::host::Policy::read(&install).unwrap();
+            assert_eq!(project(&install,root.to_str().unwrap())["cap_host"],"capacity-host");
+            let now=SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
+            let message=json!({"a":"capacity","root":root,"id":"blocked","issued_at":now,"expires_at":now+300,"ops":[{
+                "target":{"installation_id":null,"generation":1,"project_id":null,"runtime_id":"codex"},
+                "policy_schema":"taskq.host-capacity/1","expected_revision":policy.revision().unwrap(),"changes":{"runtime_limit":3}}]});
+            let lock=coreq::file_lock::lock(&install.join("resources/lock")).unwrap();
+            let (capacity_tx,capacity_rx)=std::sync::mpsc::channel();
+            let blocked=ActionQueue::start(install.clone(),&["capacity"],|install,root,message| {
+                crate::platform::write_atomic(&install.join("capacity-entered"),"")?;
+                capacity(install,root,message)
+            },move |_,_,result|capacity_tx.send(result).unwrap()).unwrap();
+            blocked.submit(&message).unwrap();
+            let until=Instant::now()+Duration::from_secs(3);
+            while !install.join("capacity-entered").exists() && Instant::now()<until {std::thread::yield_now();}
+            assert!(install.join("capacity-entered").exists());assert!(capacity_rx.try_recv().is_err());
+            let (pause_tx,pause_rx)=std::sync::mpsc::channel();
+            let focus=ActionQueue::start(install.clone(),&["pause","resume","focus"],queued_focus,move |_,_,result|pause_tx.send(result).unwrap()).unwrap();
+            focus.submit(&json!({"a":"pause","root":root,"id":"pause"})).unwrap();
+            assert!(pause_rx.recv_timeout(Duration::from_secs(3)).unwrap().unwrap()["applied_receipt"].is_string());
+            assert!(crate::data::focus(&root).unwrap().is_empty());assert!(capacity_rx.try_recv().is_err());
+            drop(lock);
+            assert_eq!(capacity_rx.recv_timeout(Duration::from_secs(3)).unwrap().unwrap()["state"],"saved");
+            for queue in [blocked,focus] {let ActionQueue{sender,worker,..}=queue;drop(sender);worker.join().unwrap();}
         });
     }
 
@@ -2039,19 +2094,20 @@ mod tests {
             "limits":{"codex":1},"used":{"codex":1},"load_gate":{"enabled":true,"cpu_max":85,"memory_min":10},
             "sample_at":95,"sample_age_seconds":3,"cpu_percent":12.5,"memory_available_percent":40.0,
             "reasons":[{"code":"hold"},{"code":"future"},{"code":"cpu"}]});
-        let group = resource_group(&cap, &saved, &json!({"codex":1}), Some(100), None, "taskq");
+        let group = resource_group(&cap, &saved,&json!("command-current"), &json!({"codex":1}), Some(100), None, "taskq");
         let t = group["targets"].as_array().unwrap();
         assert_eq!(t[0]["runtime_usage"][1],json!({"runtime_id":"codex","used":2,"limit":3,"limit_kind":"ceiling"}));
         assert_eq!(t[1]["current_policy"]["limits"]["codex"],1);
-        assert_eq!(t[0]["current_revision"],t[0]["effective_revision"]);
-        assert!(t.iter().all(|t|t["supported"][0]["fields"]==json!([])),"no legacy project writer may advertise a host edit");
+        assert!(t[0]["effective_revision"].is_null(),"equal settings without the host's exact receipt cannot look applied");
+        assert_eq!(t[0]["supported"][0]["fields"],json!(["maximum","load_gate"]));
+        assert_eq!(t[1]["supported"][0]["fields"],json!([]),"a project ceiling has no host write authority");
         assert!(t[3]["target"]["project_id"].is_null(),"runtime ceiling belongs to the host");
         assert!(t[0]["current_policy"]["mode"].is_null());
         let codes:Vec<_>=t[0]["blockers"].as_array().unwrap().iter().map(|b|b["code"].as_str().unwrap()).collect();
         assert_eq!(codes,["host","unknown","cpu"]);
         assert_eq!(t[0]["sample"]["age_seconds"],3);
         let mut stale=cap.clone();stale.as_object_mut().unwrap().remove("host_policy");
-        let unknown=resource_group(&stale,&saved,&json!({"codex":1}),Some(100),None,"taskq");
+        let unknown=resource_group(&stale,&saved,&json!("command-current"),&json!({"codex":1}),Some(100),None,"taskq");
         assert!(unknown["targets"][0]["effective_revision"].is_null());
         assert!(unknown["targets"][0]["runtime_usage"][1]["used"].is_null(),"legacy project snapshot cannot prove host use");
     }
@@ -2060,7 +2116,7 @@ mod tests {
     #[test]
     fn capacity_bridge_refuses_unqualified_host_edits() {
         for set in [json!({"mode":"auto"}),json!({"limits":{"codex":4}}),json!({"maximum":null})] {
-            assert!(capacity(Path::new("/nonexistent-taskq-954"),&json!({"set":set})).starts_with("Error: host editing unavailable here"));
+            assert_eq!(capacity(Path::new("/nonexistent-taskq-954"),Path::new("/nonexistent-taskq-954"),&json!({"set":set})).unwrap()["state"],"rejected");
         }
     }
 

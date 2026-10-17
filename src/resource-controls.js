@@ -57,13 +57,14 @@ fields:function(group) {
     if (editable(s.host, 'mode')) out.push({key: 'host.mode', target: s.host, field: 'mode', label: 'Mode', value: hc.mode, choice: ['auto', 'fixed']});
     if (editable(s.host, 'maximum')) out.push({key: 'host.maximum', target: s.host, field: 'maximum', label: 'Host maximum', nullable: true, value: hc.maximum, none: 'no maximum'});
     for (const r of s.runtimes) if (editable(r, 'runtime_limit')) out.push({key: 'rt:' + r.target.runtime_id, target: r, field: 'runtime_limit', label: rtName(r.target.runtime_id),
-      nullable: schemaFor(r, 'runtime_limit') === 'taskq.admission/1', value: r.current_policy && r.current_policy.runtime_limit});
-    if (editable(s.project, 'load_gate')) {
-      const g = s.project.current_policy && s.project.current_policy.load_gate || {};
-      out.push({key: 'gate.enabled', target: s.project, field: 'load_gate', label: 'Load gate', value: g.enabled, bool: true,
+      nullable: ['taskq.admission/1','taskq.host-capacity/1'].includes(schemaFor(r, 'runtime_limit')),none:schemaFor(r,'runtime_limit')==='taskq.host-capacity/1'?'no cap':null, value: r.current_policy && r.current_policy.runtime_limit});
+    const target=editable(s.host,'load_gate')?s.host:s.project;
+    if (editable(target, 'load_gate')) {
+      const g = target.current_policy && target.current_policy.load_gate || {};
+      out.push({key: 'gate.enabled', target, field: 'load_gate', label: 'Load gate', value: g.enabled, bool: true,
         locked: scopes(group).host && scopes(group).host.current_policy && scopes(group).host.current_policy.mode === 'auto'});
-      out.push({key: 'gate.cpu_max', target: s.project, field: 'load_gate', label: 'CPU ceiling %', value: g.cpu_max, lo: 10, hi: 100});
-      out.push({key: 'gate.memory_min', target: s.project, field: 'load_gate', label: 'Memory floor %', value: g.memory_min, lo: 1, hi: 95});
+      out.push({key: 'gate.cpu_max', target, field: 'load_gate', label: 'CPU ceiling %', value: g.cpu_max, lo: 10, hi: 100});
+      out.push({key: 'gate.memory_min', target, field: 'load_gate', label: 'Memory floor %', value: g.memory_min, lo: 1, hi: 95});
     }
     return out;
   },
@@ -107,6 +108,14 @@ review:function(group, d) {
   },
 fresh:function() { return {draft: null, op: null, receipt: null}; },
 status:function(group, local, cap, now) {
+    if(local.receipt?.state==='saved'&&schemaOf(scopes(group).host,'taskq.host-capacity/1')){
+      const revision=local.receipt.saved_revision;
+      if(typeof revision!=='string')return 'unknown';
+      const targets=(local.op?.ops||[]).map(op=>({op,target:(group.targets||[]).find(t=>tkey(t)===tkey({target:op.target}))}));
+      if(!targets.length||targets.some(x=>!x.target)||!freshness(group,now).fresh)return 'saved';
+      if(targets.every(x=>x.target.current_revision===revision&&x.target.effective_revision===revision))return 'applied';
+      return targets.some(x=>![revision,x.op.expected_revision].includes(x.target.current_revision))?'superseded':'saved';
+    }
     if (local.receipt && local.receipt.state === 'saved') return applied(group, now) === 'applied' && JSON.stringify(revs(group)) !== JSON.stringify(local.receipt.from) ? 'applied' : 'saved';
     if (local.receipt) return local.receipt.state;
     if (!local.draft) return cap && cap.edit && fields(group).length ? 'view' : 'read-only';
@@ -117,7 +126,7 @@ step:function(group, local, cap, ev, newId, now) {
     const st = status(group, local, cap, now), l = {...local};
     switch (ev.type) {
       case 'open':
-        if (!['view', 'applied', 'rejected'].includes(st)) return {local, send: null};
+        if (!['view', 'applied', 'rejected','superseded'].includes(st)) return {local, send: null};
         return {local: {draft: {base: revs(group), values: Object.fromEntries(fields(group).map(f => [f.key, shown(f)])), touched: {}, review: false, error: null}, op: null, receipt: null}, send: null};
       case 'input':
         if (!l.draft || ['sending'].includes(st)) return {local, send: null};
@@ -146,20 +155,20 @@ step:function(group, local, cap, ev, newId, now) {
       }
       case 'receipt':
         if (!l.op || ev.opId !== l.op.id) return {local, send: null};
-        l.receipt = {...l.receipt, state: ['saved', 'rejected', 'unknown'].includes(ev.state) ? ev.state : 'unknown', reason: ev.reason};
+        l.receipt = {...l.receipt, state: ['saved', 'rejected', 'unknown'].includes(ev.state) ? ev.state : 'unknown', reason: ev.reason,saved_revision:ev.saved_revision};
         return {local: l, send: null};
       case 'retry':
         // uncertain delivery reconciles with the same id and payload, never a new operation
         return st === 'unknown' ? {local: {...l, receipt: {...l.receipt, state: 'sending', reason: null}}, send: l.op} : {local, send: null};
       case 'dismiss':
-        return ['applied', 'rejected'].includes(st) ? {local: fresh(), send: null} : {local, send: null};
+        return ['applied', 'rejected','superseded'].includes(st) ? {local: fresh(), send: null} : {local, send: null};
       default:
         return {local, send: null};
     }
   },
 render:function(group, local, cap, now) {
     const st = status(group, local, cap, now), f = freshness(group, now), s = scopes(group), id = 'rsc-' + String(group.key || '').replace(/[^\w-]/g, '_');
-    let h = '<section class="rsc" data-rsc-state="' + st + '" aria-label="' + esc('Capacity of ' + (group.labels && group.labels.project || 'project') + ' on ' + (group.labels && group.labels.host || 'this host')) + '">';
+    let h = '<section class="rsc" data-rsc-state="' + st + '" aria-label="' + esc('Capacity of ' + (schemaOf(s.host,'taskq.host-capacity/1')?'all registered projects':group.labels?.project||'project') + ' on ' + (group.labels?.host||'this host')) + '">';
     h += '<p class="rsc-row"><span>Policy</span><span class="rsc-muted">' + esc(policy(group)) + '</span></p>';
     for (const u of usage(group, now)) h += '<p class="rsc-row' + (u.over ? ' rsc-over' : '') + '" aria-label="' + esc(rtName(u.runtime) + ': ' + (u.used == null ? 'unknown' : u.used) + ' used of ' + u.limit + (u.over ? ', over limit; running tasks continue' : '')) + '"><span>' + esc(rtName(u.runtime)) + '</span><span class="rsc-count">' + esc(u.text) + '</span></p>';
     h += '<p class="rsc-row"><span>Load gate</span><span class="rsc-muted">' + esc(gate(group, now)) + '</span></p>';
@@ -173,7 +182,7 @@ render:function(group, local, cap, now) {
     if (s.observation && s.observation.completeness !== 'complete') h += '<p class="rsc-muted">Blockers ' + esc(s.observation.completeness === 'partial' ? 'partly unknown' : 'unknown') + '</p>';
     if (schemaOf(s.host, 'taskq.host-capacity/1')) {
       const limits=s.project?.current_policy?.limits;
-      h += '<p class="rsc-muted">Project ceilings: ' + esc(limits==null?'unknown':Object.entries(limits).map(([rt,n])=>rtName(rt)+' '+n).join(', ')||'none') + '</p>';
+      h += '<p class="rsc-muted">Project ceilings ('+esc(group.labels?.project||'project')+'): ' + esc(limits==null?'unknown':Object.entries(limits).map(([rt,n])=>rtName(rt)+' '+n).join(', ')||'none') + '</p>';
     }
     if (cap && cap.note) h += '<p class="rsc-alert">' + esc(cap.note) + '</p>';
     if (st === 'view' || st === 'read-only') {
@@ -181,15 +190,15 @@ render:function(group, local, cap, now) {
       if (a === 'saved') h += '<p class="rsc-muted" role="status">' + RECEIPT.saved + '</p>';
       return h + (st === 'view' ? '<button type="button" data-rsc="open">Edit limits</button>' : cap && cap.reason ? '<p class="rsc-muted">' + esc(cap.reason) + '</p>' : '') + '</section>';
     }
-    if (['sending', 'saved', 'applied', 'rejected', 'unknown'].includes(st)) {
+    if (['sending', 'saved', 'applied', 'rejected', 'unknown','superseded'].includes(st)) {
       const r = local.receipt;
       h += '<p class="rsc-receipt rsc-' + st + '" role="status" aria-live="polite">' + esc(RECEIPT[st] + (r && r.reason ? ': ' + r.reason : '')) + '</p>';
       if (st === 'unknown') h += '<button type="button" data-rsc="retry">Check again</button>';
-      if (st === 'applied' || st === 'rejected') h += '<button type="button" data-rsc="open">Edit limits</button>';
+      if (st === 'applied' || st === 'rejected'||st==='superseded') h += '<button type="button" data-rsc="open">Edit limits</button>';
       return h + '</section>';
     }
     const d = local.draft;
-    if (st === 'review') return h + '<div class="rsc-review" role="alert"><p>Apply to ' + esc((group.labels && group.labels.project) || 'project') + ' on ' + esc((group.labels && group.labels.host) || 'this host') + '?</p>' +
+    if (st === 'review') return h + '<div class="rsc-review" role="alert"><p>'+(schemaOf(s.host,'taskq.host-capacity/1')?'Apply host limits to all registered projects on '+esc(group.labels?.host||'this host'):'Apply to '+esc(group.labels?.project||'project')+' on '+esc(group.labels?.host||'this host'))+'?</p>' +
       review(group, d).map(x => '<p>' + esc(x) + '</p>').join('') + '<p class="rsc-muted">Running tasks continue. Other hosts and unchanged settings stay.</p></div>' +
       '<div class="rsc-actions"><button type="button" data-rsc="confirm">Confirm</button><button type="button" data-rsc="back">Back</button><button type="button" data-rsc="cancel">Cancel</button></div></section>';
     h += '<div class="rsc-form">' + fields(group).map(x => input(id, x, d.values[x.key])).join('') + '</div>';
@@ -250,6 +259,7 @@ freshWork:function(selected) { return {selected: {...selected}, draft: null, loc
 workStatus:function(groups, w, cap, now) {
     const sel = picked(groups, w), sent = sel.filter(g => w.locals[g.key]);
     if (sent.length) return {state: 'receipts', each: Object.fromEntries(sent.map(g => [g.key, status(g, w.locals[g.key], cap(g), now)]))};
+    if(sel.some(g=>schemaOf(scopes(g).host,'taskq.host-capacity/1')))return {state:'read-only'};
     if (!w.draft) return {state: sel.length && sel.every(g => cap(g) && cap(g).edit) ? 'view' : 'read-only'};
     if (JSON.stringify(w.draft.base) !== JSON.stringify(workRevs(sel))) return {state: 'conflict'};
     return {state: w.draft.review ? 'review' : 'editing'};
@@ -416,7 +426,7 @@ const {cap}=execution.module("resource-controls.replay.helpers",{cap:g => capabi
 // Input: one node/project group of taskq.resources/1 Projection targets (host, project and runtime scopes) plus the
 // adapter's labels and capability. No network client, config parser, admission rule or credentials: `send` is the adapter's.
 const root=globalThis;
-  const STATES = ['view', 'editing', 'review', 'conflict', 'sending', 'saved', 'applied', 'rejected', 'unknown', 'read-only'];
+  const STATES = ['view', 'editing', 'review', 'conflict', 'sending', 'saved', 'applied', 'rejected', 'unknown', 'read-only','superseded'];
   const FRESH = 60;
   const {esc}=execution.module("resource-controls",{esc:s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]))});
   const {rtName}=execution.module("resource-controls",{rtName:rt => ({claude: 'Claude', codex: 'Codex', 'codex-app': 'Codex app'}[rt] || rt)});
@@ -427,7 +437,7 @@ const root=globalThis;
 
   // The group's scopes: host (no project), project (no runtime) and runtime targets, in runtime order.
 
-  const {tkey}=execution.module("resource-controls",{tkey:t => [t.target.project_id, t.target.runtime_id].map(x => x == null ? '' : x).join('/')});
+  const {tkey}=execution.module("resource-controls",{tkey:t => JSON.stringify([t.target.installation_id??null,t.target.generation??null,t.target.project_id??null,t.target.runtime_id??null])});
   // Qualified Auto/Fixed authority versus the legacy Fixed guard; a consumer never infers it from a version string.
   const {schemaOf}=execution.module("resource-controls",{schemaOf:(x, s) => x && (x.supported || []).find(p => p.policy_schema === s)});
   // The schema that advertises `field` at this target's scope; null: not editable here.
@@ -482,7 +492,7 @@ const root=globalThis;
   // rebase, receipt {opId, state, reason}, retry, dismiss.
 
 
-  const RECEIPT = {sending: 'Saving…', saved: 'Saved; waiting for service', applied: 'Applied: read back from the service',
+  const RECEIPT = {sending: 'Saving…', saved: 'Saved; waiting for service', applied: 'Applied: read back from the service',superseded:'Saved; replaced by a newer command',
     rejected: 'Not saved', unknown: 'Delivery unknown: check again', conflict: 'Settings changed since you opened the editor'};
 
 

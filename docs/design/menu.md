@@ -141,14 +141,14 @@ Canonical selections/default candidates: [D01–D14](decision-register.md). The 
 ## M12 Shared Work mode
 
 - One editor from home/settings/project; project entry preselects that project. Open it in the existing workspace (approved Workspace review), preserving menu navigation and drafts. Recovery uses the same workspace route.
-- Named host, explicitly selected projects, new-task filter, per-project/runtime limits, optional load guard, change review.
-- Selection defines change targets, not registered observations. Unchecking a project leaves its focus/limits unchanged.
-- Preserve runtime-specific limits, including codex-app. No shared host pool. Disable fields for unselected projects; unknown values follow [unknown is never healthy](https://github.com/taskqorg/specq/blob/main/engineering/verification.md#unknown-is-never-healthy).
+- Named host; host limits and load guard affect all its registered projects. Project focus/filter/ceiling edits name their own selected projects and review; that selection never narrows a host edit.
+- Selection defines project change targets, not registered observations. Unchecking leaves that project's focus/ceilings unchanged; host edits separately name their wider effect.
+- Preserve runtime-specific host limits, including codex-app, and separately named lowering project ceilings. Disable unselected project fields; unknown values follow [unknown is never healthy](https://github.com/taskqorg/specq/blob/main/engineering/verification.md#unknown-is-never-healthy).
 - Different current focus displays Mixed. Opening does not overwrite it. Change only explicitly edited fields.
 - Review exact project/host old→new changes; current attempts continue. Cancel preserves settings; readback is per project, including partial failure.
 - Preserve CPU/memory gate controls and saved-vs-applied distinction from the current UI. Gate semantics remain in taskq.md.
 - AI prepares the same reviewable operations; no hidden alternate apply route. Preview matches/exclusions for UC-05 once the filter contract exists.
-- Native tray (#954): Work mode edits host maximum, runtime limits and the load gate; Fixed remains legacy-only. Use the [shared resource controls](shared-resource-controls.md#shared-component-930); the new-task filter stays in Scope until the filter contract exists.
+- Native tray (#954): Work mode exposes one host editor for maximum, runtime limits and load gate, without project-selection controls that could imply a narrower effect. Project entry retains that project's observation context. Fixed remains legacy-only. Use the [shared resource controls](shared-resource-controls.md#shared-component-930); project focus/filter/ceiling work remains a separate target until its contracts and backends are qualified.
 
 ## M13 Pinned window
 

@@ -73,10 +73,11 @@ impl Policy {
         let Some(value)=self.raw.get(CAPACITY_COMMAND) else {return Ok(None)};
         let invalid="host capacity command unsupported or corrupt; file kept";
         let object=value.as_object().ok_or(invalid)?;
-        if object.len()!=4 || !["schema","host","policy","receipt"].iter().all(|key|object.contains_key(*key))
+        if object.len()!=4+usize::from(object.contains_key("request")) || !["schema","host","policy","receipt"].iter().all(|key|object.contains_key(*key))
             || value["schema"]!=1 || value["host"].as_str().is_none_or(str::is_empty) {
             return Err(invalid.into());
         }
+        if object.contains_key("request") && !value["request"].as_str().is_some_and(crate::resources::id) {return Err(invalid.into());}
         let snapshot=value["policy"].as_object().ok_or(invalid)?;
         if snapshot.len()!=3 || !["limits","admission","load_gate"].iter().all(|key|snapshot.contains_key(*key))
             || value["policy"]["admission"]["mode"]!="auto" {return Err(invalid.into());}
@@ -88,6 +89,12 @@ impl Policy {
         let metadata:Value=serde_json::from_str(text).map_err(|_|invalid)?;
         if metadata["product"]!="taskq" || metadata["operation"]!="taskq.host.policy.write" {return Err(invalid.into());}
         Ok(Some(receipt))
+    }
+
+    pub fn revision(&self)->Res<String> {
+        if self.raw[CAPACITY_COMMAND]["host"]==self.me && self.raw[CAPACITY_COMMAND]["policy"]==self.cap.json()
+            && let Some(command)=self.command()? {return command.event_id("observed");}
+        Ok(ring::digest::digest(&ring::digest::SHA256,&serde_json::to_vec(&json!([self.me,self.cap.json()])).map_err(|e|e.to_string())?).as_ref().iter().map(|v|format!("{v:02x}")).collect())
     }
 
     pub fn read(install: &Path) -> Res<Self> {
@@ -113,10 +120,13 @@ impl Policy {
 }
 
 /// Existing resource-control lock serializes policy writers with grants and migration.
-#[tracing::instrument(name="host.policy.write",skip_all)]
 pub fn write_capacity(install:&Path, host:&str, edit:&crate::CapEdit, expect:Option<&Value>)->Res<(Capacity,Capacity,CommandReceipt)> {
+    crate::resources::locked(install,||write_capacity_locked(install,host,edit,expect,None))
+}
+
+#[tracing::instrument(name="host.policy.write",skip_all)]
+fn write_capacity_locked(install:&Path, host:&str, edit:&crate::CapEdit, expect:Option<&Value>,mut local:Option<(&mut crate::resources::State,&Value)>)->Res<(Capacity,Capacity,CommandReceipt)> {
     if std::env::var_os("TASKQ_ATTEMPT").is_some() {return Err("a worker cannot change host policy".into());}
-    crate::resources::locked(install,|| {
         let migration=install.join("host-policy-migration");
         if migration.join("plan.json").try_exists().map_err(|e|e.to_string())?
             && !migration.join("complete").try_exists().map_err(|e|e.to_string())? {
@@ -127,6 +137,28 @@ pub fn write_capacity(install:&Path, host:&str, edit:&crate::CapEdit, expect:Opt
         let hostname=crate::hostname();
         let old=Policy::parse(serde_json::from_str(&original).map_err(|e|format!("host.json unknown: {e}"))?,&hostname)?;
         if host!=old.me {return Err("host policy edits require this local host; remote edits are unsupported".into());}
+        if let Some((state,request))=local.as_mut() {
+            let id=request["id"].as_str().ok_or("capacity request ID missing")?;
+            if let Some(op)=state.ops.get_mut(id) {
+                if op.bound!=json!({"local_capacity":request}) {return Err("capacity request ID reused with another payload".into());}
+                if op.receipt["state"]=="rejected" {return Err(op.receipt["reason"].as_str().unwrap_or("capacity request rejected").into());}
+                let command=if op.receipt["state"]=="saved" {
+                    let command=CommandReceipt::decode(op.receipt["command"].as_str().ok_or("capacity receipt corrupt")?)?;
+                    if op.receipt["saved_revision"]!=command.event_id("observed")? {return Err("capacity receipt corrupt".into());}
+                    command
+                } else if old.raw[CAPACITY_COMMAND]["request"]==id && old.raw[CAPACITY_COMMAND]["policy"]==old.cap.json() {
+                    old.command()?.ok_or("capacity request outcome unknown")?
+                } else {return Err("capacity request outcome unknown; mutation will not be repeated".into());};
+                op.writing=false;op.sent=true;
+                op.receipt=json!({"state":"saved","saved_revision":command.event_id("observed")?,"command":command.encode()});
+                return Ok((old.cap.clone(),old.cap,command));
+            }
+            if state.ops.len()>=crate::resources::MAX_OPS {return Err("capacity operation store full; no new request taken".into());}
+            let now=wall()?;
+            if request["issued_at"].as_u64().is_none_or(|at|at>now.saturating_add(30)) || request["expires_at"].as_u64().is_none_or(|at|now>=at) {return Err("capacity request expired or clock unknown".into());}
+            let revision=old.revision()?;
+            if request["ops"].as_array().ok_or("capacity operations missing")?.iter().any(|op|op["expected_revision"]!=revision) {return Err("host policy changed; review current values before applying".into());}
+        }
         if edit.mode.is_some() {return Err("host policy has no mode selector; use optional limits and the load gate".into());}
         if expect.is_some_and(|v|*v!=old.cap.json()) {return Err("host policy changed; refresh before applying".into());}
         let mut next=old.raw.clone();
@@ -150,10 +182,29 @@ pub fn write_capacity(install:&Path, host:&str, edit:&crate::CapEdit, expect:Opt
         command.checkpoint("received")?;
         let mut next=candidate.raw;
         next[CAPACITY_COMMAND]=json!({"schema":1,"host":candidate.me,"policy":candidate.cap.json(),"receipt":command.encode()});
+        if let Some((state,request))=local.as_mut() {
+            let id=request["id"].as_str().ok_or("capacity request ID missing")?;
+            next[CAPACITY_COMMAND]["request"]=json!(id);
+            state.ops.insert(id.into(),crate::resources::Op {bound:json!({"local_capacity":request}),receipt:json!({"state":"unknown"}),
+                expires_at:request["expires_at"].as_u64().ok_or("capacity expiry missing")?,saved_at:None,writing:true,sent:true});
+            crate::resources::save(install,state)?;
+            #[cfg(test)]
+            if std::env::var("TASKQ_HOST_POLICY_PHASE").is_ok_and(|phase|phase=="before-write") {
+                crate::platform::write_atomic(&install.join("ack"),"intent-saved")?;loop {std::thread::park();}
+            }
+            if wall()?>=request["expires_at"].as_u64().ok_or("capacity expiry missing")? {
+                let op=state.ops.get_mut(id).unwrap();op.writing=false;op.receipt=json!({"state":"rejected","reason":"expired"});
+                return Err("capacity request expired before host policy write".into());
+            }
+        }
         let candidate=Policy::parse(next,&hostname)?;
         replace_owned(&path,&original,&(serde_json::to_string_pretty(&candidate.raw).map_err(|e|e.to_string())?+"\n"))?;
         let saved=Policy::read(install)?;
         if saved.raw!=candidate.raw {return Err("host policy write uncertain: readback differs".into());}
+        if let Some((state,request))=local.as_mut() {
+            let op=state.ops.get_mut(request["id"].as_str().unwrap()).unwrap();op.writing=false;op.saved_at=Some(wall()?);
+            op.receipt=json!({"state":"saved","saved_revision":command.event_id("observed")?,"command":command.encode()});
+        }
         #[cfg(test)]
         if std::env::var("TASKQ_HOST_POLICY_PHASE").is_ok_and(|phase|phase=="before-applied") {
             crate::platform::write_atomic(&install.join("ack"),"policy-saved")?;
@@ -162,6 +213,59 @@ pub fn write_capacity(install:&Path, host:&str, edit:&crate::CapEdit, expect:Opt
         command.checkpoint("applied").map_err(|e|format!("host policy saved; command receipt unknown: {e}"))?;
         crate::platform::write_atomic(&install.join("poke"),"").map_err(|e|format!("host policy saved; host notification unknown: {e}"))?;
         Ok((old.cap,saved.cap,command))
+}
+
+fn wall()->Res<u64> {std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d|d.as_secs()).map_err(|_|"capacity clock unknown".into())}
+
+/// Typed native request; OS-owned local controls do not grant the remote exchange any authority.
+pub fn capacity_request(request:&Value)->Res<crate::CapEdit> {
+    use crate::resources::{keys,count,id};
+    let invalid="invalid host capacity request";
+    if !keys(request,&["id","issued_at","expires_at","ops"]) || !request["id"].as_str().is_some_and(id)
+        || serde_json::to_vec(request).map_err(|e|e.to_string())?.len()>16<<10 {return Err(invalid.into());}
+    let issued=request["issued_at"].as_u64().ok_or(invalid)?;let expires=request["expires_at"].as_u64().ok_or(invalid)?;
+    if expires<=issued || expires-issued>300 {return Err(invalid.into());}
+    let ops=request["ops"].as_array().filter(|ops|!ops.is_empty()&&ops.len()<=4).ok_or(invalid)?;
+    let mut seen=BTreeSet::new();let mut edit=crate::CapEdit::default();
+    for op in ops {
+        if !keys(op,&["target","policy_schema","expected_revision","changes"]) || op["policy_schema"]!="taskq.host-capacity/1"
+            || !op["expected_revision"].as_str().is_some_and(id) || !keys(&op["target"],&["installation_id","generation","project_id","runtime_id"])
+            || op["target"]["generation"]!=1 || !op["target"]["project_id"].is_null() {return Err(invalid.into());}
+        let rt=op["target"]["runtime_id"].as_str();
+        if (!op["target"]["runtime_id"].is_null() && rt.is_none_or(|rt|!service::RUNTIMES.contains(&rt))) || !seen.insert(rt) {return Err(invalid.into());}
+        let changes=op["changes"].as_object().filter(|c|!c.is_empty()).ok_or(invalid)?;
+        for (key,value) in changes {
+            match key.as_str() {
+                "runtime_limit" if rt.is_some() && (value.is_null()||count(value))=> {
+                    let rt=rt.unwrap().to_string();if value.is_null() {edit.unset.insert(rt);}else {edit.limits.insert(rt,value.as_u64().unwrap() as u32);}
+                }
+                "maximum" if rt.is_none() && (value.is_null()||count(value))=>edit.max=Some(value.as_u64().map(|n|n as u32)),
+                "load_gate" if rt.is_none() && keys(value,&["enabled","cpu_max","memory_min"]) && value["enabled"].is_boolean()
+                    && value["cpu_max"].as_u64().is_some_and(|n|(10..=100).contains(&n)) && value["memory_min"].as_u64().is_some_and(|n|(1..=95).contains(&n))=> {
+                        edit.gate=value["enabled"].as_bool();edit.cpu_max=value["cpu_max"].as_u64().map(|n|n as u32);edit.memory_min=value["memory_min"].as_u64().map(|n|n as u32);
+                    }
+                _=>return Err(invalid.into()),
+            }
+        }
+    }
+    Ok(edit)
+}
+
+pub fn local_capacity(install:&Path,host:&str,request:&Value)->Res<Value> {
+    let edit=capacity_request(request)?;
+    crate::resources::with(install,|state| {
+        crate::resources::prepare(state,install,wall()?)?;
+        let installation=match fs::read_to_string(install.join("installation-id")) {
+            Ok(id) if id.len()==64 && id.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b))=>json!(id),
+            Err(e) if e.kind()==std::io::ErrorKind::NotFound=>Value::Null,
+            _=>return Err("local installation identity unknown".into()),
+        };
+        if request["ops"].as_array().unwrap().iter().any(|op|op["target"]["installation_id"]!=installation) {return Err("capacity request belongs to another installation".into());}
+        let result=write_capacity_locked(install,host,&edit,None,Some((state,request)));
+        let mut receipt=state.ops.get(request["id"].as_str().unwrap()).filter(|op|op.bound==json!({"local_capacity":request})).map(|op|op.receipt.clone()).unwrap_or(json!({"state":"rejected"}));
+        if let Err(error)=result {receipt["reason"]=json!(error);}
+        receipt.as_object_mut().ok_or("local capacity receipt corrupt")?.remove("command");
+        Ok(receipt)
     })
 }
 
@@ -979,9 +1083,102 @@ mod tests {
         let root=PathBuf::from(std::env::var_os("TASKQ_HOST_POLICY_FIXTURE").unwrap());
         let (_capture,_guard)=crate::profile::tests::collecting(&root);
         let owner=Policy::read(&root).unwrap().me;
-        write_capacity(&root,&owner,&crate::CapEdit {limits:BTreeMap::from([("codex".into(),3)]),..Default::default()},None).unwrap();
+        if let Ok(request)=std::env::var("TASKQ_HOST_POLICY_REQUEST") {
+            local_capacity(&root,&owner,&serde_json::from_str(&request).unwrap()).unwrap();
+        } else {write_capacity(&root,&owner,&crate::CapEdit {limits:BTreeMap::from([("codex".into(),3)]),..Default::default()},None).unwrap();}
         crate::platform::write_atomic(&root.join("ack"),"committed").unwrap();
         loop {std::thread::park();}
+    }
+
+    fn local_fixture(name:&str)->(PathBuf,PathBuf,String,Value) {
+        let base=temp(name);let install=base.join("install");let root=base.join("project");
+        fs::create_dir_all(&install).unwrap();fs::create_dir_all(&root).unwrap();
+        fs::write(install.join("host.json"),"{\"limits\":{\"codex\":2}}").unwrap();
+        fs::write(root.join("taskq.json"),"{\"repo\":\"fixture/project\"}").unwrap();
+        fs::write(install.join("projects"),format!("{}\n",root.display())).unwrap();
+        let p=Policy::read(&install).unwrap();let now=wall().unwrap();
+        let request=json!({"id":"local-capacity","issued_at":now,"expires_at":now+300,"ops":[{
+            "target":{"installation_id":null,"generation":1,"project_id":null,"runtime_id":"codex"},
+            "policy_schema":"taskq.host-capacity/1","expected_revision":p.revision().unwrap(),"changes":{"runtime_limit":3}}]});
+        (base,install,p.me,request)
+    }
+
+    // H-A2: immutable same-ID replay, current revision and typed local scope hold before policy effects.
+    #[test]
+    fn local_capacity_request_replays_without_mutation_and_refuses_foreign_scope() {
+        let (base,install,owner,request)=local_fixture("local-request");
+        let (capture,guard)=crate::profile::tests::collecting(&install);
+        let saved=local_capacity(&install,&owner,&request).unwrap();assert_eq!(saved["state"],"saved");
+        let bytes=fs::read(install.join("host.json")).unwrap();
+        assert_eq!(local_capacity(&install,&owner,&request).unwrap(),saved);
+        for change in ["payload","stale","expired","installation","generation","project","runtime","schema","type","future","lifetime","empty","extra","large"] {
+            let mut other=request.clone();
+            if change!="payload" {other["id"]=json!(change);}
+            match change {
+                "payload"=>other["ops"][0]["changes"]["runtime_limit"]=json!(4),
+                "expired"=>{let now=wall().unwrap();other["issued_at"]=json!(now-301);other["expires_at"]=json!(now-1);}
+                "installation"=>other["ops"][0]["target"]["installation_id"]=json!("a".repeat(64)),
+                "generation"=>other["ops"][0]["target"]["generation"]=json!(2),
+                "project"=>other["ops"][0]["target"]["project_id"]=json!("project"),
+                "runtime"=>other["ops"][0]["target"]["runtime_id"]=json!("unknown"),
+                "schema"=>other["ops"][0]["policy_schema"]=json!("taskq.capacity/1"),
+                "type"=>other["ops"][0]["changes"]["runtime_limit"]=json!(true),
+                "future"=>{let now=wall().unwrap();other["issued_at"]=json!(now+60);other["expires_at"]=json!(now+300);}
+                "lifetime"=>other["expires_at"]=json!(request["issued_at"].as_u64().unwrap()+301),
+                "empty"=>other["ops"]=json!([]),
+                "extra"=>other["set"]=json!({"codex":4}),
+                "large"=>other["ops"][0]["changes"]["runtime_limit"]=json!("x".repeat(16<<10)),
+                _=>{},
+            }
+            let result=local_capacity(&install,&owner,&other);
+            assert!(result.is_err()||result.unwrap()["state"]=="rejected","{change} accepted");
+            assert_eq!(fs::read(install.join("host.json")).unwrap(),bytes,"{change} changed policy");
+        }
+        let current=Policy::read(&install).unwrap();observe_capacity(&install,&current).unwrap();
+        assert_eq!(local_capacity(&install,&owner,&request).unwrap()["saved_revision"],current.revision().unwrap());
+        let mut newer=request.clone();newer["id"]=json!("newer");newer["ops"][0]["expected_revision"]=json!(current.revision().unwrap());
+        let next=local_capacity(&install,&owner,&newer).unwrap();assert_eq!(next["state"],"saved");assert_ne!(next["saved_revision"],saved["saved_revision"]);
+        let bytes=fs::read(install.join("host.json")).unwrap();
+        assert_eq!(local_capacity(&install,&owner,&request).unwrap(),saved,"a later command must not change the original receipt");
+        assert_eq!(fs::read(install.join("host.json")).unwrap(),bytes);
+        crate::resources::with(&install,|state| {
+            let op=state.ops["local-capacity"].clone();
+            for n in state.ops.len()..crate::resources::MAX_OPS {state.ops.insert(format!("retained-{n}"),op.clone());}
+            Ok(())
+        }).unwrap();
+        newer["id"]=json!("store-full");newer["ops"][0]["expected_revision"]=json!(Policy::read(&install).unwrap().revision().unwrap());
+        assert_eq!(local_capacity(&install,&owner,&newer).unwrap()["state"],"rejected");
+        assert_eq!(fs::read(install.join("host.json")).unwrap(),bytes);
+        fs::write(install.join("resources/state.json"),"{").unwrap();
+        assert!(local_capacity(&install,&owner,&newer).unwrap_err().contains("file kept"));
+        assert_eq!(fs::read_to_string(install.join("resources/state.json")).unwrap(),"{");
+        assert_eq!(fs::read(install.join("host.json")).unwrap(),bytes);
+        capture.flush().unwrap();drop(guard);drop(capture);fs::remove_dir_all(base).unwrap();
+    }
+
+    // H-A2/H-A3: crash before effect remains unknown; crash after replacement recovers the same receipt read-only.
+    #[test]
+    fn local_capacity_crashes_never_replay_an_uncertain_write() {
+        for phase in ["before-write","before-applied"] {
+            let (base,install,owner,request)=local_fixture(&format!("local-crash-{phase}"));
+            let mut child=std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","host::tests::policy_writer","--ignored"]).env("TASKQ_HOST_POLICY_FIXTURE",&install)
+                .env("TASKQ_HOST_POLICY_REQUEST",request.to_string()).env("TASKQ_HOST_POLICY_PHASE",phase)
+                .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+            let until=Instant::now()+std::time::Duration::from_secs(10);
+            while !install.join("ack").exists() && child.try_wait().unwrap().is_none() && Instant::now()<until {std::thread::sleep(std::time::Duration::from_millis(5));}
+            let signal=fs::read_to_string(install.join("ack")).unwrap_or_default();let _=child.kill();child.wait().unwrap();
+            assert_eq!(signal,if phase=="before-write" {"intent-saved"}else{"policy-saved"});
+            let bytes=fs::read(install.join("host.json")).unwrap();
+            let (capture,guard)=crate::profile::tests::collecting(&install);
+            let result=local_capacity(&install,&owner,&request).unwrap();
+            assert_eq!(result["state"],if phase=="before-write" {"unknown"}else{"saved"},"{phase}: {result}");
+            assert_eq!(fs::read(install.join("host.json")).unwrap(),bytes,"recovery rewrote policy at {phase}");
+            if phase=="before-applied" {
+                let p=Policy::read(&install).unwrap();assert_eq!(observe_capacity(&install,&p).unwrap(),result["saved_revision"].as_str().map(String::from));
+            }
+            capture.flush().unwrap();drop(guard);drop(capture);fs::remove_dir_all(base).unwrap();
+        }
     }
 
     // H-A2: identical settings have different command identities; stale/manual readback cannot confirm a new edit.

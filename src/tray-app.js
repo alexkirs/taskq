@@ -5,7 +5,7 @@ const execution=ui.execution;
 const {createState,create}=execution.module("tray",{
 createState:function(snapshot=null){return {manualSize:null,aiText:null,aiMenu:false,aiConfirm:null,addConfirm:false,S:snapshot,page:'home',taskFilter:null,working:null,workCard:null,ask:null,noted:null,pending:{},confirming:null,updating:null,draft:null,disclosures:[],pressedAt:null,stale:false,resizing:null};},
 create:function(view,ports){
-const {gutter,fit,actionReceipt,actionNotices,focusStart,focusReceipt,focusReadback,remember,navigate,back,routeButton,answerCapability,answerReceipt,answerReadback,answerSlot,answerNotices,mountAnswers,tasks,blockProject,unique,counts,mode,counter,known,taskRow,globalGroup,age,problem,modeText,admission,incident,incidentNotice,service,when,local,custom,history,update,opText,nextActions,ai,addProject,bulk,views,appearance,agents,about,attention,projects,controls,home,routeBody,resourceGroup,resourceCapability,resourceSet,resourceReceipt,capacity,workEntry,workPage,mountResources,notifications,notifyGroup,openCard,notedCard,project,filteredTasks,head,draw,wholeLines,settle,refresh,release,receive,measure,mount}=execution.module("tray.create",{
+const {gutter,fit,actionReceipt,actionNotices,focusStart,focusReceipt,focusReadback,remember,navigate,back,routeButton,answerCapability,answerReceipt,answerReadback,answerSlot,answerNotices,mountAnswers,tasks,blockProject,unique,counts,mode,counter,known,taskRow,globalGroup,age,problem,modeText,admission,incident,incidentNotice,service,when,local,custom,history,update,opText,nextActions,ai,addProject,bulk,views,appearance,agents,about,attention,projects,controls,home,routeBody,resourceGroup,resourceCapability,resourceReceipt,capacity,workEntry,workPage,mountResources,notifications,notifyGroup,openCard,notedCard,project,filteredTasks,head,draw,wholeLines,settle,refresh,release,receive,measure,mount}=execution.module("tray.create",{
 gutter:function(){if(ports.measureScrollbar)return ports.measureScrollbar();const d=document.createElement('div');d.style.cssText='position:absolute;top:-99px;width:60px;height:60px;overflow:scroll;scrollbar-width:thin';document.body.append(d);const g=d.offsetWidth-d.clientWidth;d.remove();return Math.ceil(g);},
 fit:function(){const size=view.manualSize||view.S.size,w=size?size[0]:view.S.font>=18?360:320;document.body.style.width='100%';menu.style.width=w+'px';send({a:'size',d:window.devicePixelRatio,g:size?0:gutter(),w,h:size?size[1]:Math.ceil(menu.getBoundingClientRect().height)});menu.style.width='100%';},
 actionReceipt:function(r){if(!view.S?.projects.some(p=>p.root===r.root))return;actionErrors.set(r.root,{text:r.text});present();},
@@ -240,20 +240,20 @@ routeBody:function(){
   }
 },
 resourceGroup:function(p){return {...p.resources,key:p.root,labels:{host:p.cap_host||'this host',project:p.name}};},
-resourceCapability:function(g){const p=view.S&&view.S.projects.find(p=>p.root===g.key),e=p&&p.cap_saved&&p.cap_saved.error;return e||!p?{edit:false,reason:'Read-only here',note:e?'Config: '+e:null}:p.resources?.targets?.some(t=>t.supported?.some(s=>s.policy_schema==='taskq.host-capacity/1'))?{edit:false,reason:'Editing unavailable here',note:'Host limits affect all registered projects. Edit them with taskq service capacity.'}:{edit:true};},
-resourceSet:function(op){const set={limits:{}};for(const o of op.ops){if('runtime_limit' in o.changes)set.limits[o.target.runtime_id]=o.changes.runtime_limit;if(o.changes.load_gate)Object.assign(set,o.changes.load_gate);if('mode' in o.changes)set.mode=o.changes.mode;if('maximum' in o.changes)set.maximum=o.changes.maximum;}return set;},
+resourceCapability:function(g){const p=view.S&&view.S.projects.find(p=>p.root===g.key),e=p&&p.cap_saved&&p.cap_saved.error;return e||!p?{edit:false,reason:'Read-only here',note:e?'Config: '+e:null}:p.resources?.targets?.some(t=>t.supported?.some(s=>s.policy_schema==='taskq.host-capacity/1'))?{edit:TaskqResources.fields(g).length>0,reason:'Editing unavailable here',note:'Host limits affect all registered projects. Project ceilings are read-only here.'}:{edit:false,reason:'Legacy editor unavailable; refresh host status'};},
 
 resourceReceipt:function(m){
   const key=m.root+'#'+m.id,r=resourceRequests.get(key);
   if(!r)return;
   cancel(r.timer);resourceRequests.delete(key);
-  r.resolve(String(m.text).startsWith('Error')?{state:'rejected',reason:String(m.text).replace(/^Error:\s*/,'')}:{state:'saved'});
+  const receipt=['saved','rejected','unknown'].includes(m.state)&&(m.state!=='saved'||typeof m.saved_revision==='string'&&/^[a-f0-9]{32}$/.test(m.saved_revision))?{state:m.state,reason:m.reason,saved_revision:m.saved_revision}:{state:'unknown',reason:'Invalid capacity receipt'};
+  r.resolve(receipt);
   defer(fit,0);},
 capacity:function(p){
   if(!p.resources)return '';
   return '<details class="group"><summary>▤ Capacity <span class="meta">'+esc((p.cap_host||'this host')+' · '+TaskqResources.headline(resourceGroup(p),view.S.now))+'</span></summary><div data-resources="'+esc(p.root)+'"></div></details>';},
 workEntry:function(root){return view.S.projects.some(p=>p.resources)?'<button class="project" data-a="work"'+(root?' data-root="'+esc(root)+'"':'')+'>◎ Work mode…</button>':'';},
-workPage:function(){return '<div data-work></div>';},
+workPage:function(){const ps=view.S.projects.filter(p=>p.resources),p=ps.find(p=>view.working?.[p.root])||ps[0];return p?.resources.targets?.some(t=>t.supported?.some(s=>s.policy_schema==='taskq.host-capacity/1'))?'<div data-resources="'+esc(p.root)+'"></div>':'<div data-work></div>';},
 mountResources:function(){
   const ws=menu.querySelector('[data-work]');
   if(ws){
@@ -375,7 +375,7 @@ measure:function(name){
   }
 },
 mount:function(){
-window.taskq={settle,receive,measure,model:{unique,counts,mode,resourceSet}};
+window.taskq={settle,receive,measure,model:{unique,counts,mode}};
 ui.listen(menu,'scroll',e=>{const c=e.target;if(!c.dataset?.bound)return;cancel(c.settling);c.settling=defer(()=>settle(c),150);},true);
 // a refresh between press and release rebuilds the pressed control and its click is lost (U-A4):
 // the refresh waits for the release, at most 5 s, then runs after the click
@@ -452,9 +452,10 @@ function answerSend(board,op){
 function resourceSend(g,op){
   const capability=resourceCapability(g);
   if(!capability.edit)return Promise.resolve({state:'rejected',reason:capability.reason});
-  const p=view.S.projects.find(p=>p.root===g.key),key=g.key+'#'+op.id;
+  if(!Array.isArray(op.ops)||!op.ops.length||op.ops.some(o=>o.policy_schema!=='taskq.host-capacity/1'||o.target?.project_id!==null))return Promise.resolve({state:'rejected',reason:'Unsupported host capacity scope'});
+  const key=g.key+'#'+op.id;
   // A lost receipt retries the reviewed expectation, never a newer config; keep one operation per project.
-  if(resourcePayloads.get(g.key)?.id!==op.id)resourcePayloads.set(g.key,JSON.parse(JSON.stringify({a:'capacity',root:g.key,id:op.id,set:resourceSet(op),expect:p&&p.cap_saved})));
+  if(resourcePayloads.get(g.key)?.id!==op.id)resourcePayloads.set(g.key,JSON.parse(JSON.stringify({a:'capacity',root:g.key,id:op.id,ops:op.ops,issued_at:view.S.now,expires_at:view.S.now+300})));
   return new Promise(resolve=>{
     const prior=resourceRequests.get(key);if(prior)cancel(prior.timer);
     resourceRequests.set(key,{resolve,timer:defer(()=>{resourceRequests.delete(key);resolve({state:'unknown',reason:'no receipt'});},30000)});
@@ -586,7 +587,7 @@ const modes=[['off','Off'],['silent','Silent'],['banner','Banner'],['sound','Ban
 
 
 
-return {gutter,fit,actionReceipt,actionNotices,focusStart,focusReceipt,focusReadback,remember,navigate,back,routeButton,answerCapability,answerSend,answerReceipt,answerReadback,answerSlot,answerNotices,mountAnswers,tasks,blockProject,unique,counts,mode,counter,known,taskRow,globalGroup,age,problem,modeText,admission,incident,incidentNotice,service,when,local,custom,history,update,opText,nextActions,ai,addProject,bulk,views,appearance,agents,about,attention,projects,controls,home,routeBody,resourceGroup,resourceCapability,resourceSet,resourceSend,resourceReceipt,capacity,workEntry,workPage,mountResources,notifications,notifyGroup,openCard,notedCard,project,filteredTasks,head,draw,wholeLines,settle,refresh,release,receive,measure,mount};
+return {gutter,fit,actionReceipt,actionNotices,focusStart,focusReceipt,focusReadback,remember,navigate,back,routeButton,answerCapability,answerSend,answerReceipt,answerReadback,answerSlot,answerNotices,mountAnswers,tasks,blockProject,unique,counts,mode,counter,known,taskRow,globalGroup,age,problem,modeText,admission,incident,incidentNotice,service,when,local,custom,history,update,opText,nextActions,ai,addProject,bulk,views,appearance,agents,about,attention,projects,controls,home,routeBody,resourceGroup,resourceCapability,resourceSend,resourceReceipt,capacity,workEntry,workPage,mountResources,notifications,notifyGroup,openCard,notedCard,project,filteredTasks,head,draw,wholeLines,settle,refresh,release,receive,measure,mount};
 }
 });
 

@@ -24,7 +24,7 @@ const FRESH: u64 = 60;
 const AHEAD: u64 = 30;
 const RECONCILE: u64 = 300;
 const RETAIN: u64 = 24 * 3600;
-const MAX_OPS: usize = 4096;
+pub(crate) const MAX_OPS: usize = 4096;
 /// Longest host grant, in hours.
 pub const MAX_HOURS: u64 = 720;
 const RUNTIMES: [&str; 3] = crate::service::RUNTIMES;
@@ -106,7 +106,7 @@ fn read(install: &Path) -> Res<State> {
     }
 }
 
-fn save(install: &Path, s: &State) -> Res<()> {
+pub(crate) fn save(install: &Path, s: &State) -> Res<()> {
     let text = serde_json::to_string_pretty(s).map_err(|e| e.to_string())? + "\n";
     coreq::write_durable(&dir(install).join(FILE), &text)?;
     if read(install)? != *s {
@@ -156,7 +156,7 @@ impl<W: Wire> Wire for Fenced<W> {
 }
 
 /// `f` on the state under the host lock; written back when changed.
-fn with<T>(install: &Path, f: impl FnOnce(&mut State) -> Res<T>) -> Res<T> {
+pub(crate) fn with<T>(install: &Path, f: impl FnOnce(&mut State) -> Res<T>) -> Res<T> {
     let _lock = lock(install)?;
     let mut s = read(install)?;
     let before = s.clone();
@@ -173,7 +173,7 @@ fn token(prefix: &str) -> String {
     format!("{prefix}-{}", b.iter().map(|x| format!("{x:02x}")).collect::<String>())
 }
 
-fn id(s: &str) -> bool {
+pub(crate) fn id(s: &str) -> bool {
     !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
@@ -222,7 +222,7 @@ fn receipt(target: &Value, op: &str, state: &str, reason: Option<&str>, saved: O
         "saved_revision": saved, "effective_revision": effective, "observed_at": at})
 }
 
-fn keys(v: &Value, want: &[&str]) -> bool {
+pub(crate) fn keys(v: &Value, want: &[&str]) -> bool {
     v.as_object().is_some_and(|o| o.len() == want.len() && want.iter().all(|k| o.contains_key(*k)))
 }
 
@@ -235,7 +235,7 @@ fn target_ok(t: &Value) -> bool {
         && (t["runtime_id"].is_null() || !t["project_id"].is_null())
 }
 
-fn count(v: &Value) -> bool {
+pub(crate) fn count(v: &Value) -> bool {
     v.as_u64().is_some_and(|n| n <= u32::MAX as u64)
 }
 
@@ -346,6 +346,7 @@ fn decide(install: &Path, s: &mut State, v: &Value, conn: Conn, clock: bool, now
     };
     let op = op.to_string();
     if let Some(o) = s.ops.get_mut(&op) {
+        if o.bound.get("local_capacity").is_some() {return Ok(Some(format!("resources: {op} belongs to a local command; ignored")));}
         // the host deduplicates by op ID: the same submit (or the cancellation that came first) repeats its receipt
         let same = o.bound == *v || (o.bound.get("changes").is_none() && ["schema", "actor_id", "grant_id", "target"].iter().all(|k| o.bound[k] == v[k]));
         if !same {
@@ -446,6 +447,7 @@ fn cancel(s: &mut State, c: &Value, now: u64) -> Option<String> {
         && ["op_id", "actor_id", "grant_id"].iter().all(|k| c[k].as_str().is_some_and(id)) && target_ok(&c["target"]);
     let op = c["op_id"].as_str().filter(|_| valid)?.to_string();
     let full = s.ops.len() >= MAX_OPS;
+    if s.ops.get(&op).is_some_and(|o|o.bound.get("local_capacity").is_some()) {return Some(format!("resources: cancellation of local command {op} ignored"));}
     match s.ops.get_mut(&op) {
         Some(o) if ["schema", "actor_id", "grant_id", "target"].iter().all(|k| o.bound[k] == c[k]) => o.sent = false,
         Some(_) => return Some(format!("resources: cancellation of {op} does not match it; ignored")),
@@ -460,6 +462,7 @@ fn cancel(s: &mut State, c: &Value, now: u64) -> Option<String> {
 /// Saved operations become applied on a fresh service readback of the saved revision (§ 4 `status.json`).
 fn readback(s: &mut State, now: u64) {
     for o in s.ops.values_mut() {
+        if o.bound.get("local_capacity").is_some() {continue;}
         let Some(at) = o.saved_at.filter(|t| o.receipt["state"] == "saved" && now < t + RECONCILE) else { continue };
         let Some(p) = o.receipt["target"]["project_id"].as_str().and_then(|pid| s.projects.get(pid)) else { continue };
         if o.receipt["saved_revision"] != p.revision.as_str() {
@@ -480,7 +483,7 @@ fn readback(s: &mut State, now: u64) {
 }
 
 /// Before an exchange: interrupted writes read unknown, projects and revisions are current, retention is applied.
-fn prepare(s: &mut State, install: &Path, now: u64) -> Res<()> {
+pub(crate) fn prepare(s: &mut State, install: &Path, now: u64) -> Res<()> {
     sync(s, install, now)?;
     for o in s.ops.values_mut().filter(|o| o.writing) {
         o.writing = false;
@@ -495,7 +498,7 @@ fn prepare(s: &mut State, install: &Path, now: u64) -> Res<()> {
 /// Whether there is anything to exchange: an active host grant for this connection, or a receipt DashQ has not taken.
 fn wanted(s: &State, conn: Conn, now: u64) -> bool {
     s.grants.values().any(|g| !g.revoked && now < g.expires_at && g.installation_id == conn.0 && g.generation == conn.1)
-        || s.ops.values().any(|o| !o.sent)
+        || s.ops.values().any(|o| !o.sent && o.bound.get("local_capacity").is_none())
 }
 
 /// One exchange with DashQ over the active connection: up to 8 receipts out, up to 8 operations and cancellations
@@ -512,7 +515,7 @@ pub fn exchange(install: &Path, active: &Value, w: &mut dyn Wire, now: u64) -> R
     }
     let sent: Vec<Value> = with(install, |s| {
         prepare(s, install, now)?;
-        Ok(if wanted(s, conn, now) { s.ops.values().filter(|o| !o.sent).take(ITEMS).map(|o| o.receipt.clone()).collect() } else { vec![json!(null)] })
+        Ok(if wanted(s, conn, now) { s.ops.values().filter(|o| !o.sent && o.bound.get("local_capacity").is_none()).take(ITEMS).map(|o| o.receipt.clone()).collect() } else { vec![json!(null)] })
     })?;
     if sent.first().is_some_and(Value::is_null) {
         return Ok((vec![], false));
@@ -556,7 +559,7 @@ pub fn exchange(install: &Path, active: &Value, w: &mut dyn Wire, now: u64) -> R
         if !clock && !ops.is_empty() {
             log.push(format!("resources: host clock differs from DashQ's by {} s", now.abs_diff(server)));
         }
-        let more = !ops.is_empty() || !cancels.is_empty() || s.ops.values().any(|o| !o.sent);
+        let more = !ops.is_empty() || !cancels.is_empty() || s.ops.values().any(|o| !o.sent && o.bound.get("local_capacity").is_none());
         Ok((log, more))
     })
 }
@@ -755,6 +758,26 @@ mod tests {
         assert_eq!(receipt_of(&t,"host-profile")["reason"],"unsupported");
         assert_eq!(config(&t),before);assert_eq!(fs::read_to_string(t.install.join("host.json")).unwrap(),host);
         fs::remove_dir_all(t.base).unwrap();
+    }
+
+    // H-A2: reusing the bounded store does not export local receipts or grant remote control over their IDs.
+    #[test]
+    fn local_capacity_receipts_never_enter_the_remote_exchange() {
+        let t=setup("local-isolation");
+        fs::write(t.install.join("host.json"),"{\"limits\":{\"codex\":2}}").unwrap();
+        let (capture,guard)=crate::profile::tests::collecting(&t.install);
+        let p=crate::host::Policy::read(&t.install).unwrap();let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let request=json!({"id":"local-op","issued_at":now,"expires_at":now+300,"ops":[{"target":{"installation_id":null,"generation":1,"project_id":null,"runtime_id":"codex"},
+            "policy_schema":"taskq.host-capacity/1","expected_revision":p.revision().unwrap(),"changes":{"runtime_limit":3}}]});
+        assert_eq!(crate::host::local_capacity(&t.install,&p.me,&request).unwrap()["state"],"saved");
+        let before=read(&t.install).unwrap().ops["local-op"].clone();let policy=fs::read(t.install.join("host.json")).unwrap();
+        let mut cancel=fix()["cancel"].clone();cancel["op_id"]=json!("local-op");
+        let (sent,log)=go(&t,&[submit("local-op",json!({"runtime_limit":0}))],&[cancel],100);
+        assert!(sent.is_empty(),"local receipt leaked into DashQ: {sent:?}");
+        assert_eq!(read(&t.install).unwrap().ops["local-op"],before);
+        assert_eq!(fs::read(t.install.join("host.json")).unwrap(),policy);
+        assert_eq!(log.len(),2,"remote cancel and ID reuse must both be explicitly refused");
+        capture.flush().unwrap();drop(guard);drop(capture);fs::remove_dir_all(t.base).unwrap();
     }
 
     fn conn_file(install: &Path) -> PathBuf {

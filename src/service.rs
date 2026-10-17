@@ -3019,13 +3019,15 @@ mod tests {
                 if evidence == "unreadable-comments" { b.state.borrow_mut().fail_comment_reads = 1; }
                 // Prepare the legacy fixture before collection; this case proves ownership, not import contention.
                 crate::profile::prune(&dir).unwrap();
+                let history = crate::profile::read_log(&dir).unwrap();
                 let (_capture,_guard)=crate::profile::tests::collecting(&dir);
                 assert!(crate::profile::selftest(&dir, project, &vec![], 300).is_err());
                 let mut s = service(&b, &c, Default::default());
                 s.focus.clear();
                 s.pass().unwrap();
                 let repaired = crate::profile::read_log(&dir).unwrap();
-                assert!(repaired.starts_with(&original), "original history must survive");
+                assert!(repaired.starts_with(&history), "original history must survive");
+                assert!(std::fs::read_to_string(&path).unwrap().starts_with(&original), "original archive text must survive unchanged");
                 if evidence == "local" {
                     assert!(crate::profile::selftest(&dir, project, &vec![], 300).is_ok(), "{closed}: {repaired}");
                     let record: serde_json::Value = serde_json::from_str(repaired.lines().last().unwrap().strip_prefix("taskq-stage ").unwrap()).unwrap();
@@ -3036,7 +3038,7 @@ mod tests {
                     s.pass().unwrap();
                     assert_eq!(crate::profile::read_log(&dir).unwrap(), repaired, "idempotent repair");
                 } else {
-                    assert_eq!(repaired, original, "{closed}: {evidence} must stay unknown");
+                    assert_eq!(repaired, history, "{closed}: {evidence} must stay unknown");
                     assert!(crate::profile::selftest(&dir, project, &vec![], 300).is_err());
                 }
                 if attempt_log.is_file() { assert_eq!(std::fs::read_to_string(attempt_log).unwrap(), if evidence == "empty-log" { "" } else { "original reviewer output\n" }); }

@@ -1,5 +1,6 @@
 //! Installation-local telemetry. All storage mutations share the installation budget lock; export is read-only.
 mod semantic;
+pub(crate) use semantic::Sample;
 pub(crate) mod diagnostic;
 mod source;
 
@@ -141,9 +142,20 @@ fn import(db: &mut Connection, install: &Path, now: u64) -> Result<(), String> {
 }
 
 /// Metadata-only product records share the installed capture queue and its health.
+#[cfg(test)]
 pub fn observe(line:&str)->Result<(),String> {
     if line.len()>LINE_MAX {return Err("telemetry append exceeds 64 KiB".into());}
     coreq::telemetry::capture::observe(semantic::observation(line.trim_end())?)
+}
+
+/// Live producers submit existing typed records directly; text decoding belongs to historical input.
+pub(crate) fn record(sample:Sample)->std::io::Result<()> {
+    let prepare=||->Result<serde_json::Value,String> {
+        let kind=sample.kind();let original=sample.canonical()?;
+        if semantic::encoded_size(kind,&original)?>LINE_MAX {return Err("telemetry append exceeds 64 KiB".into());}
+        semantic::encode(kind,original)
+    };
+    prepare().and_then(coreq::telemetry::capture::observe).map_err(std::io::Error::other)
 }
 
 /// One owner uses the existing election and budget; live collectors must be quiesced first.
@@ -156,7 +168,7 @@ pub fn migrate(install:&Path)->Result<u64,String> {
     source::import(&mut archive,&target,install)
 }
 
-pub fn report_input(install:&Path)->Result<String,String> {
+pub(crate) fn visit_samples(install:&Path,kinds:&[&str],accept:impl FnMut(usize,Sample))->Result<(),String> {
     // Include this process's admitted records before taking the committed snapshot.
     tracing::dispatcher::get_default(|d|d.downcast_ref::<coreq::telemetry::capture::Capture>().cloned()).map(|capture|capture.flush()).transpose()?;
     tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(),|| {
@@ -164,8 +176,17 @@ pub fn report_input(install:&Path)->Result<String,String> {
         let reader=path.try_exists().map_err(|e|e.to_string())?.then(||coreq::telemetry::Reader::open(&path)).transpose()?;
         let cursor=reader.as_ref().map(|r|r.import_cursor("taskq.legacy")).transpose()?.flatten();
         let archive=legacy_rows(install,cursor.as_deref())?.into_iter().map(|(_,_,line)|line+"\n").collect::<String>();
-        match reader {Some(reader)=>semantic::read(&reader,semantic::KINDS,&archive),None=>Ok(archive)}
+        semantic::visit_samples(reader.as_ref(),kinds,&archive,accept)
     })
+}
+
+pub(crate) fn report_samples(install:&Path,kinds:&[&str])->Result<Vec<Sample>,String> {
+    let mut lanes:[Vec<Sample>;3]=Default::default();visit_samples(install,kinds,|lane,sample|lanes[lane].push(sample))?;Ok(lanes.into_iter().flatten().collect())
+}
+
+#[cfg(test)]
+pub fn report_input(install:&Path)->Result<String,String> {
+    let mut text=String::new();for sample in report_samples(install,semantic::KINDS)? {text.push_str(&sample.line()?);text.push('\n');}Ok(text)
 }
 
 #[cfg(test)]
@@ -376,27 +397,39 @@ mod tests {
         let d=dir();std::fs::create_dir(d.join("telemetry.log")).unwrap();
         let store=std::sync::Arc::new(coreq::telemetry::Store::open_bounded(&d.join("telemetry.log/universal.sqlite3"),budget(&d,"telemetry.sqlite3").unwrap()).unwrap());
         let capture=coreq::telemetry::capture::Capture::new(store.clone(),"taskq","test").unwrap();
+        let ops=(0..1200).map(|mut i|{let mut route=String::from("route");for _ in 0..4 {route.push((b'a'+(i%26) as u8) as char);i/=26;}(format!("GET issues/N/{route}"),1)}).collect::<std::collections::BTreeMap<_,u64>>();
+        let bytes=serde_json::to_vec(&ops).unwrap().len();assert!(bytes>16<<10&&bytes<LINE_MAX-1024);
         tracing::subscriber::with_default(tracing_subscriber::registry().with(capture.clone()),|| {
             let _action=tracing::info_span!("fixture.command").entered();
-            crate::profile::append_line(&d.join("taskq.log"),r#"taskq-stage {"stage":"claim","task":1,"attempt":2,"rt":"other","us":1,"outcome":"ok","error":"none","at_ms":1,"unknown":"no-model"}"#).unwrap();
+            record(Sample::legacy(r#"taskq-stage {"stage":"claim","task":1,"attempt":2,"rt":"other","us":1,"outcome":"ok","error":"none","at_ms":1,"unknown":"no-model"}"#).unwrap()).unwrap();
             for line in [
                 r#"taskq-profile {"op":"spawn","us":1,"error":"none","at_ms":1}"#,
                 r#"taskq-board {"op":"close","us":12,"outcome":"failed","error":"http4xx","remaining":null,"at_ms":1}"#,
                 r#"taskq-transition {"project":"other","task":1,"entry":2,"from":"doing","to":"ask","prev_s":null,"rt":null,"host":null,"at_ms":1}"#,
-                r#"taskq-requests {"at_ms":1,"source":"worker service status","ops":{"GET issues/N/comments":7}}"#,
-            ] {crate::profile::append_line(&d.join("taskq.log"),line).unwrap();}
+            ] {record(Sample::legacy(line).unwrap()).unwrap();}
+            crate::requests::record("worker service status",&ops);
         });
         capture.flush().unwrap();
         assert!(!d.join("telemetry.log/telemetry.sqlite3").exists(),"live semantic events must use the installed writer");
         let rows=store.export_kinds(&["stage"],0,0,1024).unwrap();
         let event=&rows["events"][0]["observation"];
         assert_eq!(event["version"],"test");assert!(event["trace"].is_string());
-        let report=crate::profile::read_log(&d).unwrap();
-        assert_eq!(report.lines().count(),5);
-        for prefix in ["taskq-profile ","taskq-stage ","taskq-board ","taskq-transition ","taskq-requests "] {
-            assert!(report.lines().any(|line|line.starts_with(prefix)),"{prefix}");
+        let report=report_samples(&d,semantic::KINDS).unwrap();
+        assert_eq!(report.len(),5);
+        for kind in semantic::KINDS {
+            assert!(report.iter().any(|sample|sample.kind()==*kind),"{kind}");
         }
-        drop(capture);drop(store);std::fs::remove_dir_all(d).unwrap();
+        let requests=report.iter().find(|sample|sample.kind()=="requests").unwrap().canonical().unwrap();
+        assert_eq!(requests["ops"],serde_json::to_value(&ops).unwrap());
+        assert!(crate::requests::sources_samples(&report,crate::profile::now_ms().unwrap()).contains("worker service status"));
+        let parts=store.export_kinds(&["requests"],0,0,1024).unwrap();let parts=parts["events"].as_array().unwrap();assert!(parts.len()>1);
+        assert!(parts.iter().all(|part|part["observation"]["group_id"].is_string()));
+        drop(capture);
+        let db=Connection::open(d.join("telemetry.log/universal.sqlite3")).unwrap();
+        assert_eq!(db.execute("DELETE FROM events WHERE id=?1",[parts.last().unwrap()["id"].as_str().unwrap()]).unwrap(),1);drop(db);
+        assert!(report_samples(&d,&["requests"]).err().unwrap().contains("incomplete count summary"));
+        assert!(crate::profile::report(&d).contains("Profile: unknown (telemetry incomplete count summary)"));
+        drop(store);std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]

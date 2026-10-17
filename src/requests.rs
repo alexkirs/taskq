@@ -7,14 +7,14 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// Source records in `<install>/taskq.log` (§ 4 budget): one per CLI process at its exit, one per service hour.
+/// Historical source-record prefix; live summaries use capture once per CLI exit or service hour.
 const RECORD: &str = "taskq-requests ";
 /// Requests of this process by operation, for its exit record.
 static PROCESS: Mutex<BTreeMap<String, u64>> = Mutex::new(BTreeMap::new());
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Usage { at_ms: u64, source: String, ops: BTreeMap<String, u64> }
+pub(crate) struct Usage { at_ms: u64, source: String, ops: BTreeMap<String, u64> }
 
 /// Longest pause: GitHub and GitLab budgets reset within the hour.
 const MAX_PAUSE: i64 = 3600;
@@ -206,15 +206,14 @@ pub fn source(argv: &[String], role: Option<&str>) -> Option<String> {
     Some(format!("{role} {cmd}"))
 }
 
-/// Appends one source record of `ops` to `<install>/taskq.log`; nothing when no request was sent.
+/// Submit one typed source observation; nothing when no request was sent.
 pub fn record(source: &str, ops: &BTreeMap<String, u64>) {
-    let Some(path) = crate::profile::log_path() else { return };
     if ops.is_empty() { return; }
     let at_ms = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis().min(u64::MAX as u128) as u64);
     let usage = Usage { at_ms, source: source.into(), ops: ops.clone() };
-    let line = format!("{RECORD}{}\n", serde_json::to_string(&usage).unwrap_or_default());
-    if let Err(e) = crate::profile::append_line(path, &line) {
-        eprintln!("Board request record: unknown ({})", crate::profile::append_error(&e));
+    if let Err(e) = crate::telemetry::record(crate::telemetry::Sample::Requests(usage)) {
+        use std::io::Write;
+        let _=writeln!(std::io::stderr(),"Board request record: unknown ({})", crate::profile::append_error(&e));
     }
 }
 
@@ -227,6 +226,13 @@ pub fn flush(source: &str) {
 /// Validate historical metadata with the same normalization used by the request writer.
 pub(crate) fn legacy_value(line: &str) -> Result<Value,String> {
     let usage:Usage=serde_json::from_str(line.strip_prefix(RECORD).ok_or("unknown request record")?).map_err(|e|e.to_string())?;
+    usage.validate()?;
+    serde_json::to_value(usage).map_err(|e|e.to_string())
+}
+
+impl Usage {
+pub(crate) fn validate(&self)->Result<(),String> {
+    let usage=self;
     let words=usage.source.split(' ').collect::<Vec<_>>();
     let command=|word:&&str|*word=="*"||(!word.is_empty()&&word.len()<=30&&word.bytes().all(|b|b.is_ascii_lowercase()||b==b'-'));
     if usage.source!="service"&&!(matches!(words.first(),Some(&"cli"|&"worker"|&"reviewer"))
@@ -235,16 +241,19 @@ pub(crate) fn legacy_value(line: &str) -> Result<Value,String> {
         let (method,path)=name.split_once(' ').ok_or("invalid request operation")?;
         if !matches!(method,"GET"|"POST"|"PUT"|"PATCH"|"DELETE"|"HEAD"|"OPTIONS")||op(method,&path.split('/').map(|part|if part=="N" {"0"} else {part}).collect::<Vec<_>>().join("/"))!=*name {return Err("invalid request operation".into());}
     }
-    serde_json::to_value(usage).map_err(|e|e.to_string())
+    Ok(())
+}
 }
 
 /// `taskq profile` section: board requests of the hour before `now_ms` by source, from the retained records.
-pub fn sources(text: &str, now_ms: u64) -> String {
+pub(crate) fn sources_samples(samples:&[crate::telemetry::Sample], now_ms: u64) -> String {
     let start = now_ms.saturating_sub(3_600_000);
     let (mut rows, mut first) = (BTreeMap::<String, (u64, BTreeMap<String, u64>)>::new(), None::<u64>);
-    for line in text.lines().filter_map(|l| l.strip_prefix(RECORD)) {
-        let Ok(u) = serde_json::from_str::<Usage>(line) else {
-            return "Board requests by source: unknown (corrupt request record; log kept)\n".into();
+    for sample in samples {
+        let u=match sample {
+            crate::telemetry::Sample::Requests(r)=>r.clone(),
+            crate::telemetry::Sample::Corrupt("requests")=>return "Board requests by source: unknown (corrupt request record; log kept)\n".into(),
+            _=>continue,
         };
         first = Some(first.map_or(u.at_ms, |f| f.min(u.at_ms)));
         if u.at_ms <= start || u.at_ms > now_ms { continue; }
@@ -273,6 +282,9 @@ pub fn sources(text: &str, now_ms: u64) -> String {
     }
     out
 }
+
+#[cfg(test)]
+pub fn sources(text:&str,now_ms:u64)->String {sources_samples(&crate::telemetry::Sample::archive(text),now_ms)}
 
 #[cfg(test)]
 mod tests {

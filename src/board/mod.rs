@@ -702,12 +702,12 @@ mod tests {
     // Chain: real curl/config stdin -> local HTTP refusal -> request accounting and secret-free execution trace.
     #[test]
     fn native_http_preserves_refusal_without_exporting_request_data() {
-        let dir = std::env::temp_dir().join(format!("taskq-native-http-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::env::temp_dir().join(format!("taskq-native-http-{}-{}", std::process::id(),crate::runtime::uuid()));
+        std::fs::create_dir(&dir).unwrap();
         let out = coreq::process::output("test.http", Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "board::tests::native_http_child", "--ignored", "--nocapture"])
             .env("TASKQ_NATIVE_HTTP_TEST_ROOT", &dir), std::time::Duration::from_secs(15));
-        assert!(out.is_ok(), "native HTTP chain failed: {out:?}");
+        assert!(out.is_ok(), "native HTTP chain failed: {out:?}; phases: {}",std::fs::read_to_string(dir.join("phases.log")).unwrap_or_else(|_|"child entry not observed".into()));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -717,7 +717,10 @@ mod tests {
         use std::{io::{Read, Write}, net::TcpListener, time::{Duration, Instant}};
         let dir = std::path::PathBuf::from(std::env::var_os("TASKQ_NATIVE_HTTP_TEST_ROOT").unwrap());
         let began = Instant::now();
+        let phase=|name:&str|writeln!(std::fs::OpenOptions::new().create(true).append(true).open(dir.join("phases.log")).unwrap(),"{name} {}ms",began.elapsed().as_millis()).unwrap();
+        phase("capture.start");
         let _runtime = coreq::telemetry::capture::Runtime::install(&dir.join("db"), "fixtureq", "1").unwrap();
+        phase("capture.ready");
         let installed = began.elapsed();
         crate::profile::take_report();
         // The HTTP deadline starts after collector setup, which has its own outer bound.
@@ -758,18 +761,24 @@ mod tests {
             let reply = "private-response";
             write!(socket, "HTTP/1.1 503 Unavailable\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).unwrap();
         });
+        phase("http.start");
         let result = Api::new(base.clone(), base, "private-token").call("POST", "/request", Some(body));
+        phase("http.returned");
         let joined = server.join();
+        phase("http.joined");
         assert!(joined.is_ok(), "HTTP fixture failed; runtime install={installed:?}, through request={:?}, client error={:?}", began.elapsed(), result.as_ref().err());
         assert!(result.err().unwrap().contains("HTTP 503"));
         assert!(crate::profile::take_report().contains("http5xx:1"));
+        phase("capture.qualify");
         let health = coreq::telemetry::capture::qualify().unwrap();
+        phase("capture.qualified");
         let store = coreq::telemetry::Reader::open(&dir.join("db")).unwrap();
         let exported = store.export(0, 0, 1024).unwrap();
         assert!(exported["events"].as_array().unwrap().iter().any(|r| r["observation"]["operation"] == "fixtureq.operation.board.http"
             && r["observation"]["kind"] == "method" && r["observation"]["outcome"] == "ok"));
         assert!(!exported.to_string().contains("private-"));
         assert_eq!(health["lost"], 0);
+        phase("capture.drop");drop(_runtime);phase("complete");
     }
 
 

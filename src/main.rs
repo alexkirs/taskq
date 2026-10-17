@@ -1114,6 +1114,7 @@ fn save_kids(s: &Service, root: &Path) -> Res<()> {
 fn stopped_handoff(s: &mut Service, host: &host::Shared, cfg: &Config) -> Res<bool> {
     if !host.lock().map_err(|_|"stopped project admission unknown")?.begin_pass(&cfg.root) {return Ok(false);}
     s.reap_owned();
+    s.reconcile_ownership()?;
     s.sync_host();
     let mut h = host.lock().map_err(|_| "stopped project admission unknown")?;
     let idle = s.idle() && !operator::running(&cfg.root);

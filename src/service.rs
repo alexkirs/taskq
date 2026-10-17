@@ -572,6 +572,7 @@ impl<'a> Service<'a> {
         self.unready();
         let before = self.kids.len();
         self.reap_owned();
+        self.reconcile_ownership()?;
         self.sync_host();
         if before != self.kids.len() || self.reduced_at.is_none_or(|t| self.mono.saturating_sub(t) >= (self.cfg.ttl / 5).max(1) as u64) {
             self.reduced_at = Some(self.mono);
@@ -597,6 +598,7 @@ impl<'a> Service<'a> {
     fn reap_owned_within(&mut self,budget:std::time::Duration) {
         let until=std::time::Instant::now()+budget;
         let mut deferred=None;
+        let mut released=BTreeSet::new();
         self.kids.retain_mut(|k| {
             if std::time::Instant::now()>=until {
                 deferred.get_or_insert(k.execution);
@@ -616,6 +618,7 @@ impl<'a> Service<'a> {
             Ok(Some(_)) => match release_execution(self.board,k.task,k.attempt,k.execution,"exit") {
                 Ok(())=>{
                     if matches!(k.rt.as_str(),"codex"|"claude") { if let Err(e)=crate::retire_kid(&self.cfg,k.task,k.attempt,k.execution) { self.log.push(format!("native recovery cleanup: {e}")); } }
+                    released.insert((k.task,k.attempt));
                     self.observations.remove(&(k.task,k.execution));self.cache.remove(&k.task);self.unknown.remove(&k.attempt);self.stopping.remove(&k.attempt);false
                 },
                 Err(e)=>{self.unknown.insert(k.attempt,e);true}
@@ -624,7 +627,18 @@ impl<'a> Service<'a> {
             Err(e) => { self.unknown.insert(k.attempt, e); true }
             }
         });
+        self.retire_reservations(released);
         if let Some(first)=deferred.and_then(|id|self.kids.iter().position(|k|k.execution==id)) {self.kids.rotate_left(first);}
+    }
+
+    fn retire_reservations(&mut self, released:BTreeSet<(u64,u64)>) {
+        for (task,attempt) in released {
+            if self.kids.iter().any(|k|k.task==task && k.attempt==attempt)
+                || self.observations.iter().any(|((n,_),x)|*n==task && x.attempt==attempt)
+                || self.held.iter().any(|l|l.task==task && l.attempt==attempt) {continue;}
+            self.reserved.retain(|(n,a,_)|*n!=task || *a!=attempt);
+            self.pending.remove(&(task,attempt));
+        }
     }
 
     /// New capacity config (§ 3): a gate change starts held.
@@ -660,6 +674,45 @@ impl<'a> Service<'a> {
     /// Lost native handles still hold reservations and must retain their recovery inputs.
     pub fn retained_attempts(&self)->Vec<u64> {
         self.entry().held.into_iter().map(|(_,attempt,_)|attempt).collect()
+    }
+
+    fn observe_ownership(&mut self, views:&[View]) -> Result<(),String> {
+        let mut released=BTreeSet::new();
+        for task in self.observations.keys().map(|(task,_)|*task).collect::<BTreeSet<_>>() {
+            let read;
+            let log=if let Some(v)=views.iter().find(|v|v.issue.number==task) {&v.log}
+                else {read=crate::board::entries(self.board,task)?;&read};
+            let current=core::executions(task,log);
+            // Open-list absence, label removal and missing history never release known ownership.
+            self.observations.retain(|(n,id),old| {
+                let terminal=*n==task && !self.kids.iter().any(|k|k.task==task && k.execution==*id)
+                    && current.iter().any(|x|x.id==*id && x.attempt==old.attempt && x.host==old.host && x.runtime==old.runtime && x.release.is_some());
+                if terminal {released.insert((task,old.attempt));}
+                !terminal
+            });
+        }
+        self.observations.extend(views.iter().flat_map(|v|core::executions(v.issue.number,&v.log).into_iter()
+            .filter(|x|x.host==self.cfg.me && x.release.is_none()).map(|x|((v.issue.number,x.id),x))));
+        self.retire_reservations(released);
+        for ((task,_),x) in &self.observations {
+            let reservation=(*task,x.attempt,x.runtime.clone());
+            if !self.kids.iter().any(|k|k.task==*task && k.execution==x.id) && !self.reserved.contains(&reservation) {self.reserved.push(reservation);}
+        }
+        self.ownership_known=true;
+        Ok(())
+    }
+
+    /// Recovery monitoring reads ownership only; it cannot resume ordinary task effects.
+    pub fn reconcile_ownership(&mut self) -> Result<(),String> {
+        if self.ownership_known && (self.handoff_waits().is_empty()
+            || self.tasks_read.is_some_and(|at|at.elapsed().as_secs()<self.cfg.poll.max(1))) {return Ok(());}
+        self.ownership_known=false;
+        let (views,hosts)=views(self.board,&mut self.cache,&mut self.deps)?;
+        let now=self.board.now()?;
+        self.observe_ownership(&views)?;
+        self.snapshot=Some(crate::snapshot::from_views("host",self.board,&self.cfg,now,&views,&hosts));
+        self.tasks_read=Some(std::time::Instant::now());
+        Ok(())
     }
 
     /// Handles may cross a qualified image switch; childless uncertainty cannot.
@@ -933,18 +986,7 @@ impl<'a> Service<'a> {
         let ttl = self.cfg.ttl;
         let (views, hosts) = views(self.board, &mut self.cache, &mut self.deps)?;
         let now = self.board.now()?;
-        for task in self.observations.keys().map(|(task,_)|*task).collect::<BTreeSet<_>>() {
-            let read;
-            let log=if let Some(v)=views.iter().find(|v|v.issue.number==task) {&v.log}
-                else {read=crate::board::entries(self.board,task)?;&read};
-            let current=core::executions(task,log);
-            // Open-list absence, label removal and missing history never release known ownership.
-            self.observations.retain(|(n,id),old|*n!=task || self.kids.iter().any(|k|k.task==task && k.execution==*id)
-                || !current.iter().any(|x|x.id==*id && x.attempt==old.attempt && x.host==old.host && x.runtime==old.runtime && x.release.is_some()));
-        }
-        self.observations.extend(views.iter().flat_map(|v|core::executions(v.issue.number,&v.log).into_iter()
-            .filter(|x|x.host==me && x.release.is_none()).map(|x|((v.issue.number,x.id),x))));
-        self.ownership_known = true;
+        self.observe_ownership(&views)?;
         self.snapshot = Some(crate::snapshot::from_views("host", self.board, &self.cfg, now, &views, &hosts));
         self.tasks_read = Some(std::time::Instant::now());
         // § 4 one service per host name: another install's fresh heartbeat under this name holds every write (#933)
@@ -2006,7 +2048,8 @@ mod tests {
         let a=b.comment(n,"taskq: spawn worker codex:session mac").unwrap();
         let mut s=Service::new(&b,&c,"fixture",Box::new(|_|panic!("drain must never submit work")));
         s.host=Some(host.clone());
-        assert!(!crate::stopped_handoff(&mut s,&host,&c).unwrap(),"no board observation is not an idle proof");
+        b.state.borrow_mut().fail_comment_reads=1;
+        assert!(crate::stopped_handoff(&mut s,&host,&c).is_err(),"no board observation is not an idle proof");
         s.pass().unwrap();
         assert!(s.kids.is_empty());
         assert!(s.retained_attempts().contains(&a));
@@ -2025,8 +2068,20 @@ mod tests {
         assert!(s.retained_attempts().contains(&a),"leaving the open-issue list is not native termination");
         assert!(!crate::stopped_handoff(&mut s,&host,&c).unwrap());
         release_execution(&b,n,a,a,"exit").unwrap();
-        s.pass().unwrap();
-        assert!(crate::stopped_handoff(&mut s,&host,&c).unwrap(),"verified release permits drain completion");
+        s.tasks_read=Some(std::time::Instant::now()-std::time::Duration::from_secs(c.poll.max(1)));
+        assert!(crate::stopped_handoff(&mut s,&host,&c).unwrap(),"read-only monitor must observe terminal delivery and complete drain");
+        let n=b.create("Recovered","",&[TASK_LABEL.into()]).unwrap();
+        let a=b.comment(n,"taskq: spawn worker codex:recovered mac").unwrap();
+        s.pass().unwrap();assert!(s.retained_attempts().contains(&a));
+        let exit=Rc::new(RefCell::new(None));
+        s.adopt(Kid {execution:a,task:n,attempt:a,rt:"codex".into(),proc:Box::new(FakeProc(exit.clone()))}).unwrap();
+        assert!(!crate::stopped_handoff(&mut s,&host,&c).unwrap());
+        *exit.borrow_mut()=Some(0);
+        assert!(crate::stopped_handoff(&mut s,&host,&c).unwrap(),"reduced monitoring must retire the recovered reservation after exact release");
+        b.state.borrow_mut().fail_comments=1;
+        s.ownership_known=false;
+        assert!(crate::stopped_handoff(&mut s,&host,&c).unwrap(),"read-only recovery can prepare without resuming ordinary board writes");
+        assert_eq!(b.state.borrow().fail_comments,1,"recovery must not try an ordinary task write");
         drop(s);fs::remove_dir_all(&c.root).unwrap();
     }
 

@@ -758,7 +758,7 @@ pub fn run(install: &Path) -> Res<()> {
         if let Some((id,result))=finished {
             drop(h);
             let error=result.err().unwrap_or_else(||"controller exited without an observed host stop".into());
-            let _=crate::lifecycle::failed(install,&id,&error);crate::platform::log(&format!("Stop controller: {}",crate::compact(&error,153)));
+            let _=crate::lifecycle::controller_exited(install,&id,&error);crate::platform::log(&format!("Stop controller: {}",crate::compact(&error,153)));
             h=shared.lock().unwrap_or_else(|e|e.into_inner());
         }
         let timers = h.policy.as_ref().map(|p| (p.update_every, p.rollback_after)).unwrap_or((60, 600));

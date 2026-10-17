@@ -261,10 +261,18 @@ pub fn update_wait(install:&Path,instance:&str)->Res<()> {
 }
 
 pub fn failed(install:&Path,id:&str,error:&str)->Res<()> {
+    record_failure(install,id,error,false)
+}
+
+pub fn controller_exited(install:&Path,id:&str,error:&str)->Res<()> {
+    record_failure(install,id,error,true)
+}
+
+fn record_failure(install:&Path,id:&str,error:&str,only_missing:bool)->Res<()> {
     resources::try_with(install,|state| {
         if let Some(op)=state.ops.get_mut(id) {
             let p=parse(id,op)?;
-            if op.receipt["state"]!="observed" {
+            if op.receipt["state"]!="observed"&&(!only_missing||op.receipt["reason"].is_null()) {
                 let detail:String=error.char_indices().take_while(|(offset,ch)|offset+ch.len_utf8()<=112).map(|(_,ch)|ch).collect();
                 op.receipt["reason"]=json!(format!("{} outcome unknown: {detail}; retry service {} --request {id}",p.action().title(),p.action().title().to_ascii_lowercase()));
             }
@@ -467,6 +475,10 @@ mod tests {
         while !ready.is_file() {assert!(child.0.try_wait().unwrap().is_none(),"Stop owner fixture exited before preparation");assert!(Instant::now()<until);std::thread::sleep(Duration::from_millis(10));}
         let (capture,guard)=crate::profile::tests::collecting(&install);
         let original=receipt(&install,"exact-stop").unwrap().unwrap();assert_eq!(original["action"],if mode=="stop" {"stop"}else{"uninstall"});assert_eq!(original["state"],"applied");
+        controller_exited(&install,"exact-stop","controller exited before recording its cause").unwrap();
+        let fallback=receipt(&install,"exact-stop").unwrap().unwrap();
+        assert!(fallback["reason"].as_str().unwrap().contains("controller exited before recording its cause"));
+        assert!(fallback["reason"].as_str().unwrap().contains("--request exact-stop"));
         if mode=="stop" {
             assert!(original["restart_condition"].as_str().unwrap().contains("service install"));
             assert_eq!(original["restart_condition"].as_str().unwrap().contains("logon"),!cfg!(target_os="linux"));
@@ -494,6 +506,9 @@ mod tests {
         assert!(complete_stop_with(&install,"exact-stop",|_,_|Err("native effect failed".into())).unwrap_err().contains("native effect failed"));
         failed(&install,"exact-stop","native host path scope differs").unwrap();
         let failure=receipt(&install,"exact-stop").unwrap().unwrap()["reason"].clone();
+        assert!(failure.as_str().unwrap().contains("native host path scope differs"),"a new concrete error replaces the earlier fallback");
+        controller_exited(&install,"exact-stop","process exited with exit status: 1").unwrap();
+        assert_eq!(receipt(&install,"exact-stop").unwrap().unwrap()["reason"],failure,"outer controller exit cannot hide its retained inner cause");
         let origin=pending(&install).unwrap().unwrap().origin().to_string();
         update_wait(&install,&origin).unwrap();
         assert_eq!(receipt(&install,"exact-stop").unwrap().unwrap()["reason"],failure,"background maintenance cannot hide a prepared controller failure");

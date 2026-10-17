@@ -1046,9 +1046,11 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
 }
 
 fn publish_status(tool: &coreq::Tool, root: &Path, status: &Value, host: Option<&host::Shared>) -> bool {
-    let written = coreq::status::write(tool, root, status);
+    let mut status=status.clone();
+    if let Some(host)=host {status["host_instance"]=host.lock().map(|h|json!(h.instance)).unwrap_or(Value::Null);}
+    let written = coreq::status::write(tool, root, &status);
     if let Err(e) = &written { log!("status publication failed: {e}; observed state unknown"); }
-    let qualified = written.is_ok() && snapshot::complete(status) && status["error"].is_null() && status["focus_error"].is_null();
+    let qualified = written.is_ok() && snapshot::complete(&status) && status["error"].is_null() && status["focus_error"].is_null();
     if let Some(host) = host { if let Ok(mut h) = host.lock() { h.publication(root, qualified); } }
     qualified
 }
@@ -1632,6 +1634,10 @@ fn restart_waits(s: &Service, root: &Path) -> Vec<String> {
 }
 
 fn service_fields(root: &Path) -> String {
+    service_project_fields(root,data::json(&dot(root).join("status.json")))
+}
+
+fn service_project_fields(root:&Path,status:Res<Option<Value>>)->String {
     let d = dot(root);
     let mut out = vec![format!("Project: `{}`", root.display())];
     match data::focus(root) {
@@ -1640,7 +1646,6 @@ fn service_fields(root: &Path) -> String {
         Ok(f) => out.extend(f.iter().map(|l| format!("Focus: {l}"))),
         Err(e) => out.push(format!("Focus: unknown ({e})")),
     }
-    let status = data::json(&d.join("status.json"));
     if let Err(e) = &status {
         out.push(format!("Status: unknown ({e})"));
     }
@@ -1662,12 +1667,42 @@ fn service_fields(root: &Path) -> String {
         (Some(s), Some(a)) if snapshot::complete(&s) => {
             out.push(snapshot::counts_line(&snapshot::status_totals(&s).unwrap()));
             out.push(format!("Freshness: {} (cached status)", age(a as i64)));
-            out.push("Service: unknown (process not checked)".into());
         }
-        _ => out.push("Service: unknown (status missing, stale or failed)\nFreshness: unknown (no fresh successful status)\nCounts: unknown (no fresh successful read)".into()),
+        _ => out.push("Snapshot: unknown (status missing, stale or failed)\nFreshness: unknown (no fresh successful status)\nCounts: unknown (no fresh successful read)".into()),
     }
     out.extend(requests);
     out.join("\n")
+}
+
+fn service_report(a:&Args)->Res<()> {
+    let install=platform::default_install();
+    let service=host::service_status(&install);
+    let registry=host::project_paths(&install);
+    let rows:Vec<_>=registry.as_ref().ok().into_iter().flatten().map(|root|(root,data::json(&dot(root).join("status.json")))).collect();
+    let binding=|status:&Res<Option<Value>>| {
+        let Some(s)=status.as_ref().ok().and_then(Option::as_ref) else {return "unknown";};
+        if service["state"]!="running"||s["pid"].as_u64().is_none_or(|pid|pid==0||pid>i32::MAX as u64)
+            ||s["host_instance"].as_str().is_none_or(|id|!resources::id(id)) {return "unknown";}
+        if s["pid"]==service["pid"]&&s["host_instance"]==service["instance"] {"current"}else{"other"}
+    };
+    if a.flags.contains_key("json") {
+        let projects:Vec<_>=rows.into_iter().map(|(root,status)|json!({"root":root,"host_binding":binding(&status),
+            "status":status.as_ref().ok().and_then(Option::as_ref),"error":status.as_ref().err()})).collect();
+        println!("{}",json!({"schema":"taskq.service/1","service":service,"projects":projects,"registry_error":registry.as_ref().err()}));
+    } else {
+        println!("{}",host::service_line(&service));
+        if let Err(error)=&registry {println!("Projects: unknown ({error})");}
+        for (root,status) in rows {
+            let owner=binding(&status);
+            let notice=status.as_ref().ok().and_then(Option::as_ref).is_some_and(|s|s["incident_notice"]==true);
+            let update=status.as_ref().ok().and_then(Option::as_ref).and_then(|s|s["update"].as_str()).unwrap_or("unknown");
+            println!("Update: {update}");
+            println!("{}\nProject owner: {owner}",service_project_fields(root,status));
+            println!("{}",incident::line(&incident::status(root)));
+            if notice||incident::notice(root) {println!("Incident reports: notice");}
+        }
+    }
+    Ok(())
 }
 
 #[tracing::instrument(name="service.command",skip_all,fields(coreq_operation=match args.pos.get(1).map(String::as_str).unwrap_or("") {
@@ -1681,13 +1716,7 @@ fn service(args: &Args) -> Res<()> {
         platform::service_log();
     }
     let projects = platform::default_install().join("projects");
-    if sub == "list" {
-        // one project root per line, written by `service install` (§ 5); a PM or ARM covers several projects from it
-        for r in fs::read_to_string(&projects).map_err(|e| format!("{}: {e}", projects.display()))?.lines().filter(|l| !l.is_empty()) {
-            println!("{}", service_fields(Path::new(r)));
-        }
-        return Ok(());
-    }
+    if matches!(sub,"status"|"list") {return service_report(args);}
     if sub == "capacity" {return capacity_cmd(args);}
     if sub == "run" {
         let install=platform::default_install();
@@ -1747,16 +1776,6 @@ fn service(args: &Args) -> Res<()> {
             fs::write(d.join("restart"), "").map_err(|e| e.to_string())?;
             poke(&root)?;
             println!("Restart requested for {}", project_name(&root));
-            Ok(())
-        }
-        "status" => {
-            let text = fs::read_to_string(d.join("status.json")).map_err(|_| "no service status: is `taskq service run` running here?".to_string())?;
-            println!("{text}");
-            let status = data::json(&d.join("status.json"))?.unwrap_or_default();
-            println!("Update: {}", status["update"].as_str().unwrap_or("unknown"));
-            println!("{}", incident::line(&incident::status(&root)));
-            if status["incident_notice"] == true || incident::notice(&root) { println!("Incident reports: notice"); }
-            for l in requests::lines(&status) { println!("{l}"); }
             Ok(())
         }
         "install" | "uninstall" | "stop" => {
@@ -4100,7 +4119,7 @@ mod tests {
         assert!(s.contains("Focus: one\nFocus: two"));
         assert!(s.contains("In work 2 · Waiting for answer 1 · Ready 1"));
         assert!(s.contains("cached status"));
-        assert!(s.contains("Service: unknown (process not checked)"));
+        assert!(!s.contains("Service:"),"project cache cannot claim native host health");
         // Capacity-only publication keeps the file fresh without refreshing the board counts.
         status["tasks_age_seconds"] = json!(301);
         status["capacity"] = json!({"gate": "off"});

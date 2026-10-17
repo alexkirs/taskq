@@ -25,4 +25,11 @@ const notice=(context.incidentNotice(context.p));
 for(const text of ['Incident reports: notice','taskqorg/taskq','public','Posting account: unknown','Reports stay local','incident_reports','false','TASKQ_INCIDENT_REPORTS=off'])assert(notice.includes(text));
 assert(!notice.includes('data-a='),'disclosure has no action that could enable reporting');
 context.p.incident_notice=false;assert.equal((context.incidentNotice(context.p)),'');
+context.p={name:'fixture',root:'fixture',alive:true};
+for(const [service,has] of [[null,'Host service: unknown'],[{state:'running',pid:731,fresh:true},'running · PID 731 · fresh observation'],
+ [{state:'running',pid:731,fresh:false},'running · PID 731 · stale observation'],[{state:'exited'},'recorded process exited; worker outcomes separate'],
+ [{state:'unknown',reason:'<bad owner>'},'unknown: &lt;bad owner&gt;']]){
+ context.S={service};assert(context.service(context.p).includes(has),has);
+}
 console.log('PASS five incident states, missing/stale status, local actions, escaped project, disclosure without automatic enable');
+console.log('PASS shared native host state, separate freshness/worker outcomes and escaped unknown reason');

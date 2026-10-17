@@ -336,6 +336,7 @@ fn slot(project: &Path, task: u64, attempt: u64) -> Slot {
     (project.into(), if attempt == 0 { task } else { 0 }, attempt)
 }
 pub struct Host {
+    pub instance: String,
     pub policy: Res<Policy>,
     pub capacity_command:Option<String>,
     slots: BTreeMap<Slot, String>,
@@ -361,7 +362,7 @@ pub struct Host {
 
 impl Host {
     pub fn new(policy: Res<Policy>) -> Self {
-        Self { policy, capacity_command:None, slots: BTreeMap::new(), gate: Gate::default(), began: Instant::now(), last: None,
+        Self { instance:crate::runtime::uuid(),policy, capacity_command:None, slots: BTreeMap::new(), gate: Gate::default(), began: Instant::now(), last: None,
             ready: BTreeSet::new(), turn: None, held: None, restart: false, busy: BTreeMap::new(), prepared: BTreeSet::new(), draining: BTreeSet::new(),
             request_since: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()), hour_start: crate::requests::totals(), last_hour: None,
             rebuilding: false, rebuilt: BTreeSet::new(), published: BTreeMap::new() }
@@ -454,16 +455,73 @@ impl Host {
     }
 }
 
-/// A prior recorded owner must have exited; record age never proves that. The PID record is a projection.
-pub fn other(install: &Path) -> Res<Option<u32>> {
-    let text=match fs::read_to_string(install.join("service")) {
+#[derive(serde::Serialize,serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServiceRecord {
+    schema:u8,pid:u32,started:String,instance:String,at:u64,version:String,
+}
+enum OwnerRecord { Legacy(u32), Current(ServiceRecord) }
+
+fn service_record(install:&Path)->Res<Option<OwnerRecord>> {
+    use std::io::Read;
+    let file=match fs::File::open(install.join("service")) {
         Err(e) if e.kind()==std::io::ErrorKind::NotFound=>return Ok(None),
-        Err(e)=>return Err(format!("host service pid unknown: {e}")),
-        Ok(text)=>text,
+        Err(e)=>return Err(format!("host service owner unknown: {e}")),
+        Ok(file)=>file,
     };
-    let pid=text.trim().parse::<u32>().map_err(|_|"host service pid unknown: malformed record")?;
-    if pid==0 {return Err("process liveness unknown: invalid pid".into());}
-    Ok((pid!=std::process::id() && crate::runtime::liveness(pid)?).then_some(pid))
+    let mut bytes=Vec::new();file.take(1025).read_to_end(&mut bytes).map_err(|e|format!("host service owner unknown: {e}"))?;
+    if bytes.len()>1024 {return Err("host service owner unknown: oversized record".into());}
+    let text=String::from_utf8(bytes).map_err(|_|"host service owner unknown: invalid text")?;
+    if let Ok(pid)=text.trim().parse::<u32>() {
+        if pid==0||pid>i32::MAX as u32 {return Err("process liveness unknown: invalid pid".into());}
+        return Ok(Some(OwnerRecord::Legacy(pid)));
+    }
+    let r:ServiceRecord=serde_json::from_str(&text).map_err(|_|"host service owner unknown: malformed record")?;
+    if r.schema!=1||r.pid==0||r.pid>i32::MAX as u32||r.started.is_empty()||r.started.len()>128
+        ||!r.started.bytes().all(|c|c.is_ascii_alphanumeric()||c==b'-')||!crate::resources::id(&r.instance)||r.version.is_empty()||r.version.len()>80 {
+        return Err("host service owner unknown: unsupported record; kept".into());
+    }
+    Ok(Some(OwnerRecord::Current(r)))
+}
+
+fn publish_service(install:&Path,native:&coreq::process::Identity,instance:&str)->Res<()> {
+    let record=ServiceRecord {schema:1,pid:native.pid,started:native.started.clone(),instance:instance.into(),at:wall()?,version:crate::platform::VERSION.into()};
+    crate::platform::write_atomic(&install.join("service"),&(serde_json::to_string(&record).map_err(|e|e.to_string())?+"\n"))
+}
+
+/// A prior recorded owner must have exited; age never proves that. The native lock still owns admission.
+pub fn other(install: &Path) -> Res<Option<u32>> {
+    match service_record(install)? {
+        None=>Ok(None),
+        Some(OwnerRecord::Legacy(pid))=>Ok((pid!=std::process::id()&&crate::runtime::liveness(pid)?).then_some(pid)),
+        Some(OwnerRecord::Current(r))=> {
+            let live=coreq::process::identity(r.pid).map_err(|e|format!("host service owner unknown: {e}"))?;
+            Ok((r.pid!=std::process::id()&&live.as_ref().is_some_and(|p|p.started==r.started)).then_some(r.pid))
+        }
+    }
+}
+
+/// Native process state and projection freshness are separate; neither releases any owned execution.
+pub fn service_status(install:&Path)->Value {
+    let result=coreq::telemetry::capture::operation("host.service.observe",||->Res<Value> {
+        let record=service_record(install)?.ok_or("host service owner record missing")?;
+        let OwnerRecord::Current(r)=record else {return Err("legacy PID-only owner record; host identity unknown".into());};
+        let native=coreq::process::identity(r.pid).map_err(|e|format!("host service owner unknown: {e}"))?;
+        let live=native.as_ref().is_some_and(|p|p.started==r.started);
+        let age=wall()?.checked_sub(r.at);
+        let fresh=live&&age.is_some_and(|age|age<=60);
+        Ok(json!({"state":if live {"running"}else{"exited"},"pid":r.pid,"started":r.started,"instance":r.instance,"version":r.version,
+            "at":r.at,"age_seconds":age,"fresh":fresh,"reason":if !live {Some("recorded host process exited; worker outcomes remain separate")}else if !fresh {Some("host observation stale or clock unknown")}else{None}}))
+    },|_|"owner-unknown");
+    result.unwrap_or_else(|reason|json!({"state":"unknown","fresh":false,"reason":reason}))
+}
+
+pub fn service_line(status:&Value)->String {
+    match status["state"].as_str() {
+        Some("running")=>format!("Service: running (host, pid {}); observation {}",status["pid"],if status["fresh"]==true {"fresh"}else{"stale or unknown"}),
+        Some("exited")=>format!("Service: recorded host process exited (pid {}); worker outcomes unknown here",status["pid"]),
+        _=>format!("Service: unknown ({})",status["reason"].as_str().unwrap_or("no native observation")),
+    }
 }
 
 /// Legacy roots are never served concurrently, even when their status has gone stale. Unknown holds admission.
@@ -486,11 +544,12 @@ fn legacy(roots: &[PathBuf]) -> Res<()> {
     Ok(())
 }
 
-fn startup_status(install: &Path, root: &Path, error: &str) -> Res<()> {
+fn startup_status(install: &Path, root: &Path, error: &str,instance:&str) -> Res<()> {
     if project_service(root)?.is_some() { return Err("legacy ownership retained; startup status not written".into()); }
-    let status = coreq::status::common(&crate::platform::tool(install), "unknown", &crate::project_name(root),
+    let mut status = coreq::status::common(&crate::platform::tool(install), "unknown", &crate::project_name(root),
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()), Some(error.into()), None);
     fs::create_dir_all(crate::dot(root)).map_err(|e| e.to_string())?;
+    status["host_instance"]=json!(instance);
     coreq::status::write(&crate::platform::tool(install), root, &status)
 }
 
@@ -516,6 +575,8 @@ pub fn run(install: &Path) -> Res<()> {
         std::thread::sleep(std::time::Duration::from_secs(1));
     };
     let shared = Arc::new(Mutex::new(Host::new(Policy::read(install))));
+    let native=coreq::process::identity(std::process::id()).map_err(|e|e.to_string())?.ok_or("host process identity missing")?;
+    let instance=shared.lock().map_err(|_|"host owner unknown")?.instance.clone();
     let mut threads: BTreeMap<PathBuf, std::thread::JoinHandle<Res<()>>> = BTreeMap::new();
     let mut roots = vec![];
     let mut stopped = BTreeSet::new();
@@ -526,7 +587,7 @@ pub fn run(install: &Path) -> Res<()> {
     let mut registry = Registry::default();
     loop {
         if let Err(e) = crate::profile::prune(install) { eprintln!("taskq: telemetry unknown: {e}"); }
-        crate::platform::write_atomic(&install.join("service"), &format!("{}\n", std::process::id()))?;
+        publish_service(install,&native,&instance)?;
         registry.refresh(install, began.elapsed().as_secs());
         roots.clone_from(&registry.roots);
         let old = legacy(&roots);
@@ -570,7 +631,8 @@ pub fn run(install: &Path) -> Res<()> {
                                     h.busy.insert(root.clone(), false);
                                     if h.restart { h.prepared.insert(root.clone()); }
                                 }
-                                let _ = startup_status(&install, &root, &e);
+                                let instance=host.lock().map(|h|h.instance.clone()).unwrap_or_default();
+                                let _ = startup_status(&install, &root, &e,&instance);
                                 crate::platform::log(&e);
                                 std::thread::sleep(std::time::Duration::from_secs(1));
                             }
@@ -1038,12 +1100,67 @@ mod tests {
         assert!(freed,"native owner exit did not release ownership");
     }
 
+    // H-A1/H-A5: exact native incarnation, launch generation and observation age have independent meanings.
+    #[test]
+    fn host_owner_projection_separates_identity_generation_and_freshness() {
+        let install=temp("owner-observation");
+        let marker=install.join("published");
+        let mut child=std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact","host::tests::owner_probe","--ignored"])
+            .env("TASKQ_OWNER_INSTALL",&install).env("TASKQ_OWNER_MARKER",&marker).env("TASKQ_OWNER_PUBLISH","first")
+            .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+        let until=Instant::now()+std::time::Duration::from_secs(5);
+        while !marker.exists()&&Instant::now()<until&&child.try_wait().unwrap().is_none() {std::thread::yield_now();}
+        assert_eq!(fs::read_to_string(marker).unwrap(),"claimed");
+        let native=coreq::process::identity(child.id()).unwrap().unwrap();
+        let status=service_status(&install);
+        assert_eq!(status["state"],"running");assert_eq!(status["fresh"],true);assert_eq!(status["instance"],"first");
+        assert!(service_line(&status).contains("running (host, pid"));
+        assert_eq!(other(&install).unwrap(),Some(child.id()));
+        let original=fs::read_to_string(install.join("service")).unwrap();
+        let mut record:Value=serde_json::from_str(&original).unwrap();
+        for at in [wall().unwrap()-120,wall().unwrap()+120] {
+            record["at"]=json!(at);fs::write(install.join("service"),record.to_string()).unwrap();
+            let stale=service_status(&install);assert_eq!(stale["state"],"running");assert_eq!(stale["fresh"],false);
+            assert!(service_line(&stale).contains("observation stale or unknown"));
+            assert_eq!(other(&install).unwrap(),Some(child.id()),"stale/future projection released a live owner");
+        }
+        publish_service(&install,&native,"second").unwrap();
+        assert_eq!(service_status(&install)["instance"],"second","same native PID may have a new host launch");
+        record=serde_json::from_str(&original).unwrap();record["started"]=json!(format!("{}-older",native.started));
+        fs::write(install.join("service"),record.to_string()).unwrap();
+        assert_eq!(service_status(&install)["state"],"exited","another incarnation must not look like the recorded daemon");
+        assert_eq!(other(&install).unwrap(),None);assert!(coreq::process::identity(child.id()).unwrap().is_some());
+        assert!(owner(&install).unwrap().is_none(),"record mismatch bypassed the native ownership lock");
+        record["schema"]=json!(2);
+        for text in [record.to_string(),"{".into(),"x".repeat(1025)] {
+            fs::write(install.join("service"),&text).unwrap();
+            assert_eq!(service_status(&install)["state"],"unknown");assert!(other(&install).is_err());
+            assert_eq!(fs::read_to_string(install.join("service")).unwrap(),text);
+        }
+        fs::write(install.join("service"),child.id().to_string()).unwrap();
+        assert_eq!(service_status(&install)["state"],"unknown","PID-only compatibility cannot certify a native host owner");
+        assert_eq!(other(&install).unwrap(),Some(child.id()));
+        publish_service(&install,&native,"second").unwrap();
+        child.kill().unwrap();child.wait().unwrap();
+        assert_eq!(service_status(&install)["state"],"exited");assert_eq!(other(&install).unwrap(),None);
+        fs::remove_dir_all(install).unwrap();
+    }
+
     #[test]
     #[ignore="owned native process for one_host_owner_before_heartbeat_publication"]
     fn owner_probe() {
         let install=PathBuf::from(std::env::var_os("TASKQ_OWNER_INSTALL").unwrap());
         let claim=owner(&install).unwrap();
         let marker=PathBuf::from(std::env::var_os("TASKQ_OWNER_MARKER").unwrap());
+        if claim.is_some()&&let Ok(instance)=std::env::var("TASKQ_OWNER_PUBLISH") {
+            use std::io::Read;
+            let native=coreq::process::identity(std::process::id()).unwrap().unwrap();
+            publish_service(&install,&native,&instance).unwrap();
+            crate::platform::write_atomic(&marker,"claimed").unwrap();
+            let _=std::io::stdin().read(&mut [0]); // Parent pipe closure also retires a failed fixture.
+            return;
+        }
         crate::platform::write_atomic(&marker,if claim.is_some(){"claimed"}else{"blocked"}).unwrap();
         if std::env::var_os("TASKQ_OWNER_HOLD").is_some() && claim.is_some() {loop {std::thread::park();}}
     }
@@ -1229,6 +1346,7 @@ mod tests {
         assert!(crate::publish_status(&tool,&root,&status,Some(&host)));
         assert!(host.lock().unwrap().publications_ready(&roots));
         let path=coreq::status::path(&tool,&root);
+        assert_eq!(crate::data::json(&path).unwrap().unwrap()["host_instance"],host.lock().unwrap().instance);
         fs::remove_file(&path).unwrap();fs::create_dir(&path).unwrap();
         assert!(!crate::publish_status(&tool,&root,&status,Some(&host)));
         assert!(!host.lock().unwrap().publications_ready(&roots));
@@ -1238,6 +1356,7 @@ mod tests {
         for failed in [json!({"complete":false,"tasks":[]}),json!({"complete":true,"tasks":[],"error":"board unavailable"}),
             json!({"complete":true,"tasks":[],"focus_error":"focus command pending"})] {
             assert!(!crate::publish_status(&tool,&root,&failed,Some(&host)));
+            assert_eq!(crate::data::json(&path).unwrap().unwrap()["host_instance"],host.lock().unwrap().instance,"failed status lost its owner generation");
             assert!(!host.lock().unwrap().publications_ready(&roots));
         }
         assert!(crate::publish_status(&tool,&root,&status,Some(&host)));
@@ -1397,7 +1516,7 @@ mod tests {
         fs::create_dir_all(crate::dot(&install)).unwrap();
         let legacy_status = format!("{{\"pid\":{}}}", child.id());
         fs::write(crate::dot(&install).join("status.json"), &legacy_status).unwrap();
-        assert!(startup_status(&install, &install, "invented malformed config").is_err());
+        assert!(startup_status(&install, &install, "invented malformed config","fixture").is_err());
         assert_eq!(fs::read_to_string(crate::dot(&install).join("status.json")).unwrap(), legacy_status, "startup failure cannot overwrite a live legacy pid");
         assert!(legacy(&[install.clone()]).is_err());
         fs::write(install.join("service"), child.id().to_string()).unwrap(); assert_eq!(other(&install).unwrap(), Some(child.id()));

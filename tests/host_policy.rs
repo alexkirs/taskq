@@ -1,6 +1,61 @@
 use serde_json::{Value,json};
 use std::{fs,process::Command,time::{Duration,SystemTime,UNIX_EPOCH}};
 
+// H-A1/H-A5: actual status/list CLI -> same native observation from any cwd; generation fences project caches.
+#[test]
+fn service_status_observes_exact_owner_without_project_cwd() {
+    let stamp=SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let base=std::env::temp_dir().join(format!("taskq-host-observation-{}-{stamp}",std::process::id()));
+    let install=base.join("install");let root=base.join("project");let outside=base.join("unrelated");
+    for dir in [&install,&outside,&root.join(".taskq")] {fs::create_dir_all(dir).unwrap();}
+    fs::write(root.join("taskq.json"),json!({"repo":"fixture/project"}).to_string()).unwrap();
+    fs::write(install.join("projects"),format!("{}\n",root.display())).unwrap();
+    let native=coreq::process::identity(std::process::id()).unwrap().unwrap();
+    let now=SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let mut record=json!({"schema":1,"pid":native.pid,"started":native.started,"instance":"run-a","at":now,"version":"fixture"});
+    fs::write(install.join("service"),record.to_string()).unwrap();
+    fs::write(root.join(".taskq/status.json"),json!({"pid":native.pid,"host_instance":"run-a","at":now,"complete":false}).to_string()).unwrap();
+    let command=|cwd:&std::path::Path,args:&[&str]| {
+        let output=coreq::process::output("test.host-status",Command::new(env!("CARGO_BIN_EXE_taskq"))
+            .args(args).current_dir(cwd).env("TASKQ_INSTALL",&install).env_remove("TASKQ_ROOT")
+            .env_remove("TASKQ_ATTEMPT").env_remove("TASKQ_TASK").env_remove("COREQ_TRACE_CONTEXT")
+            .env("TASKQ_INCIDENT_REPORTS","off"),Duration::from_secs(10)).unwrap();
+        assert!(output.status.success());output
+    };
+    let run=|cwd:&std::path::Path,args:&[&str]|serde_json::from_slice::<Value>(&command(cwd,args).stdout).unwrap();
+    for cwd in [&install,&root,&outside] {
+        for verb in ["status","list"] {
+            let report=run(cwd,&["service",verb,"--json"]);
+            assert_eq!(report["service"]["state"],"running");assert_eq!(report["service"]["instance"],"run-a");
+            assert_eq!(report["projects"].as_array().unwrap().len(),1);
+            assert_eq!(report["projects"][0]["root"],root.to_str().unwrap());assert_eq!(report["projects"][0]["host_binding"],"current");
+        }
+    }
+    record["instance"]=json!("run-b");fs::write(install.join("service"),record.to_string()).unwrap();
+    let report=run(&outside,&["service","status","--json"]);
+    assert_eq!(report["service"]["instance"],"run-b");assert_eq!(report["projects"][0]["host_binding"],"other","same PID cannot confirm another host generation");
+    for cache in [json!({"pid":native.pid}),json!({"pid":0,"host_instance":"run-b"}),json!({"pid":native.pid,"host_instance":"bad generation"})] {
+        fs::write(root.join(".taskq/status.json"),cache.to_string()).unwrap();
+        assert_eq!(run(&outside,&["service","status","--json"])["projects"][0]["host_binding"],"unknown");
+    }
+    fs::write(root.join(".taskq/status.json"),json!({"pid":native.pid,"host_instance":"run-b","incident_notice":true}).to_string()).unwrap();
+    fs::write(root.join("taskq.json"),json!({"repo":"fixture/project","incident_reports":false}).to_string()).unwrap();
+    let text=String::from_utf8(command(&outside,&["service","status"]).stdout).unwrap();
+    assert!(text.contains("Service: running (host, pid"));assert!(text.contains("Project owner: current"));
+    assert!(text.contains("Incident reports: notice"),"status lost its retained disclosure: {text}");
+    fs::write(root.join(".taskq/status.json"),"{").unwrap();
+    let report=run(&outside,&["service","status","--json"]);
+    assert_eq!(report["service"]["state"],"running");assert!(report["projects"][0]["error"].is_string());
+    assert_eq!(fs::read_to_string(root.join(".taskq/status.json")).unwrap(),"{");
+    fs::write(install.join("projects"),"relative\n").unwrap();
+    let report=run(&outside,&["service","status","--json"]);
+    assert_eq!(report["service"]["state"],"running");assert!(report["projects"].as_array().unwrap().is_empty());assert!(report["registry_error"].is_string());
+    record["schema"]=json!(2);let unknown=record.to_string();fs::write(install.join("service"),&unknown).unwrap();
+    assert_eq!(run(&outside,&["service","status","--json"])["service"]["state"],"unknown");
+    assert_eq!(fs::read_to_string(install.join("service")).unwrap(),unknown);
+    fs::remove_dir_all(base).unwrap();
+}
+
 // H-A2: actual CLI -> authoritative host edit/readback; project caps and private owner fields stay intact.
 #[test]
 fn capacity_command_changes_host_policy_not_project_settings() {

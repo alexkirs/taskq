@@ -178,7 +178,9 @@ fn project_run_waits_for_the_host_owner() {
         let mut child=Command::new(env!("CARGO_BIN_EXE_taskq")).args(["service","run"])
             .env("TASKQ_INSTALL",&install).env_remove("TASKQ_ROOT").env_remove("TASKQ_ATTEMPT")
             .env_remove("TASKQ_TASK").env_remove("COREQ_TRACE_CONTEXT").env("TASKQ_INCIDENT_REPORTS","off")
+            .env("COREQ_TELEMETRY_STORE_TRACE","1")
             .current_dir(cwd).stdout(std::process::Stdio::null()).stderr(fs::File::create(&log).unwrap()).spawn().unwrap();
+        let began=std::time::Instant::now();
         let until=std::time::Instant::now()+Duration::from_secs(10);
         let observed=loop {
             let text=fs::read_to_string(&log).unwrap();
@@ -186,9 +188,16 @@ fn project_run_waits_for_the_host_owner() {
             if child.try_wait().unwrap().is_some()||std::time::Instant::now()>=until {break false;}
             std::thread::sleep(Duration::from_millis(10));
         };
-        if child.try_wait().unwrap().is_none() {child.kill().unwrap();child.wait().unwrap();}
+        let exit=child.try_wait().unwrap();
+        if exit.is_none() {child.kill().unwrap();child.wait().unwrap();}
         let text=fs::read_to_string(&log).unwrap();
-        assert!(observed,"{} selected a different owner: {text}",cwd.display());
+        if !observed {
+            let telemetry=coreq::telemetry::Reader::open(&install.join("telemetry.log/universal.sqlite3"))
+                .and_then(|reader|reader.export(0,0,256)).map(|page|page["events"].as_array().unwrap().iter().map(|row| {
+                    let event=&row["observation"];json!([event["operation"],event["kind"],event["outcome"],event["error"]])
+                }).collect::<Vec<_>>());
+            panic!("{} host owner wait unobserved; elapsed={:?}, native_exit={exit:?}, fixture={} (retained), committed_phases={telemetry:?}: {text}",cwd.display(),began.elapsed(),root.display());
+        }
         assert!(!project.join(".taskq/status.json").exists());
         assert_eq!(fs::read_to_string(install.join("service")).unwrap(),std::process::id().to_string());
     }

@@ -251,6 +251,35 @@ fn session(rt: &str, log: &Path) -> Option<String> {
         .find_map(|v| v["session_id"].as_str().map(String::from))
 }
 
+fn wait_native(turn:&mut dyn crate::runtime::Proc,root:&Path,logs:&Path,name:&str,rt:&str,cadence:std::time::Duration)->i32 {
+    let mut unknown=None;
+    loop {
+        let reason=match turn.exited() {
+            Ok(Some(code))=>return code,
+            Ok(None)=>None,
+            Err(reason)=>Some(reason),
+        };
+        if reason!=unknown {
+            let mut saved=true;
+            if let Some(reason)=&reason {
+                log!("{rt} operator observation unknown: {reason}; retaining execution");
+                if let Err(error)=fs::write(logs.join(format!("{name}.err")),reason) {log!("operator diagnostic unavailable: {error}");}
+            }
+            // Retro shares this observer but has no request answer to update.
+            if logs==dir(root) {
+                let mut value=read(&answer_path(root,name));
+                if value["state"]=="running" {
+                    if let Some(reason)=&reason {value["native_state"]=json!("unknown");value["reason"]=json!(reason);}
+                    else if let Some(object)=value.as_object_mut() {object.remove("native_state");object.remove("reason");}
+                    if let Err(error)=save_answer(root,name,&mut value) {log!("operator observation not saved: {error}; retaining execution");saved=false;}
+                }
+            }
+            if saved {unknown=reason;}
+        }
+        std::thread::sleep(cadence);
+    }
+}
+
 /// Normal runtime tools and project permissions; logs stay separate from the working directory.
 /// `taskq retro` also uses this path, with a read/recommend-only request.
 pub fn exec(rt: &str, brief: &str, root: &Path, logs: &Path, name: &str, resume: Option<&str>) -> Result<String, String> {
@@ -276,32 +305,16 @@ pub fn exec(rt: &str, brief: &str, root: &Path, logs: &Path, name: &str, resume:
     fs::create_dir_all(logs).map_err(|e| e.to_string())?;
     let out = logs.join(format!("{name}.out"));
     if rt == "claude" && (resume.is_none() || crate::runtime::claude_background(root, &l.session)?) {
-        use crate::runtime::Proc;
         let mut turn = crate::runtime::ClaudeTurn::start(&env, &l, &out, &text, &access).map_err(|e| e.to_string())?;
-        loop {
-            match turn.exited() {
-                Ok(Some(0)) => break,
-                Ok(Some(code)) => return Err(format!("Claude operator failed (exit {code}); partial effects unknown")),
-                Err(reason) => { fs::write(logs.join(format!("{name}.err")), reason).map_err(|e| e.to_string())?; }
-                Ok(None) => {}
-            }
-            std::thread::sleep(std::time::Duration::from_millis(500));
-        }
+        let code=wait_native(&mut turn,root,logs,name,rt,std::time::Duration::from_millis(500));
+        if code!=0 {return Err(format!("Claude operator failed (exit {code}); partial effects unknown"));}
         return fs::read_to_string(&out).map_err(|e| e.to_string())?.lines().rev().filter_map(|line| serde_json::from_str::<Value>(line).ok())
             .find_map(|v| (v["type"] == "result").then(|| v["result"].as_str().map(String::from)).flatten()).ok_or("Claude final response missing".into());
     }
     let f = fs::File::create(&out).map_err(|e| e.to_string())?;
     let err = fs::File::create(logs.join(format!("{name}.err"))).map_err(|e| e.to_string())?;
     let mut child = crate::runtime::start_command(c.current_dir(root).stdout(f).stderr(err), root, &text).map_err(|e| format!("{rt}: {e}"))?;
-    let mut wait_error=None;
-    let status=loop {
-        match child.exited() {
-            Ok(Some(code))=>break code,
-            Err(reason) if wait_error.as_ref()!=Some(&reason)=>{log!("{rt} operator termination unknown: {reason}; retaining execution");wait_error=Some(reason);},
-            _=>{},
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    };
+    let status=wait_native(child.as_mut(),root,logs,name,rt,std::time::Duration::from_millis(50));
     let events: Vec<Value> = fs::read_to_string(&out).map_err(|e| e.to_string())?.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
     if status!=0 || events.iter().any(|v| v["is_error"] == true || v["type"] == "turn.failed") {
         return Err(format!("{rt} operator failed (exit {}); partial effects unknown; inspect request log before retry", status));
@@ -711,6 +724,34 @@ fn apply(install: &Path, exe: &Path, ops: &[Value], id: &str, rev: u64) -> (bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // R6/R12: unknown native reads must reach the UI without releasing or resubmitting the request.
+    #[test]
+    fn operator_observation_publishes_changed_uncertainty_and_recovers() {
+        struct Turn {root:PathBuf,step:usize}
+        impl crate::runtime::Proc for Turn {
+            fn exited(&mut self)->Result<Option<i32>,String> {
+                let value=read(&answer_path(&self.root,"1"));
+                match self.step {
+                    0=>assert_eq!(value["rev"],1),
+                    1|2=>{assert_eq!(value["rev"],2);assert_eq!(value["native_state"],"unknown");assert_eq!(value["reason"],"Workspace not trusted");assert!(running(&self.root));},
+                    3=>{assert_eq!(value["rev"],3);assert!(value.get("native_state").is_none());assert!(value.get("reason").is_none());},
+                    _=>unreachable!(),
+                }
+                self.step+=1;
+                match self.step {1|2=>Err("Workspace not trusted".into()),3=>Ok(None),_=>Ok(Some(0))}
+            }
+            fn kill(&mut self)->Result<(),String> {panic!("unknown observation cannot cancel the native execution")}
+            fn id(&self)->u32 {0}
+        }
+        let root=temp("native-observation");fs::create_dir_all(dir(&root)).unwrap();
+        answer(&root,"1",json!({"state":"running","rt":"claude"}));
+        let mut turn=Turn {root:root.clone(),step:0};
+        assert_eq!(wait_native(&mut turn,&root,&dir(&root),"1","claude",std::time::Duration::ZERO),0);
+        assert_eq!(turn.step,4);assert_eq!(read(&answer_path(&root,"1"))["rev"],3);
+        assert_eq!(fs::read_to_string(dir(&root).join("1.err")).unwrap(),"Workspace not trusted");
+        fs::remove_dir_all(root).unwrap();
+    }
 
     fn temp(tag: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!("taskq-op-{tag}-{}", std::process::id()));

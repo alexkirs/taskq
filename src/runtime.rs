@@ -1322,11 +1322,12 @@ impl ClaudeTurn {
             if matched.is_some() {return Err("Claude original input matches multiple native candidates; inspect them before release".into());}
             matched=Some((id.to_owned(),session.to_owned()));
         }
-        let (id,session)=matched.ok_or("Claude original input not found; submission remains unknown; retry native observation")?;
+        let missing=||format!("{}Claude original input not found; submission remains unknown; retry native observation",self.launch_error.as_ref().map(|e|format!("{e}; ")).unwrap_or_default());
+        let (id,session)=matched.ok_or_else(missing)?;
         if !self.session.is_empty() && session!=self.session {return Err(format!("Claude original input found in copied job {id}; conversation identity differs; inspect native state"));}
         let before=if session==self.session {self.before} else {0};
         if !self.history.read(&claude_transcript_in(home,&session)?,before,&self.input,&self.log)? {
-            return Err("Claude original input not found; submission remains unknown; retry native observation".into());
+            return Err(missing());
         }
         self.id=id;
         self.session=session;
@@ -1387,7 +1388,10 @@ impl ClaudeTurn {
             if !self.id.is_empty() && self.id!=id {self.launch_error=Some("Claude returned a different background job; reconcile the original input and session".into());}
             self.id=id.into();
         } else {self.launch_error=Some("Claude returned no valid background ID; launch outcome unknown; reconcile the original input".into());}
-        if !out.status.success() {self.launch_error.get_or_insert_with(||format!("Claude launch response failed: {stderr}; submission outcome unknown"));}
+        if !out.status.success() {
+            let uncertainty=self.launch_error.as_deref().unwrap_or("submission outcome unknown");
+            self.launch_error=Some(format!("Claude launch response failed: {stderr}; {uncertainty}"));
+        }
         let recorded=File::options().append(true).open(&self.log).and_then(|mut file|
             writeln!(file,"{}",serde_json::json!({"type":"claude.launch","stdout":stdout,"stderr":stderr})));
         if let Err(e)=recorded {self.launch_error.get_or_insert_with(||format!("Claude launch observation not recorded: {e}; native handle retained"));}
@@ -2693,6 +2697,11 @@ mod tests {
             else {
                 assert!(result.is_ok(),"{case}: uncertain native side effect must retain its handle");
                 assert!(turn.launch_error.is_some());
+                if case=="exit" {
+                    assert!(turn.launch_error.as_deref().unwrap().contains("native launch failed"));
+                    let reason=turn.recover_job(&[],Some(&root)).unwrap_err();
+                    assert!(reason.contains("native launch failed")&&reason.contains("original input not found"),"native refusal was masked: {reason}");
+                }
                 assert_eq!(turn.input,input);
                 assert!(turn.observe(&serde_json::json!({"id":turn.id,"sessionId":turn.session,"state":"failed","pid":null})).unwrap_err().contains("current input acceptance unconfirmed"),"old job status cannot settle the current submission");
                 if matches!(case,"log"|"copy") {assert_eq!(turn.id,candidate,"returned native identity survives a subsequent failure");}

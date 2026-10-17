@@ -2832,7 +2832,6 @@ mod tests {
             for evidence in ["local", "foreign-project", "foreign-host", "missing-log", "empty-log", "unreadable-log", "ignored-spawn", "untrusted-spawn", "runtime-mismatch", "unreadable-board", "unreadable-comments"] {
                 let dir = std::env::temp_dir().join(format!("taskq-no-host-{}-{closed}-{evidence}", std::process::id()));
                 std::fs::create_dir_all(dir.join(".taskq")).unwrap();
-                let (_capture,_guard)=crate::profile::tests::collecting(&dir);
                 let b = Fake::default();
                 let n = b.create("T", "", &["taskq".into()]).unwrap();
                 let w = b.comment(n, "taskq: spawn worker codex:w mac").unwrap();
@@ -2867,6 +2866,9 @@ mod tests {
                 }
                 if evidence == "unreadable-board" { b.state.borrow_mut().fail_issue_read = Some((n, 1)); }
                 if evidence == "unreadable-comments" { b.state.borrow_mut().fail_comment_reads = 1; }
+                // Prepare the legacy fixture before collection; this case proves ownership, not import contention.
+                crate::profile::prune(&dir).unwrap();
+                let (_capture,_guard)=crate::profile::tests::collecting(&dir);
                 assert!(crate::profile::selftest(&dir, project, &vec![], 300).is_err());
                 let mut s = service(&b, &c, Default::default());
                 s.focus.clear();

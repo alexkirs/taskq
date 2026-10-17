@@ -9,6 +9,6 @@
     "esbuild": "0.28.2"
   },
   "dependencies": {
-    "@taskq/coreq": "https://codeload.github.com/taskqorg/coreq/tar.gz/5e57178eef9a6622ab3d21d6572c259cf93f0008"
+    "@taskq/coreq": "https://codeload.github.com/taskqorg/coreq/tar.gz/ef09304d80de44fe64934458c1a4912c98eb57e0"
   }
 }

@@ -1,11 +1,11 @@
 [package]
 name = "taskq"
-version = "4.6.9"
+version = "4.6.10"
 edition = "2024"
 publish = false
 
 [dependencies]
-coreq = { git = "https://github.com/taskqorg/coreq", rev = "5e57178eef9a6622ab3d21d6572c259cf93f0008" }
+coreq = { git = "https://github.com/taskqorg/coreq", rev = "ef09304d80de44fe64934458c1a4912c98eb57e0" }
 tracing = "0.1"
 ring = "0.17"
 rusqlite = { version = "0.40.2", default-features = false, features = ["bundled", "cache"] }
@@ -28,7 +28,7 @@ block2 = "0.6"
 # tray notifications (§ 4, M14): already in the tree via objc2-app-kit
 objc2 = "0.6"
 objc2-user-notifications = { version = "0.3", default-features = false, features = ["std", "block2", "bitflags", "UNUserNotificationCenter", "UNNotification", "UNNotificationContent", "UNNotificationRequest", "UNNotificationResponse", "UNNotificationSettings", "UNNotificationSound", "UNNotificationTrigger"] }
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSApplication", "NSResponder", "NSWindow", "NSView", "NSControl", "NSButton", "NSFont", "NSFontDescriptor", "NSScreen"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSApplication", "NSResponder", "NSWindow", "NSView", "NSControl", "NSButton", "NSFont", "NSFontDescriptor", "NSScreen", "NSMenu", "NSMenuItem", "NSEvent"] }
 # shared icon renderer (§ 4): system-font digits through Core Text, already in the tree via tray-icon/wry
 objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFCGTypes"] }
 objc2-core-graphics = { version = "0.3", default-features = false, features = ["std", "CGBitmapContext", "CGContext", "CGImage", "CGColorSpace"] }
@@ -47,7 +47,7 @@ strip = true
 lto = true
 
 [build-dependencies]
-coreq-instrument = { git = "https://github.com/taskqorg/coreq", rev = "5e57178eef9a6622ab3d21d6572c259cf93f0008" }
+coreq-instrument = { git = "https://github.com/taskqorg/coreq", rev = "ef09304d80de44fe64934458c1a4912c98eb57e0" }
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }

@@ -790,11 +790,30 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
     let mut event_loop = EventLoopBuilder::<Ev>::with_user_event().build();
     #[cfg(target_os = "macos")]
     {
-        // menu bar only: no Dock icon, no app menu
+        // Accessory keeps the tray out of the Dock; AppKit menu accelerators enable native text editing.
         use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
         event_loop.set_activation_policy(ActivationPolicy::Accessory);
         // a snapshot never takes the owner's focus (taskq.md R12)
         event_loop.set_activate_ignoring_other_apps(snapshot.is_none());
+        if snapshot.is_none() {
+            use objc2::{MainThreadOnly,sel};
+            use objc2_foundation::{MainThreadMarker,NSString};
+            use objc2_app_kit::{NSApplication,NSMenu,NSEventModifierFlags as Mod};
+            let mtm=MainThreadMarker::new().ok_or("tray text editing requires the main thread")?;
+            let app=NSApplication::sharedApplication(mtm);
+            let menu=app.mainMenu().unwrap_or_else(||NSMenu::new(mtm));
+            let edit=NSMenu::initWithTitle(NSMenu::alloc(mtm),&NSString::from_str("Edit"));
+            for (title,action,key,shift) in [
+                ("Undo",sel!(undo:),"z",false),("Redo",sel!(redo:),"z",true),
+                ("Cut",sel!(cut:),"x",false),("Copy",sel!(copy:),"c",false),
+                ("Paste",sel!(paste:),"v",false),("Select All",sel!(selectAll:),"a",false),
+            ] {
+                let item=unsafe {edit.addItemWithTitle_action_keyEquivalent(&NSString::from_str(title),Some(action),&NSString::from_str(key))};
+                item.setKeyEquivalentModifierMask(Mod::Command|if shift {Mod::Shift}else{Mod::empty()});
+            }
+            let item=unsafe {menu.addItemWithTitle_action_keyEquivalent(&NSString::from_str("Edit"),None,&NSString::from_str(""))};
+            item.setSubmenu(Some(&edit));app.setMainMenu(Some(&menu));
+        }
     }
     let proxy = event_loop.create_proxy();
     TrayIconEvent::set_event_handler(Some(move |e: TrayIconEvent| {

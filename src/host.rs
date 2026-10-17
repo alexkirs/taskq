@@ -121,7 +121,7 @@ pub fn write_capacity(install:&Path, host:&str, edit:&crate::CapEdit, expect:Opt
             if let Some(value)=edit.memory_min {next["load_gate"]["memory_min"]=json!(value);}
         }
         let candidate=Policy::parse(next,&hostname)?;
-        replace_policy(&path,&original,&candidate.raw)?;
+        replace_owned(&path,&original,&(serde_json::to_string_pretty(&candidate.raw).map_err(|e|e.to_string())?+"\n"))?;
         let saved=Policy::read(install)?;
         if saved.raw!=candidate.raw {return Err("host policy write uncertain: readback differs".into());}
         Ok((old.cap,saved.cap))
@@ -129,33 +129,33 @@ pub fn write_capacity(install:&Path, host:&str, edit:&crate::CapEdit, expect:Opt
 }
 
 /// Reuse migration's native replacement so a settings edit preserves owner/group/ACL and file permissions.
-fn replace_policy(path:&Path, original:&str, next:&Value)->Res<()> {
+fn replace_owned(path:&Path, original:&str, next:&str)->Res<()> {
     use std::io::Write;
     let metadata=fs::symlink_metadata(path).map_err(|e|e.to_string())?;
-    if !metadata.is_file() || metadata.permissions().readonly() {return Err("host policy is not a writable regular file; kept".into());}
+    if !metadata.is_file() || metadata.permissions().readonly() {return Err("state file is not a writable regular file; kept".into());}
     let owner=ownership(path)?;
-    let stage=path.with_file_name("host.json.pending");
+    let stage=path.with_file_name(&{let mut name=path.file_name().ok_or("state file name missing")?.to_os_string();name.push(".pending");name});
     let mut file=fs::OpenOptions::new().write(true).create_new(true).open(&stage)
-        .map_err(|e|format!("host policy prepare refused; interrupted state kept: {e}"))?;
+        .map_err(|e|format!("state file prepare refused; interrupted state kept: {e}"))?;
     let result=(|| {
         stage_owner(&stage,&owner)?;
         file.set_permissions(metadata.permissions()).map_err(|e|e.to_string())?;
-        file.write_all((serde_json::to_string_pretty(next).map_err(|e|e.to_string())?+"\n").as_bytes()).map_err(|e|e.to_string())?;
+        file.write_all(next.as_bytes()).map_err(|e|e.to_string())?;
         file.sync_all().map_err(|e|e.to_string())?;
         drop(file);
         if fs::read_to_string(path).map_err(|e|e.to_string())?!=original || ownership(path)?!=owner {
-            return Err("host policy changed while saving; current file kept".into());
+            return Err("state file changed while saving; current file kept".into());
         }
         replace_project(path,&stage)?;
         #[cfg(windows)] stage_owner(path,&owner)?;
-        #[cfg(unix)] fs::File::open(path.parent().ok_or("host policy parent missing")?).and_then(|f|f.sync_all()).map_err(|e|e.to_string())?;
-        if ownership(path)?!=owner {return Err("host policy ownership readback differs".into());}
+        #[cfg(unix)] fs::File::open(path.parent().ok_or("state file parent missing")?).and_then(|f|f.sync_all()).map_err(|e|e.to_string())?;
+        if ownership(path)?!=owner {return Err("state file ownership readback differs".into());}
         Ok(())
     })();
     if result.is_err() && let Err(cleanup)=fs::remove_file(&stage) && cleanup.kind()!=std::io::ErrorKind::NotFound {
-        return Err(format!("host policy write uncertain: {}; temporary cleanup failed: {cleanup}",result.unwrap_err()));
+        return Err(format!("state file write uncertain: {}; temporary cleanup failed: {cleanup}",result.unwrap_err()));
     }
-    result.map_err(|e:String|format!("host policy write uncertain: {e}"))
+    result.map_err(|e:String|format!("{} write uncertain: {e}",path.display()))
 }
 
 pub type Shared = Arc<Mutex<Host>>;
@@ -483,16 +483,95 @@ fn append_project(install: &Path, root: &Path, text: &str) {
         .and_then(|mut f| writeln!(f, "{}", crate::platform::log_line(now, text)));
 }
 
+fn project_text(install:&Path)->Res<Option<String>> {
+    match fs::symlink_metadata(install.join("projects.pending")) {
+        Ok(_)=>return Err("projects.pending retained; project membership unknown".into()),
+        Err(e) if e.kind()==std::io::ErrorKind::NotFound=>{},
+        Err(e)=>return Err(format!("projects prepare unknown: {e}")),
+    }
+    let path=install.join("projects");
+    match fs::read_to_string(&path) {
+        Ok(text)=>Ok(Some(text)),
+        Err(e) if e.kind()==std::io::ErrorKind::NotFound=>Ok(None),
+        Err(e)=>Err(format!("{}: {e}",path.display())),
+    }
+}
+
+/// Keep configured spelling for existing resource IDs; canonical identity owns execution and aliases.
+fn project_entries(text:&str)->Res<Vec<(PathBuf,PathBuf)>> {
+    text.lines().filter(|line|!line.is_empty()).map(|line| {
+        let path=PathBuf::from(line);
+        if !path.is_absolute() {return Err("projects unknown: a root is not absolute".into());}
+        let canonical=path.canonicalize().map_err(|e|format!("projects unknown: {e}"))?;
+        if !canonical.is_dir() {return Err("projects unknown: a root is not a directory".into());}
+        Ok((path,canonical))
+    }).collect()
+}
+
+pub fn project_paths(install:&Path)->Res<Vec<PathBuf>> {
+    let text=project_text(install)?.ok_or_else(||format!("{}: project registry missing",install.join("projects").display()))?;
+    Ok(project_entries(&text)?.into_iter().map(|(path,_)|path).collect())
+}
+
 /// Read only the explicit registry. Canonical identity prevents duplicate threads for aliases.
 pub fn projects(install: &Path) -> Res<Vec<PathBuf>> {
-    let text = fs::read_to_string(install.join("projects")).map_err(|e| format!("projects unknown: {e}"))?;
-    let mut roots = BTreeSet::new();
-    for line in text.lines().filter(|l| !l.is_empty()) {
-        let root = Path::new(line);
-        if !root.is_absolute() { return Err("projects unknown: a root is not absolute".into()); }
-        roots.insert(root.canonicalize().map_err(|e| format!("projects unknown: {e}"))?);
+    let text=project_text(install)?.ok_or("projects unknown: registry missing")?;
+    Ok(project_entries(&text)?.into_iter().map(|(_,canonical)|canonical).collect::<BTreeSet<_>>().into_iter().collect())
+}
+
+/// One owner retains the preflight snapshot and native lock until the registry commit or refusal.
+pub struct ProjectEdit {
+    install:PathBuf, original:Option<String>, next:String, removed:Vec<PathBuf>, adding:bool,
+    _lock:coreq::file_lock::Lock,
+}
+impl ProjectEdit {
+    #[tracing::instrument(name="host.projects.prepare",skip_all)]
+    pub fn new(install:&Path,root:&Path,adding:bool)->Res<Self> {
+        fs::create_dir_all(install).map_err(|e|e.to_string())?;
+        let lock=coreq::file_lock::try_lock(&install.join("projects.lock")).map_err(|e|format!("project registry busy or lock unavailable: {e}"))?;
+        let path=install.join("projects");
+        let original=project_text(install)?;
+        if original.is_none() && !adding {return Err(format!("{}: project registry missing; nothing changed",path.display()));}
+        match fs::symlink_metadata(&path) {
+            Ok(meta)=> {
+                if !meta.is_file() || meta.permissions().readonly() {return Err("project registry is not a writable regular file; kept".into());}
+                ownership(&path)?;
+            }
+            Err(e) if e.kind()==std::io::ErrorKind::NotFound && original.is_none()=>{},
+            Err(e)=>return Err(format!("project registry metadata unknown: {e}")),
+        }
+        let target=root.canonicalize().map_err(|e|format!("project root unknown: {e}"))?;
+        let target_text=target.to_str().ok_or("project root is not UTF-8")?;
+        if target_text.contains(['\n','\r']) {return Err("project root cannot be represented by the line registry".into());}
+        let entries=project_entries(original.as_deref().unwrap_or(""))?;
+        let removed:Vec<PathBuf>=entries.iter().filter(|(_,canonical)|*canonical==target).map(|(path,_)|path.clone()).collect();
+        let mut next=original.clone().unwrap_or_default();
+        if adding && removed.is_empty() {
+            if !next.is_empty()&&!next.ends_with('\n') {next.push('\n');}
+            next.push_str(target_text);next.push('\n');
+        } else if !adding && !removed.is_empty() {
+            next=entries.iter().filter(|(_,canonical)|*canonical!=target).map(|(path,_)|format!("{}\n",path.display())).collect();
+        }
+        Ok(Self {install:install.into(),original,next,removed:if removed.is_empty(){vec![target]}else{removed},adding,_lock:lock})
     }
-    Ok(roots.into_iter().collect())
+
+    #[tracing::instrument(name="host.projects.commit",skip_all)]
+    pub fn commit(self)->Res<()> {
+        let path=self.install.join("projects");
+        let write=|| {
+            if self.original.as_deref()!=Some(self.next.as_str()) {
+                match &self.original {
+                    Some(original)=>replace_owned(&path,original,&self.next)?,
+                    None=>coreq::write_durable(&path,&self.next)?,
+                }
+            }
+            if fs::read_to_string(&path).map_err(|e|e.to_string())?!=self.next {return Err("project registry write unknown: readback differs".into());}
+            Ok(())
+        };
+        if self.adding {crate::resources::locked(&self.install,write)?;}
+        else {crate::resources::unregister(&self.install,&self.removed,write)?;}
+        crate::platform::write_atomic(&self.install.join("poke"),"").map_err(|e|format!("project registry saved; host notification unknown: {e}"))
+    }
 }
 
 #[derive(Default)]
@@ -706,6 +785,42 @@ mod tests {
     }
     fn policy() -> Policy {
         Policy::parse(json!({"limits": {"codex": 2}, "admission": {"max": 2}, "load_gate": {"enabled": false}}), "invented").unwrap()
+    }
+
+    // H-A5: one editor preserves unrelated roots/permissions, rejects interrupted state and removes canonical aliases.
+    #[test]
+    fn registry_editor_preserves_roots_and_refuses_unknown() {
+        let base=temp("registry-editor");let install=base.join("install");let a=base.join("a");let b=base.join("b");
+        for path in [&install,&a,&b] {fs::create_dir_all(path).unwrap();}
+        assert!(ProjectEdit::new(&install,&a,false).is_err(),"only registration initializes a missing registry");
+        ProjectEdit::new(&install,&a,true).unwrap().commit().unwrap();
+        let path=install.join("projects");
+        let before=fs::read_to_string(&path).unwrap();
+        assert_eq!(before,format!("{}\n",a.canonicalize().unwrap().display()));
+        assert!(install.join("poke").exists());
+        #[cfg(unix)] {use std::os::unix::fs::PermissionsExt;fs::set_permissions(&path,fs::Permissions::from_mode(0o640)).unwrap();}
+        let owner=ownership(&path).unwrap();
+        ProjectEdit::new(&install,&b,true).unwrap().commit().unwrap();
+        assert_eq!(ownership(&path).unwrap(),owner);
+        #[cfg(unix)] {use std::os::unix::fs::PermissionsExt;assert_eq!(fs::metadata(&path).unwrap().permissions().mode()&0o777,0o640);}
+        let saved=fs::read(&path).unwrap();
+        let mut registry=Registry::default();registry.refresh(&install,0);
+        let roots=registry.roots.clone();
+        fs::write(install.join("projects.pending"),"interrupted").unwrap();
+        registry.refresh(&install,60);
+        assert!(registry.error.is_some() && registry.roots==roots);
+        assert!(ProjectEdit::new(&install,&a,false).is_err());
+        assert_eq!(fs::read(&path).unwrap(),saved);
+        fs::remove_file(install.join("projects.pending")).unwrap();
+        let alias=a.join(".");
+        fs::write(&path,format!("{}{}\n{}\n",String::from_utf8(saved).unwrap(),alias.display(),b.display())).unwrap();
+        ProjectEdit::new(&install,&a,false).unwrap().commit().unwrap();
+        assert_eq!(projects(&install).unwrap(),vec![b.canonicalize().unwrap()]);
+        assert_eq!(project_paths(&install).unwrap().len(),2,"unrelated configured spelling is retained");
+        fs::write(&path,b"\xff").unwrap();
+        assert!(ProjectEdit::new(&install,&a,true).is_err());
+        assert_eq!(fs::read(&path).unwrap(),b"\xff");
+        fs::remove_dir_all(base).unwrap();
     }
 
     // H-A1: an owner before PID publication excludes a second process, survives sweep, and releases on exit.

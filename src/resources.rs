@@ -93,6 +93,11 @@ pub fn dir(install: &Path) -> PathBuf {
 }
 
 fn read(install: &Path) -> Res<State> {
+    match fs::symlink_metadata(dir(install).join("state.json.pending")) {
+        Ok(_)=>return Err("resources state prepare retained; authority unknown".into()),
+        Err(e) if e.kind()==std::io::ErrorKind::NotFound=>{},
+        Err(e)=>return Err(format!("resources state prepare unknown: {e}")),
+    }
     match fs::read_to_string(dir(install).join(FILE)) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(State::default()),
         Err(e) => Err(format!("resources: {e}")),
@@ -103,7 +108,7 @@ fn read(install: &Path) -> Res<State> {
 
 fn save(install: &Path, s: &State) -> Res<()> {
     let text = serde_json::to_string_pretty(s).map_err(|e| e.to_string())? + "\n";
-    crate::platform::write_atomic(&dir(install).join(FILE), &text)?;
+    coreq::write_durable(&dir(install).join(FILE), &text)?;
     if read(install)? != *s {
         return Err("resources: readback differs".into());
     }
@@ -178,27 +183,25 @@ fn policy(root: &Path) -> Res<(String, Value)> {
     Ok((cfg.me.clone(), crate::service::capacity(&v, &cfg.me)?.json()))
 }
 
-fn registered(install: &Path, root: &str) -> bool {
-    crate::operator::projects(install).iter().any(|(_, r)| r.display().to_string() == root)
+fn registered(install: &Path, root: &str) -> Res<bool> {
+    Ok(crate::host::project_paths(install)?.iter().any(|r| r == Path::new(root)))
 }
 
-/// `service uninstall`: `write` drops `root` from `<install>/projects` under the host lock, so no operation writes
-/// to it after this returns; its project ID then loses authority for good.
-pub fn unregister(install: &Path, root: &Path, write: impl FnOnce() -> Res<()>) -> Res<()> {
-    if !dir(install).join(FILE).exists() {
-        return write();
-    }
-    with(install, |s| {
-        write()?;
-        s.projects.retain(|_, p| Path::new(&p.root) != root);
-        Ok(())
-    })
+/// Retire old scopes before dropping roots. A failed registry write remains restrictive, never revives an ID.
+pub fn unregister(install: &Path, roots: &[PathBuf], write: impl FnOnce() -> Res<()>) -> Res<()> {
+    let _lock=lock(install)?;
+    let mut s=read(install)?;
+    let before=s.projects.len();
+    s.projects.retain(|_, p| !roots.contains(&PathBuf::from(&p.root)));
+    let retired=s.projects.len()!=before;
+    if retired {save(install,&s)?;}
+    write().map_err(|e|if retired {format!("resource scope retired; registry write failed: {e}")} else {e})
 }
 
 /// Registered roots get an opaque ID once; an unregistered root loses it for good. A capacity that differs from the
 /// recorded one, including a hand edit, gets a new revision.
-fn sync(s: &mut State, install: &Path, now: u64) {
-    let roots: Vec<String> = crate::operator::projects(install).into_iter().map(|(_, r)| r.display().to_string()).collect();
+fn sync(s: &mut State, install: &Path, now: u64) -> Res<()> {
+    let roots: Vec<String> = crate::host::project_paths(install)?.into_iter().map(|r| r.display().to_string()).collect();
     s.projects.retain(|_, p| roots.contains(&p.root));
     for r in roots {
         if !s.projects.values().any(|p| p.root == r) {
@@ -211,6 +214,7 @@ fn sync(s: &mut State, install: &Path, now: u64) {
             *p = Project { root: p.root.clone(), revision: token("r"), policy: now_policy, since: now };
         }
     }
+    Ok(())
 }
 
 fn receipt(target: &Value, op: &str, state: &str, reason: Option<&str>, saved: Option<&str>, effective: Option<&str>, at: Option<u64>) -> Value {
@@ -407,7 +411,7 @@ fn decide(install: &Path, s: &mut State, v: &Value, conn: Conn, clock: bool, now
     s.ops.get_mut(&op).unwrap().writing = false;
     // the marker save and earlier waits took time: deadline, grant and connection again on a fresh clock
     let now = now.max((fence.clock)());
-    if !(fence.live)() || !registered(install, &p.root) {
+    if !(fence.live)() || !registered(install, &p.root)? {
         return Ok(record(s, "rejected", Some("scope")));
     }
     if let Err(r) = authorize(s, v, conn, now) {
@@ -476,15 +480,16 @@ fn readback(s: &mut State, now: u64) {
 }
 
 /// Before an exchange: interrupted writes read unknown, projects and revisions are current, retention is applied.
-fn prepare(s: &mut State, install: &Path, now: u64) {
+fn prepare(s: &mut State, install: &Path, now: u64) -> Res<()> {
+    sync(s, install, now)?;
     for o in s.ops.values_mut().filter(|o| o.writing) {
         o.writing = false;
         o.receipt["state"] = json!("unknown");
         o.sent = false;
     }
-    sync(s, install, now);
     s.ops.retain(|_, o| now < o.expires_at + RETAIN);
     readback(s, now);
+    Ok(())
 }
 
 /// Whether there is anything to exchange: an active host grant for this connection, or a receipt DashQ has not taken.
@@ -502,10 +507,11 @@ pub fn exchange(install: &Path, active: &Value, w: &mut dyn Wire, now: u64) -> R
     let conn = (inst, generation);
     // no store: no host grant was ever made, nothing to exchange or to create
     if !dir(install).join(FILE).exists() {
+        read(install)?;
         return Ok((vec![], false));
     }
     let sent: Vec<Value> = with(install, |s| {
-        prepare(s, install, now);
+        prepare(s, install, now)?;
         Ok(if wanted(s, conn, now) { s.ops.values().filter(|o| !o.sent).take(ITEMS).map(|o| o.receipt.clone()).collect() } else { vec![json!(null)] })
     })?;
     if sent.first().is_some_and(Value::is_null) {
@@ -619,7 +625,7 @@ pub fn grant(install: &Path, grant_id: &str, actor: &str, scope: &Scope, by: &st
     };
     let names: BTreeMap<String, String> = crate::operator::projects(install).into_iter().map(|(n, r)| (r.display().to_string(), n)).collect();
     with(install, |s| {
-        sync(s, install, now);
+        sync(s, install, now)?;
         let mut ids = vec![];
         for x in &scope.projects {
             let found: Vec<&String> = s.projects.iter().filter(|(k, p)| *k == x || names.get(&p.root) == Some(x)).map(|(k, _)| k).collect();
@@ -654,7 +660,7 @@ pub fn report(install: &Path, now: u64) -> Res<Vec<String>> {
     let names: BTreeMap<String, String> = crate::operator::projects(install).into_iter().map(|(n, r)| (r.display().to_string(), n)).collect();
     let conn = enrollment::active(install).ok().flatten();
     with(install, |s| {
-        prepare(s, install, now);
+        prepare(s, install, now)?;
         let mut out = vec![match &conn {
             Some(a) => format!("Connection: {} generation {}", a["destination"].as_str().unwrap_or("?"), a["generation"]),
             None => "Connection: none (grants need an active DashQ connection)".into(),
@@ -716,7 +722,7 @@ mod tests {
         fs::write(root.join("taskq.json"), "{\n  \"repo\": \"o/r\",\n  \"limits\": {\"codex\": 2},\n  \"custom\": {\"keep\": true}\n}\n").unwrap();
         fs::write(install.join("projects"), format!("{}\n", root.display())).unwrap();
         with(&install, |s| {
-            sync(s, &install, 0);
+            sync(s, &install, 0)?;
             let (_, mut p) = s.projects.pop_first().unwrap();
             p.revision = "r1".into();
             s.projects.insert("project-1".into(), p);
@@ -1010,13 +1016,93 @@ mod tests {
         assert_eq!((receipt_of(&t, "op-u")["reason"].as_str(), config(&t)), (Some("scope"), before.clone()));
         // the locked path drops the ID with the registration; registering the root again never revives it
         fs::write(t.install.join("projects"), format!("{}\n", t.root.display())).unwrap();
-        unregister(&t.install, &t.root, || fs::write(t.install.join("projects"), "").map_err(|e| e.to_string())).unwrap();
+        unregister(&t.install, std::slice::from_ref(&t.root), || fs::write(t.install.join("projects"), "").map_err(|e| e.to_string())).unwrap();
         assert!(read(&t.install).unwrap().projects.is_empty());
         fs::write(t.install.join("projects"), format!("{}\n", t.root.display())).unwrap();
         go(&t, &[submit("op-v", json!({"runtime_limit": 0}))], &[], 399);
         assert_eq!((receipt_of(&t, "op-v")["reason"].as_str(), config(&t)), (Some("scope"), before));
         assert!(!read(&t.install).unwrap().projects.contains_key("project-1"));
         fs::remove_dir_all(&t.base).unwrap();
+    }
+
+    // H-A5: a failed registry commit cannot revive a retired scope on the next exchange.
+    #[test]
+    fn failed_registry_commit_keeps_scope_retired() {
+        let t=setup("unregister-failed");
+        let before=config(&t);
+        let result=unregister(&t.install,std::slice::from_ref(&t.root),||Err("fixture registry write failed".into()));
+        assert!(result.unwrap_err().contains("scope retired"));
+        assert!(!read(&t.install).unwrap().projects.contains_key("project-1"));
+        go(&t,&[submit("old-scope",json!({"runtime_limit":0}))],&[],100);
+        assert_eq!(receipt_of(&t,"old-scope")["reason"],"scope");
+        assert_eq!(config(&t),before);
+        let state=read(&t.install).unwrap();
+        assert!(!state.projects.contains_key("project-1"));
+        assert!(state.grants.contains_key("grant-1") && state.ops.contains_key("old-scope"));
+        fs::remove_dir_all(t.base).unwrap();
+    }
+
+    // H-A5: process death after scope retirement and before registry replacement cannot revive old grants.
+    #[test]
+    fn retired_scope_survives_process_death_before_registry_commit() {
+        let t=setup("registry-crash");
+        let registry=fs::read(t.install.join("projects")).unwrap();
+        let signal=t.base.join("retired");
+        let mut child=std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact","resources::tests::retire_fixture","--ignored"])
+            .env("TASKQ_RESOURCE_RETIRE_FIXTURE",&t.base)
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+        let until=std::time::Instant::now()+std::time::Duration::from_secs(5);
+        while !signal.exists() && child.try_wait().unwrap().is_none() && std::time::Instant::now()<until {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let retired=fs::read_to_string(signal).unwrap_or_default();
+        let _=child.kill();child.wait().unwrap();
+        assert_eq!(retired,"retired","fixture did not reach the crash boundary");
+        assert_eq!(fs::read(t.install.join("projects")).unwrap(),registry);
+        assert!(!read(&t.install).unwrap().projects.contains_key("project-1"));
+        go(&t,&[submit("after-crash",json!({"runtime_limit":0}))],&[],100);
+        assert_eq!(receipt_of(&t,"after-crash")["reason"],"scope");
+        fs::remove_dir_all(t.base).unwrap();
+    }
+
+    #[test]
+    #[ignore="owned subprocess for retired_scope_survives_process_death_before_registry_commit"]
+    fn retire_fixture() {
+        let base=PathBuf::from(std::env::var_os("TASKQ_RESOURCE_RETIRE_FIXTURE").unwrap());
+        unregister(&base.join("install"),&[base.join("proj")],|| {
+            crate::platform::write_atomic(&base.join("retired"),"retired")?;
+            loop {std::thread::park();}
+        }).unwrap();
+    }
+
+    // H-A5: unknown membership is not an empty authoritative list and must not erase cached scopes.
+    #[test]
+    fn unknown_registry_preserves_resource_authority() {
+        let t=setup("registry-unknown");
+        let registry=fs::read(t.install.join("projects")).unwrap();
+        let state=fs::read(dir(&t.install).join(FILE)).unwrap();
+        for fault in ["missing","invalid","pending"] {
+            match fault {
+                "missing"=>fs::remove_file(t.install.join("projects")).unwrap(),
+                "invalid"=>fs::write(t.install.join("projects"),b"\xff").unwrap(),
+                _=>fs::write(t.install.join("projects.pending"),"interrupted").unwrap(),
+            }
+            assert!(report(&t.install,100).is_err(),"{fault} membership silently accepted");
+            let mut wire=Dash {replies:vec![],posts:vec![],at:0,cut:None};
+            assert!(exchange(&t.install,&active(),&mut wire,100).is_err());
+            assert!(wire.posts.is_empty());
+            assert_eq!(fs::read(dir(&t.install).join(FILE)).unwrap(),state,"{fault} destroyed cached authority");
+            fs::write(t.install.join("projects"),&registry).unwrap();
+            if fault=="pending" {fs::remove_file(t.install.join("projects.pending")).unwrap();}
+        }
+        fs::write(dir(&t.install).join("state.json.pending"),"interrupted retirement").unwrap();
+        let mut wrote=false;
+        assert!(unregister(&t.install,std::slice::from_ref(&t.root),|| {wrote=true;Ok(())}).is_err());
+        assert!(!wrote,"unknown resource retirement cannot commit registry removal");
+        assert_eq!(fs::read(dir(&t.install).join(FILE)).unwrap(),state);
+        assert_eq!(fs::read(dir(&t.install).join("state.json.pending")).unwrap(),b"interrupted retirement");
+        fs::remove_dir_all(t.base).unwrap();
     }
 
     /// DashQ stand-in for connection calls: pairing activates generation 2, a revoke succeeds, ingest answers 401.
@@ -1056,7 +1142,7 @@ mod tests {
         for (op, change) in changes {
             fs::write(t.root.join("taskq.json"), &before).unwrap();
             fs::write(conn_file(&t.install), conn(Some(active())).to_string()).unwrap();
-            with(&t.install, |s| { sync(s, &t.install, 0); s.projects.get_mut("project-1").unwrap().revision = "r1".into(); Ok(()) }).unwrap();
+            with(&t.install, |s| { sync(s, &t.install, 0)?; s.projects.get_mut("project-1").unwrap().revision = "r1".into(); Ok(()) }).unwrap();
             let seen = std::cell::RefCell::new(None);
             // the final read sees the operation's connection; the change starts right after it
             let live = || {

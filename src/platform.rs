@@ -243,11 +243,11 @@ pub fn sweep(install: &Path, shim: &Path) {
     let read = |f: &str| fs::read_to_string(install.join(f)).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     let mut keep: Vec<String> = [read("current"), read("previous"), Some(VERSION.into())].into_iter().flatten().collect();
     // a corrupt status.json leaves its project's version unknown: every release stays (§ 4 Data)
-    let registry=coreq::telemetry::capture::operation("update.projects",||fs::read_to_string(install.join("projects")),|_|"registry-unreadable");
+    let registry=coreq::telemetry::capture::operation("update.projects",||crate::host::project_paths(install),|_|"registry-unreadable");
     let mut unknown=registry.is_err();
-    for root in registry.unwrap_or_default().lines().filter(|l| !l.is_empty()) {
+    for root in registry.unwrap_or_default() {
         let version=coreq::telemetry::capture::operation("update.project-version",|| {
-            crate::data::json(&Path::new(root).join(".taskq/status.json"))?.as_ref()
+            crate::data::json(&root.join(".taskq/status.json"))?.as_ref()
                 .and_then(|st|st["version"].as_str()).filter(|v|!v.is_empty()).map(String::from)
                 .ok_or_else(||"project version unknown".to_string())
         },|_|"version-unknown");
@@ -650,7 +650,7 @@ mod tests {
         // H-A5: update keeps policy, interrupted writes, exact native recovery and the qualified rollback floor.
         let protected=[("host.json","{\"limits\":{\"codex\":2},\"owner_field\":\"keep\"}"),
             ("host.json.pending","interrupted policy; preserve"),("service","123"),("service.lock",""),("poke","wake"),
-            ("restart","restart requested"),("update","update requested"),("projects.lock",""),("projects.pending","retained registry prepare")];
+            ("restart","restart requested"),("update","update requested"),("projects.lock","")];
         for (name,text) in protected {fs::write(install.join(name),text).unwrap();}
         fs::create_dir_all(install.join("host-policy-migration")).unwrap();
         fs::write(install.join("host-policy-migration/original.json"),"original configuration").unwrap();
@@ -696,6 +696,11 @@ mod tests {
             fs::create_dir_all(install.join("releases/4.0.2")).unwrap();sweep(&install,&shim);
             assert!(install.join("releases/4.0.2").exists(),"unreadable registry cannot authorize release deletion");
             fs::write(install.join("projects"),format!("{}\n",root.display())).unwrap();
+            fs::write(install.join("projects.pending"),"retained registry prepare").unwrap();
+            sweep(&install,&shim);
+            assert!(install.join("releases/4.0.2").exists(),"interrupted registry cannot authorize release deletion");
+            assert_eq!(fs::read_to_string(install.join("projects.pending")).unwrap(),"retained registry prepare");
+            fs::remove_file(install.join("projects.pending")).unwrap();
             fs::remove_file(root.join(".taskq/status.json")).unwrap();
             sweep(&install,&shim);
             assert!(install.join("releases/4.0.2").exists(),"missing project status cannot authorize release deletion");

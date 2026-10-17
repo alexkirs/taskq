@@ -1771,15 +1771,12 @@ fn service(args: &Args) -> Res<()> {
                 return Ok(());
             }
             if sub == "install" {
+                let edit=host::ProjectEdit::new(&cfg.install,&root,true)?;
                 let off = install_focus(&root)?;
                 platform::install_self(&platform::tool(&cfg.install))?;
                 platform::write_unit(&u)?;
                 let handover = load_unit(&u, &root)?;
-                let mut all: Vec<String> = fs::read_to_string(&projects).unwrap_or_default().lines().map(String::from).collect();
-                if !all.contains(&root.display().to_string()) {
-                    all.push(root.display().to_string());
-                    fs::write(&projects, all.join("\n") + "\n").map_err(|e| e.to_string())?;
-                }
+                edit.commit().map_err(|e|format!("unit prepared; project registration unknown: {e}"))?;
                 println!("installed {}{}", u.path.display(), if handover { "; live children kept: the running service re-execs" } else { "" });
                 if off {
                     println!("Focus: off; nothing admitted until `taskq service focus all|<label..>`");
@@ -2013,12 +2010,11 @@ fn logged(root: &Path, source: &str, text: &str, r: Receipt, json: bool) -> Res<
 }
 
 fn uninstall_unit(u: &platform::Unit, root: &Path, projects: &Path) -> Res<()> {
-    let registered = fs::read_to_string(projects).map_err(|e| format!("{}: {e}", projects.display()))?;
-    let all: Vec<String> = registered.lines().filter(|l| *l != root.display().to_string()).map(|l| format!("{l}\n")).collect();
+    let install=projects.parent().ok_or("project registry has no parent")?;
+    let edit=host::ProjectEdit::new(install,root,false)?;
     platform::run_all(&u.unload, false)?;
     if let Err(e) = fs::remove_file(&u.path) && e.kind() != std::io::ErrorKind::NotFound { return Err(e.to_string()); }
-    let install = projects.parent().unwrap_or(Path::new("."));
-    resources::unregister(install, root, || fs::write(projects, all.concat()).map_err(|e| e.to_string()))
+    edit.commit().map_err(|e|format!("unit unloaded; project unregistration unknown: {e}"))
 }
 
 fn golden_selftest(traces: &str, published: bool) -> Res<usize> {
@@ -3167,6 +3163,41 @@ mod tests {
         assert_eq!(width("see [#12](https://very/long/url) and `cargo test --locked` https://x/y"), 15, "link targets and code are exempt; outside whitespace counts");
     }
 
+    // H-A5: one registry owner covers preflight/effects/commit; a later remover reads the preceding writer's roots.
+    #[test]
+    fn registry_owner_preserves_parallel_changes_before_uninstall() {
+        let base=std::env::temp_dir().join(format!("taskq-registry-owner-{}",std::process::id()));
+        let install=base.join("install");let a=base.join("a");let b=base.join("b");let c=base.join("c");
+        for path in [&install,&a,&b,&c] {fs::create_dir_all(path).unwrap();}
+        let before=format!("{}\n{}\n",a.display(),b.display());
+        fs::write(install.join("projects"),&before).unwrap();fs::write(install.join("fixture.unit"),"unit").unwrap();
+        let held=coreq::file_lock::lock(&install.join("projects.lock")).unwrap();
+        let run=||coreq::process::output("test.registry-owner",std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact","tests::registry_uninstall_fixture","--ignored"]).env("TASKQ_REGISTRY_FIXTURE",&base),Duration::from_secs(5)).unwrap();
+        run();
+        let busy:Value=serde_json::from_slice(&fs::read(base.join("result.json")).unwrap()).unwrap();
+        let unchanged=fs::read_to_string(install.join("projects")).unwrap()==before && install.join("fixture.unit").is_file();
+        // This is the first owner's acknowledged change while the second one has been refused.
+        fs::write(install.join("projects"),format!("{before}{}\n",c.display())).unwrap();
+        drop(held);fs::write(install.join("fixture.unit"),"unit").unwrap();run();
+        let done:Value=serde_json::from_slice(&fs::read(base.join("result.json")).unwrap()).unwrap();
+        let after=fs::read_to_string(install.join("projects")).unwrap();
+        fs::remove_dir_all(&base).unwrap();
+        assert_eq!(busy["ok"],false,"uninstall crossed another registry owner's boundary: {busy}");
+        assert!(unchanged,"registry or unit changed while the preceding owner held projects.lock");
+        assert_eq!(done["ok"],true,"{done}");
+        assert_eq!(after,format!("{}\n{}\n",b.display(),c.display()),"a stale snapshot lost the preceding writer's project");
+    }
+
+    #[test]
+    #[ignore="owned process for registry_owner_preserves_parallel_changes_before_uninstall"]
+    fn registry_uninstall_fixture() {
+        let base=PathBuf::from(std::env::var_os("TASKQ_REGISTRY_FIXTURE").unwrap());let install=base.join("install");
+        let unit=platform::Unit {path:install.join("fixture.unit"),text:String::new(),load:vec![],unload:vec![],stop:vec![]};
+        let result=uninstall_unit(&unit,&base.join("a"),&install.join("projects"));
+        platform::write_atomic(&base.join("result.json"),&json!({"ok":result.is_ok(),"error":result.err()}).to_string()).unwrap();
+    }
+
     // Chain: § 4 service uninstall. Risk: an unreadable registry loses the unit.
     #[test]
     fn unreadable_registry_preserves_unit_before_unload() {
@@ -3190,7 +3221,7 @@ mod tests {
         assert!(u.path.is_file());
         assert!(!projects.exists());
         fs::remove_file(&u.path).unwrap();
-        fs::remove_dir(&root).unwrap();
+        fs::remove_dir_all(&root).unwrap();
     }
 
     // Chain: § 4 service uninstall failure. Risk: a failed uninstall loses registration.
@@ -3199,7 +3230,8 @@ mod tests {
         let root = std::env::temp_dir().join(format!("taskq-uninstall-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
         let projects = root.join("projects");
-        let registered = format!("{}\nother\n", root.display());
+        let other=root.join("other");fs::create_dir_all(&other).unwrap();
+        let registered = format!("{}\n{}\n", root.display(),other.display());
         fs::write(&projects, &registered).unwrap();
         let u = platform::Unit {
             path: root.join("unit"), text: String::new(), load: vec![], stop: vec![],
@@ -3211,7 +3243,7 @@ mod tests {
         assert_eq!(fs::read_to_string(&projects).unwrap(), registered);
         fs::remove_file(&u.path).unwrap();
         fs::remove_file(&projects).unwrap();
-        fs::remove_dir(&root).unwrap();
+        fs::remove_dir_all(&root).unwrap();
     }
 
     // Chain: § 7 close verdict. Risk: a padded verdict publishes.

@@ -376,6 +376,13 @@ impl Host {
         self.policy = policy;
     }
 
+    /// A newly attached project may carry old occupancy, even if its root was drained earlier.
+    fn attach(&mut self,root:&Path) {
+        self.busy.insert(root.into(),true);
+        self.prepared.remove(root);self.recovered.remove(root);self.rebuilt.remove(root);
+        self.rebuilding=true;
+    }
+
     pub fn sync(&mut self, project: &Path, held: Vec<crate::admission::Res>) -> usize {
         self.slots.retain(|(p, _, _), _| p != project);
         for (n, a, rt) in held { self.slots.insert(slot(project, n, a), rt); }
@@ -634,7 +641,7 @@ pub fn run(install: &Path) -> Res<()> {
             for root in &roots {
                 h.draining.remove(root);
                 if threads.contains_key(root) || stopped.contains(root) { continue; }
-                h.busy.insert(root.clone(), true);
+                h.attach(root);
                 let root = root.clone();
                 let install = install.to_path_buf();
                 let host = shared.clone();
@@ -1089,6 +1096,16 @@ mod tests {
         assert!(h.rebuild_slots(&b,vec![(2,8,"codex".into())]));assert!(!h.rebuilding);
         assert_eq!(h.used()["codex"],2);assert!(h.reserve(&a,3,0,"codex",&p.cap,true,0).is_err());
         h.sync(&b,vec![]);assert!(h.reserve(&a,3,0,"codex",&p.cap,true,0).is_ok());
+
+        h.sync(&a,vec![(1,7,"codex".into())]);
+        let c=PathBuf::from("later");h.attach(&c);
+        assert_eq!(h.reserve(&a,4,0,"codex",&p.cap,true,30).unwrap_err(),"host occupancy recovery pending","registration may carry unresolved prior occupancy");
+        assert!(!h.rebuild_slots(&a,vec![(1,7,"codex".into())]));
+        assert!(h.rebuild_slots(&c,vec![(4,9,"codex".into())]));
+        assert_eq!(h.used()["codex"],2);
+        h.sync(&c,vec![]);h.busy.remove(&c);h.attach(&c);
+        assert!(!h.rebuild_slots(&a,vec![(1,7,"codex".into())]),"re-registration cannot reuse the earlier root's recovery acknowledgment");
+        assert!(h.rebuild_slots(&c,vec![]));assert!(!h.rebuilding);
     }
 
     // H-A5: the final handover barrier covers orphaned slots and closes before re-entry.

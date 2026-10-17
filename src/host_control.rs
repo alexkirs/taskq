@@ -113,7 +113,7 @@ pub fn install_state(tool:&coreq::Tool,owner:Option<&Identity>)->Res<InstallStat
 $a=$d.Actions.Item(1);$e=$saved.Task.Actions.Exec
 $principal=[string]$xml.Task.Principals.Principal.UserId
 $owner=if($principal.StartsWith('S-1-',[StringComparison]::OrdinalIgnoreCase)){{[Security.Principal.SecurityIdentifier]::new($principal).Value}}else{{[Security.Principal.NTAccount]::new($principal).Translate([Security.Principal.SecurityIdentifier]).Value}}
-if($d.Principal.LogonType -ne 3 -or $d.Principal.RunLevel -ne 0 -or $owner -ne $sid -or $d.Actions.Count -ne 1 -or @($e).Count -ne 1 -or $a.Path -ne {exe} -or $a.Arguments -ne 'service run' -or $a.WorkingDirectory -ne {cwd} -or $a.Path -ne [string]$e.Command -or $a.Arguments -ne [string]$e.Arguments -or $a.WorkingDirectory -ne [string]$e.WorkingDirectory){{throw 'host task scope differs'}}
+if($d.Principal.LogonType -ne 3 -or $d.Principal.RunLevel -ne 0 -or $owner -ne $sid -or $d.Actions.Count -ne 1 -or @($e).Count -ne 1 -or !(Test-CoreQPath $a.Path {exe}) -or $a.Arguments -ne 'service run' -or !(Test-CoreQPath $a.WorkingDirectory {cwd}) -or !(Test-CoreQPath $a.Path ([string]$e.Command)) -or $a.Arguments -ne [string]$e.Arguments -or !(Test-CoreQPath $a.WorkingDirectory ([string]$e.WorkingDirectory))){{throw 'host task scope differs'}}
 if($d.Triggers.Count -ne 1 -or $d.Triggers.Item(1).Type -ne 9 -or !$d.Triggers.Item(1).Enabled){{throw 'host task trigger differs'}}
 $principal=[string]$d.Triggers.Item(1).UserId
 $trigger=if($principal.StartsWith('S-1-',[StringComparison]::OrdinalIgnoreCase)){{[Security.Principal.SecurityIdentifier]::new($principal).Value}}else{{[Security.Principal.NTAccount]::new($principal).Translate([Security.Principal.SecurityIdentifier]).Value}}
@@ -127,6 +127,7 @@ if({pid} -eq 0){{throw 'scheduler instance has no attributable host'}}
 $engine=$instances[0].EnginePID;$daemon=Get-CimInstance Win32_Process -Filter 'ProcessId = {pid}'
 if(!$daemon -or $daemon.ParentProcessId -ne $engine -or (Get-Process -Id {pid}).StartTime.ToFileTimeUtc().ToString() -ne {started}){{throw 'native host incarnation differs'}}
 "#,name=quote(tool.title),definition=quote(&definition(tool)?.to_string_lossy()),exe=quote(&tool.install.join(tool.exe_name()).to_string_lossy()),cwd=quote(&tool.install.to_string_lossy()),pid=owner.map_or(0,|p|p.pid),started=quote(owner.map_or("",|p|p.started.as_str())));
+        let code=format!("{}\n{code}",coreq::service::windows_path_identity());
         output("host.install.owner",&mut powershell(&code))?;
     }
     Ok(InstallState::Loaded)
@@ -182,12 +183,13 @@ fn verify_saved_install_scope(tool:&coreq::Tool)->Res<()> {
 $p=$saved.Task.Principals.Principal;$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 $principal=[string]$p.UserId
 $owner=if($principal.StartsWith('S-1-',[StringComparison]::OrdinalIgnoreCase)){{[Security.Principal.SecurityIdentifier]::new($principal).Value}}else{{[Security.Principal.NTAccount]::new($principal).Translate([Security.Principal.SecurityIdentifier]).Value}}
-if(@($saved.Task.Principals.Principal).Count -ne 1 -or $owner -ne $sid -or [string]$p.LogonType -ne 'InteractiveToken' -or [string]$p.RunLevel -ne 'LeastPrivilege' -or @($saved.Task.Actions.Exec).Count -ne 1 -or @($saved.Task.Actions.ChildNodes).Count -ne 1 -or [string]$e.Command -ne {exe} -or [string]$e.Arguments -ne 'service run' -or [string]$e.WorkingDirectory -ne {cwd}){{throw 'saved host task scope differs'}}
+if(@($saved.Task.Principals.Principal).Count -ne 1 -or $owner -ne $sid -or [string]$p.LogonType -ne 'InteractiveToken' -or [string]$p.RunLevel -ne 'LeastPrivilege' -or @($saved.Task.Actions.Exec).Count -ne 1 -or @($saved.Task.Actions.ChildNodes).Count -ne 1 -or !(Test-CoreQPath ([string]$e.Command) {exe}) -or [string]$e.Arguments -ne 'service run' -or !(Test-CoreQPath ([string]$e.WorkingDirectory) {cwd})){{throw 'saved host task scope differs'}}
 if(@($saved.Task.Triggers.ChildNodes).Count -ne 1 -or @($saved.Task.Triggers.LogonTrigger).Count -ne 1 -or [string]$saved.Task.Triggers.LogonTrigger.Enabled -ne 'true'){{throw 'saved host task trigger differs'}}
 $principal=[string]$saved.Task.Triggers.LogonTrigger.UserId
 $trigger=if($principal.StartsWith('S-1-',[StringComparison]::OrdinalIgnoreCase)){{[Security.Principal.SecurityIdentifier]::new($principal).Value}}else{{[Security.Principal.NTAccount]::new($principal).Translate([Security.Principal.SecurityIdentifier]).Value}}
 if($trigger -ne $sid){{throw 'saved host task trigger owner differs'}}
 "#,definition=quote(&definition(tool)?.to_string_lossy()),exe=quote(&tool.install.join(tool.exe_name()).to_string_lossy()),cwd=quote(&tool.install.to_string_lossy()));
+        let code=format!("{}\n{code}",coreq::service::windows_path_identity());
         output("host.install.definition",&mut powershell(&code))?;
     }
     Ok(())
@@ -229,6 +231,8 @@ fn powershell(code:&str)->Command {
 
 #[cfg(windows)]
 fn controller_args(install:&Path,id:&str,action:&str,context:&str,exe:&Path)->Res<String> {
+    let install=install.canonicalize().map_err(|e|format!("controller installation identity unknown: {e}"))?;
+    let exe=exe.canonicalize().map_err(|e|format!("controller executable identity unknown: {e}"))?;
     let bootstrap=format!("$ErrorActionPreference='Stop';$env:TASKQ_INSTALL={};$env:COREQ_TRACE_CONTEXT={};Remove-Item Env:TASKQ_ROOT,Env:TASKQ_ATTEMPT,Env:TASKQ_TASK -ErrorAction SilentlyContinue;& {} service {} --request {};exit $LASTEXITCODE",quote(&install.to_string_lossy()),quote(context),quote(&exe.to_string_lossy()),action,quote(id));
     let invocation=powershell(&bootstrap);Ok(invocation.get_args().map(|a|a.to_string_lossy()).collect::<Vec<_>>().join(" "))
 }
@@ -283,9 +287,10 @@ pub(crate) fn dispatch_command(install:&Path,id:&str,action:&str,context:&str)->
         let code=format!(r#"$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue'
 $s=New-Object -ComObject 'Schedule.Service';$s.Connect();$r=$s.GetFolder('\');$name={name};$path=(Get-Command powershell.exe -ErrorAction Stop).Source;$args={args};$cwd={cwd};$identity=[Security.Principal.WindowsIdentity]::GetCurrent()
 try{{$t=$r.GetTask($name)}}catch{{if(($_.Exception.GetBaseException()).HResult -ne -2147024894){{throw}};$t=$null}}
-if($t){{$a=$t.Definition.Actions.Item(1);if($t.Definition.Principal.LogonType -ne 3 -or $t.Definition.Principal.RunLevel -ne 0 -or ($t.Definition.Principal.UserId -ne $identity.Name -and $t.Definition.Principal.UserId -ne $identity.User.Value) -or $t.Definition.Triggers.Count -ne 0 -or $t.Definition.Settings.ExecutionTimeLimit -ne 'PT2M' -or $t.Definition.Actions.Count -ne 1 -or $a.Path -ne $path -or $a.Arguments -ne $args -or $a.WorkingDirectory -ne $cwd){{throw 'existing controller definition differs'}}}}
+if($t){{$a=$t.Definition.Actions.Item(1);if($t.Definition.Principal.LogonType -ne 3 -or $t.Definition.Principal.RunLevel -ne 0 -or ($t.Definition.Principal.UserId -ne $identity.Name -and $t.Definition.Principal.UserId -ne $identity.User.Value) -or $t.Definition.Triggers.Count -ne 0 -or $t.Definition.Settings.ExecutionTimeLimit -ne 'PT2M' -or $t.Definition.Actions.Count -ne 1 -or !(Test-CoreQPath $a.Path $path) -or $a.Arguments -ne $args -or !(Test-CoreQPath $a.WorkingDirectory $cwd)){{throw 'existing controller definition differs'}}}}
 else{{$d=$s.NewTask(0);$d.Principal.UserId=$identity.Name;$d.Principal.LogonType=3;$d.Principal.RunLevel=0;$d.Settings.ExecutionTimeLimit='PT2M';$d.Settings.MultipleInstances=2;$d.Settings.DisallowStartIfOnBatteries=$false;$d.Settings.StopIfGoingOnBatteries=$false;$a=$d.Actions.Create(0);$a.Path=$path;$a.Arguments=$args;$a.WorkingDirectory=$cwd;$sddl='D:P(A;;GA;;;'+$identity.User.Value+')(A;;GA;;;SY)';$t=$r.RegisterTaskDefinition($name,$d,18,$null,$null,3,$sddl)}}
 if($t.State -ne 4){{$null=$t.Run($null)}}"#,name=quote(&format!("TaskQ-Stop-{id}")),args=quote(&args),cwd=quote(&install.to_string_lossy()));
+        let code=format!("{}\n{code}",coreq::service::windows_path_identity());
         output("host.stop.dispatch",&mut powershell(&code))?;
     }
     #[cfg(not(any(target_os="macos",target_os="linux",windows)))] return Err("native Stop controller unsupported".into());
@@ -389,8 +394,9 @@ fn stop_unit(tool:&coreq::Tool,id:&str,expected:&Identity,unit_revision:&str)->R
     #[cfg(windows)] {
         let setup=format!(r#"$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue'
 $s=New-Object -ComObject 'Schedule.Service';$s.Connect();$r=$s.GetFolder('\');$t=$r.GetTask({name});$a=$t.Definition.Actions.Item(1);[xml]$saved=Get-Content -Raw -LiteralPath {definition};$exec=$saved.Task.Actions.Exec
-if($t.Definition.Actions.Count -ne 1 -or @($exec).Count -ne 1 -or $a.Path -ne [string]$exec.Command -or $a.Arguments -ne [string]$exec.Arguments -or $a.WorkingDirectory -ne [string]$exec.WorkingDirectory -or $a.WorkingDirectory -ne {cwd}){{throw 'scheduled host scope differs'}}
+if($t.Definition.Actions.Count -ne 1 -or @($exec).Count -ne 1 -or !(Test-CoreQPath $a.Path ([string]$exec.Command)) -or $a.Arguments -ne [string]$exec.Arguments -or !(Test-CoreQPath $a.WorkingDirectory ([string]$exec.WorkingDirectory)) -or !(Test-CoreQPath $a.WorkingDirectory {cwd})){{throw 'scheduled host scope differs'}}
 "#,name=quote(tool.title),definition=quote(&definition(tool)?.to_string_lossy()),cwd=quote(&install.to_string_lossy()));
+        let setup=format!("{}\n{setup}",coreq::service::windows_path_identity());
         let query=format!(r#"{setup}
 $instances=@(Get-TaskQInstances $s $t);if($instances.Count -gt 1){{throw 'multiple native host instances'}}
 if($instances.Count -eq 0){{'null';exit 0}}
@@ -455,9 +461,10 @@ pub(crate) fn retire_command(install:&Path,id:&str,action:&str,context:&str)->Re
         let args=controller_args(install,id,action,context,&std::env::current_exe().map_err(|e|e.to_string())?)?;
         let code=format!(r#"$ErrorActionPreference='Stop';$s=New-Object -ComObject 'Schedule.Service';$s.Connect();$r=$s.GetFolder('\');$name={name}
 try{{$t=$r.GetTask($name)}}catch{{if(($_.Exception.GetBaseException()).HResult -ne -2147024894){{throw}};$t=$null}}
-if($t){{$a=$t.Definition.Actions.Item(1);if($t.Definition.Actions.Count -ne 1 -or $a.Path -ne (Get-Command powershell.exe -ErrorAction Stop).Source -or $a.Arguments -ne {args} -or $a.WorkingDirectory -ne {cwd} -or $t.Definition.Principal.RunLevel -ne 0 -or $t.Definition.Triggers.Count -ne 0){{throw 'controller ownership differs; definition kept'}};$r.DeleteTask($name,0)}}
+if($t){{$a=$t.Definition.Actions.Item(1);if($t.Definition.Actions.Count -ne 1 -or !(Test-CoreQPath $a.Path (Get-Command powershell.exe -ErrorAction Stop).Source) -or $a.Arguments -ne {args} -or !(Test-CoreQPath $a.WorkingDirectory {cwd}) -or $t.Definition.Principal.RunLevel -ne 0 -or $t.Definition.Triggers.Count -ne 0){{throw 'controller ownership differs; definition kept'}};$r.DeleteTask($name,0)}}
 try{{$null=$r.GetTask($name);throw 'controller definition remains'}}catch{{if(($_.Exception.GetBaseException()).HResult -ne -2147024894){{throw}}}}
 exit 0"#,name=quote(&format!("TaskQ-Stop-{id}")),args=quote(&args),cwd=quote(&install.to_string_lossy()));
+        let code=format!("{}\n{code}",coreq::service::windows_path_identity());
         output("host.stop.controller.retire",&mut powershell(&code))?;
     }
     #[cfg(not(windows))] let _=install;
@@ -468,6 +475,19 @@ exit 0"#,name=quote(&format!("TaskQ-Stop-{id}")),args=quote(&args),cwd=quote(&in
 mod tests {
     use super::*;
     use serde_json::{Value,json};
+
+    #[cfg(windows)]
+    #[test]
+    fn controller_replay_keeps_arguments_across_install_aliases() {
+        let install=std::env::temp_dir().join(format!("taskq-controller-alias-{}",crate::runtime::uuid()));
+        fs::create_dir_all(&install).unwrap();let exe=std::env::current_exe().unwrap();
+        let canonical=install.canonicalize().unwrap();
+        let args=controller_args(&install,"same-request","complete-stop","same-context",&exe).unwrap();
+        assert_eq!(args,controller_args(&canonical,"same-request","complete-stop","same-context",&exe.canonicalize().unwrap()).unwrap());
+        assert_ne!(args,controller_args(&install,"other-request","complete-stop","same-context",&exe).unwrap());
+        assert!(controller_args(&install.join("missing"),"same-request","complete-stop","same-context",&exe).is_err());
+        fs::remove_dir_all(install).unwrap();
+    }
 
     #[test]
     fn removed_systemd_failed_history_is_absent_but_incomplete_inventory_is_unknown() {
@@ -521,6 +541,19 @@ mod tests {
             let kept=fs::read(&definition).unwrap();fs::write(&definition,&original).unwrap();
             assert!(refused.is_err());assert_eq!(kept,b"foreign invalid definition");
             #[cfg(windows)] {
+                let canonical=coreq::Tool {install:install.canonicalize().unwrap(),..tool.clone()};
+                assert_eq!(install_state(&canonical,Some(&native)).unwrap(),InstallState::Loaded,"native/saved ordinary paths accept the canonical caller");
+                let other=install.join("other.exe");fs::copy(install.join(tool.exe_name()),&other).unwrap();
+                for (field,path,accepted) in [("Command",install.join(tool.exe_name()).canonicalize().unwrap(),true),("WorkingDirectory",install.canonicalize().unwrap(),true),
+                    ("Command",other.clone(),false),("Command",install.join("missing.exe"),false),("WorkingDirectory",install.parent().unwrap().to_path_buf(),false),("WorkingDirectory",install.join("missing"),false)] {
+                    let code=format!("$ErrorActionPreference='Stop';[xml]$xml=Get-Content -Raw -LiteralPath {definition};$xml.Task.Actions.Exec.{field}={path};$xml.Save({definition})",definition=quote(&definition.to_string_lossy()),path=quote(&path.to_string_lossy()));
+                    output("host.install.fixture.path",&mut powershell(&code)).unwrap();
+                    let changed=fs::read(&definition).unwrap();let checked=install_state(&tool,Some(&native));
+                    let kept=fs::read(&definition).unwrap();fs::write(&definition,&original).unwrap();
+                    assert_eq!(checked.is_ok(),accepted,"{field} {}: {checked:?}",path.display());assert_eq!(kept,changed);
+                    assert_eq!(coreq::process::identity(native.pid).unwrap().as_ref(),Some(&native));
+                }
+                fs::remove_file(other).unwrap();
                 let sid=output("host.install.fixture.principal",&mut powershell("[Security.Principal.WindowsIdentity]::GetCurrent().User.Value")).unwrap();
                 let sid=String::from_utf8(sid.stdout).unwrap();
                 for (principal,accepted) in [(sid.trim(),true),("S-1-5-18",false),("S-1-invalid",false)] {

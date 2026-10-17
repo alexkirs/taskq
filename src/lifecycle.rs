@@ -253,8 +253,8 @@ pub fn observe(install:&Path,instance:&str,ready:bool)->Res<()> {
 
 pub fn update_wait(install:&Path,instance:&str)->Res<()> {
     resources::try_with(install,|state| {
-        if let Some(p)=active(state)? && p.origin()==instance {
-            state.ops.get_mut(p.id()).unwrap().receipt["reason"]=json!("host release check in progress; waiting for its bounded result");
+        if let Some(p)=active(state)? && p.origin()==instance && p.phase=="queued" && state.ops[p.id()].receipt["reason"].is_null() {
+            state.ops.get_mut(p.id()).unwrap().receipt["reason"]=json!("host maintenance in progress; waiting for its bounded result");
         }
         Ok(())
     })
@@ -266,7 +266,7 @@ pub fn failed(install:&Path,id:&str,error:&str)->Res<()> {
             let p=parse(id,op)?;
             if op.receipt["state"]!="observed" {
                 let detail:String=error.char_indices().take_while(|(offset,ch)|offset+ch.len_utf8()<=112).map(|(_,ch)|ch).collect();
-                op.receipt["reason"]=json!(format!("{} outcome unknown: {detail}; retry service {} --request {id}",p.action().title(),if p.action()==Action::Uninstall {"uninstall"}else{"stop"}));
+                op.receipt["reason"]=json!(format!("{} outcome unknown: {detail}; retry service {} --request {id}",p.action().title(),p.action().title().to_ascii_lowercase()));
             }
         }
         Ok(())
@@ -492,6 +492,11 @@ mod tests {
             assert!(result.is_err());assert!(control.poll().is_none(),"controller completion is delivered once");
         }
         assert!(complete_stop_with(&install,"exact-stop",|_,_|Err("native effect failed".into())).unwrap_err().contains("native effect failed"));
+        failed(&install,"exact-stop","native host path scope differs").unwrap();
+        let failure=receipt(&install,"exact-stop").unwrap().unwrap()["reason"].clone();
+        let origin=pending(&install).unwrap().unwrap().origin().to_string();
+        update_wait(&install,&origin).unwrap();
+        assert_eq!(receipt(&install,"exact-stop").unwrap().unwrap()["reason"],failure,"background maintenance cannot hide a prepared controller failure");
         assert_eq!(fs::read(install.join("projects")).unwrap(),registry);
         assert!(complete_stop_with(&install,"exact-stop",|_,_|Ok(())).unwrap_err().contains("native exit"));
         assert_eq!(fs::read(install.join("projects")).unwrap(),registry);
@@ -504,6 +509,7 @@ mod tests {
             child.0.kill().unwrap();child.0.wait().unwrap();Ok(())
         }).unwrap();
         assert_eq!(final_receipt["state"],"observed");assert_eq!(final_receipt["native_exit"],true);assert_eq!(final_receipt["received_receipt"],original["received_receipt"]);
+        assert!(final_receipt["reason"].is_null(),"observed native completion clears the prior failed effect");
         assert!(final_receipt.get("service_instance").is_none(),"native exit cannot claim a new service generation");
         assert_eq!(fs::read(install.join("projects")).unwrap(),if mode=="project" {Vec::new()}else{registry});
         if mode!="stop" {assert_eq!(final_receipt["unit_removed"],true);if mode=="project" {assert_eq!(final_receipt["unregistered"],true);}}
@@ -547,7 +553,13 @@ mod tests {
         let original=fs::read(install.join("projects")).unwrap();
         fs::write(install.join("projects"),"").unwrap();assert!(prepare(&install,"original").is_err());
         assert_eq!(receipt(&install,"exact-restart").unwrap().unwrap()["state"],"queued");fs::write(install.join("projects"),original).unwrap();
+        failed(&install,"exact-restart","native definition unavailable").unwrap();
+        assert!(receipt(&install,"exact-restart").unwrap().unwrap()["reason"].as_str().unwrap().contains("retry service restart --request exact-restart"));
+        let failure=receipt(&install,"exact-restart").unwrap().unwrap()["reason"].clone();
+        update_wait(&install,"original").unwrap();
+        assert_eq!(receipt(&install,"exact-restart").unwrap().unwrap()["reason"],failure,"queued failure survives a background progress tick");
         prepare(&install,"original").unwrap();assert_eq!(receipt(&install,"exact-restart").unwrap().unwrap()["state"],"applied");
+        assert!(receipt(&install,"exact-restart").unwrap().unwrap()["reason"].is_null(),"qualified preparation clears the resolved queued failure");
         observe(&install,"original",true).unwrap();assert_eq!(status(&install,None)["state"],"applied");
         publish(&install,"replacement");observe(&install,"replacement",false).unwrap();assert_eq!(status(&install,None)["state"],"applied");
         assert!(prepare(&install,"replacement").is_err(),"an already replaced origin must never trigger a second switch");

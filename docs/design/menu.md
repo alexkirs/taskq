@@ -56,7 +56,7 @@ Counter scope, all states and quiet Closed totals: [K-A1–K-A6](task-counters.m
 - A failed project action returns its reason to the menu and clears its pending indicator. The error remains through status refreshes until another action for that project; successful dispatch still waits for state readback.
 - Global commands name affected projects/host and unchanged targets before apply. Per-project actions affect only that project.
 - Show pending, applied, partial failure and unknown separately; confirm application by readback.
-- Restart, pause and stop until next login have distinct effects. Stop preserves autostart; expose active-work consequences before use.
+- Restart, pause and stop have distinct effects. Stop retains autostart; show its native restart condition and active-work consequences before use.
 - Uninstall uses a nested confirmation naming the project, removes its service unit and preserves project files and other registrations. Remove shared install resources only when no consumer remains. R11 applies.
 - Emergency termination is required, separate from Pause; [E1–E5](emergency-recovery.md) define the reviewed-recovery candidate.
 
@@ -109,7 +109,7 @@ Native sizing, scroll ownership and cadence rendering follow [R-UI1–R-UI6](ren
 
 - Categories: Appearance, Activity history, Agents, Services and About. Work mode remains a direct entry, not a second editor.
 - Appearance contains view/font; Activity history contains M6 presets/custom range; Agents retains host probes; proposed permission controls follow [P1–P9](worker-permissions.md), pending authority/enforcement approval.
-- Services lists targets with freshness, incidents, log/folder, restart, stop until next login and nested uninstall confirmation. Retain Resources access to the existing external monitor and incident consent controls. No repeated service sections on home.
+- Services lists targets with freshness, incidents, log/folder, restart, stop with its native restart condition, and nested uninstall confirmation. Retain Resources access to the existing external monitor and incident consent controls. No repeated service sections on home.
 - Stale status does not prove a dead process. Known logs remain accessible during failure; unknown log paths are explained.
 - About shows tray/service versions and host. Update now appears only for a verified newer version; preserve progress, readback, failure and rollback visibility.
 - Update writes the existing service request and follows §8. Do not claim completion from a button click.

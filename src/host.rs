@@ -406,6 +406,20 @@ impl Host {
             self.published.get(root).is_some_and(|at| at.elapsed().as_secs() < 60))
     }
 
+    pub fn handoff_ready(&self) -> bool {
+        self.restart && !self.rebuilding && self.held.is_none()
+            && self.busy.keys().all(|root|self.prepared.contains(root))
+            && self.slots.keys().all(|(root,_,_)|self.prepared.contains(root))
+    }
+
+    /// Once all projects prepared, none can re-enter before the coordinator switches images.
+    pub fn begin_pass(&mut self, root:&Path) -> bool {
+        if self.handoff_ready() {return false;}
+        self.prepared.remove(root);
+        self.busy.insert(root.into(),true);
+        true
+    }
+
     pub fn reserve(&mut self, project: &Path, n: u64, a: u64, rt: &str, cap: &Capacity, queue: bool, now: u64) -> Res<usize> {
         let p = self.policy.as_ref().map_err(Clone::clone)?;
         if let Some(reason) = &self.held { return Err(reason.clone()); }
@@ -627,9 +641,9 @@ pub fn run(install: &Path) -> Res<()> {
                             Ok(c) => return crate::service_run(&c, Some(host)),
                             Err(e) => {
                                 if let Ok(mut h) = host.lock() {
-                                    if h.draining.contains(&root) { return Err("project drained".into()); }
-                                    h.busy.insert(root.clone(), false);
-                                    if h.restart { h.prepared.insert(root.clone()); }
+                                    // No board/native reconciliation exists while configuration is invalid.
+                                    h.busy.insert(root.clone(), true);
+                                    h.prepared.remove(&root);
                                 }
                                 let instance=host.lock().map(|h|h.instance.clone()).unwrap_or_default();
                                 let _ = startup_status(&install, &root, &e,&instance);
@@ -663,6 +677,7 @@ pub fn run(install: &Path) -> Res<()> {
             else {
                 // A reduced loop failed: its attempts expire on other hosts, and local launches hold for inspection.
                 stopped.insert(root.clone());
+                h.prepared.remove(&root);
                 h.ready(&root, false);
                 append_project(install, &root, "project thread stopped; leases expire on other hosts; retained slots have unknown liveness");
             }
@@ -684,7 +699,7 @@ pub fn run(install: &Path) -> Res<()> {
             for root in &roots {
                 if let Err(e) = crate::poke(root) { append_project(install, root, &e); }
             }
-            if h.busy.keys().all(|r| h.prepared.contains(r)) {
+            if h.handoff_ready() {
                 drop(h);
                 let _ = fs::remove_file(install.join("restart"));
                 for root in &roots { let _ = fs::remove_file(crate::dot(root).join("restart")); }
@@ -1025,6 +1040,26 @@ impl Panics {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // H-A5: the final handover barrier covers orphaned slots and closes before re-entry.
+    #[test]
+    fn handover_preparation_latches_only_after_every_owned_project() {
+        let a=PathBuf::from("a");let b=PathBuf::from("b");
+        let mut h=Host::new(Err("fixture".into()));
+        assert!(h.begin_pass(&a));h.restart=true;h.prepared.insert(a.clone());
+        h.sync(&b,vec![(1,7,"codex".into())]);
+        assert!(!h.handoff_ready(),"an unrepresented slot is not an idle project");
+        assert!(h.begin_pass(&a));assert!(!h.prepared.contains(&a));
+        h.prepared.insert(a.clone());assert!(h.begin_pass(&b));
+        h.prepared.insert(b.clone());
+        h.held=Some("registry unknown".into());assert!(!h.handoff_ready());
+        h.held=None;assert!(h.handoff_ready());
+        for _ in 0..3 {
+            assert!(!h.begin_pass(&a));assert!(!h.begin_pass(&b));assert!(h.handoff_ready());
+        }
+        h.prepared.remove(&b);assert!(!h.handoff_ready(),"failed ownership cannot keep an old acknowledgment");
+        assert!(h.begin_pass(&a));assert!(!h.prepared.contains(&a));
+    }
     fn temp(name: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!("taskq-host-{name}-{}", std::process::id()));
         fs::create_dir_all(&p).unwrap(); p

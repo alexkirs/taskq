@@ -802,6 +802,10 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
     let mut observed_poke = None;
     let mut observed_command = None;
     loop {
+        if let Some(host)=&host {
+            let proceed=host.lock().map_err(|_|"host handover unknown")?.begin_pass(&cfg.root);
+            if !proceed {std::thread::sleep(Duration::from_secs(1));continue;}
+        }
         let pass_began=Instant::now();
         let poke_start = poke_times(&pokes);
         telemetry::diagnostic::poll(&cfg.install);
@@ -981,7 +985,7 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
         if let Some(host) = &host {
             if let Ok(mut h) = host.lock() {
             let registered = !h.draining.contains(&cfg.root);
-            let drained = s.kids.is_empty() && !operator::running(&cfg.root);
+            let drained = s.idle() && !operator::running(&cfg.root);
             if !registered && drained { h.sync(&cfg.root, vec![]); h.ready(&cfg.root, false); return Err("project drained".into()); }
             if registered { h.busy.insert(cfg.root.clone(), !drained); }
             if h.restart && restart_waits(&s, &cfg.root).is_empty() {
@@ -1108,10 +1112,11 @@ fn save_kids(s: &Service, root: &Path) -> Res<()> {
 
 /// A failed reduced loop retains its handles; an image switch also needs recovery evidence.
 fn stopped_handoff(s: &mut Service, host: &host::Shared, cfg: &Config) -> Res<bool> {
+    if !host.lock().map_err(|_|"stopped project admission unknown")?.begin_pass(&cfg.root) {return Ok(false);}
     s.reap_owned();
     s.sync_host();
     let mut h = host.lock().map_err(|_| "stopped project admission unknown")?;
-    let idle = s.kids.is_empty() && !operator::running(&cfg.root);
+    let idle = s.idle() && !operator::running(&cfg.root);
     h.busy.insert(cfg.root.clone(), !idle);
     if h.restart && restart_waits(s, &cfg.root).is_empty() {
         save_kids(s, &cfg.root)?;
@@ -1627,6 +1632,7 @@ fn reexec(s: &Service, cfg: &Config) -> Res<()> {
 fn restart_waits(s: &Service, root: &Path) -> Vec<String> {
     let mut w: Vec<String> = s.kids.iter().filter(|k| cfg!(windows) || matches!(k.rt.as_str(), "codex-app" | "claude")).map(|k| format!("#{}", k.task)).collect();
     w.dedup();
+    w.extend(s.handoff_waits());
     if operator::running(root) {
         w.push("operator".into());
     }
@@ -1784,7 +1790,8 @@ fn service(args: &Args) -> Res<()> {
             if sub == "stop" {
                 platform::run_all(&u.stop, false)?;
                 kill_service(&root);
-                println!("Stop requested for {}; starts again at the next logon", project_name(&root));
+                let condition=if cfg!(target_os="linux") {"explicit service install or user-manager startup"} else {"next logon or explicit service install"};
+                println!("Stop requested for {}; restart: {condition}", project_name(&root));
                 return Ok(());
             }
             if sub == "install" {
@@ -3600,7 +3607,7 @@ mod tests {
         s.kids.push(Kid { execution: 41, task: 7, attempt: 41, rt: "codex-app".into(), proc: Box::new(runtime::Adopted::new(coreq::process::identity(pid).unwrap().unwrap())) });
         reexec(&s, &c).unwrap();
         assert!(dot(&root).join("restart").exists());
-        assert_eq!(restart_waits(&s, &root), ["#7"], "status and log name the task the restart waits for");
+        assert_eq!(restart_waits(&s, &root), ["#7","ownership unknown"], "status names the active task and missing ownership read");
         assert_eq!(s.kids[0].attempt, 41);
         assert_eq!(adopted.exited(), Ok(None));
         s.kids.clear();
@@ -3609,7 +3616,7 @@ mod tests {
         fs::write(operator::answer_path(&root, "1"), r#"{"state":"running"}"#).unwrap();
         reexec(&s, &c).unwrap();
         assert!(dot(&root).join("restart").exists() && handover(&root));
-        assert_eq!(restart_waits(&s, &root), ["operator"]);
+        assert_eq!(restart_waits(&s, &root), ["ownership unknown","operator"]);
         fs::write(operator::answer_path(&root, "1"), r#"{"state":"result"}"#).unwrap();
         // an idle service reloads the unit, which would end a child
         fs::write(dot(&root).join("status.json"), r#"{"kids": []}"#).unwrap();

@@ -272,6 +272,8 @@ pub struct Service<'a> {
     /// The read model of the last successful pass (for `status.json` and the tray).
     pub snapshot: Option<crate::snapshot::Snapshot>,
     pub tasks_read: Option<std::time::Instant>,
+    /// A complete board ownership read is required before drain or handover.
+    ownership_known: bool,
     /// This host's heartbeat issue, from the last board read: a lease write needs no second list (§ 4 budget).
     host_issue: Option<u64>,
     /// Rebuilt from board ownership; heartbeat projection only, never a launch/release authority.
@@ -552,7 +554,7 @@ pub fn record(path: &std::path::Path, now: i64, moves: &[(u64, &str, u64)]) -> R
 impl<'a> Service<'a> {
     pub fn new(board: &'a dyn Board, cfg: &'a Config, version: &str, start: Box<dyn FnMut(&Launch) -> Result<Box<dyn Proc>, crate::runtime::StartError> + 'a>) -> Self {
         let cap = Ok(Capacity::fixed(cfg.limits.clone(), GATE_DEFAULT));
-        Service { recovery_after: None, reduced_at: None, host: None, wall: 0, reserved: vec![], requested: vec![], refused: None, host_used: None, board, cfg: cfg.clone(), version: version.into(), kids: vec![], instance: String::new(), machine: String::new(), focus: vec![], focus_error: None, delivered: HashMap::new(), cache: HashMap::new(), deps: HashMap::new(), label_fixes: HashMap::new(), pruned: HashSet::new(), start, recover: None, #[cfg(test)] agent_status: json!([]), log: vec![], snapshot: None, tasks_read: None, host_issue: None, observations: BTreeMap::new(), owner_comments: vec![], seen: HashMap::new(), gone_after: None, moved_after: None, events_since: None, cap, gate: Gate::default(), mono: 0, held: vec![], pending: BTreeSet::new(), hold: None, refused_access: BTreeMap::new(), unknown: HashMap::new(), execution_waits: BTreeMap::new(), pending_releases: BTreeSet::new(), stopping: BTreeSet::new(), begun: HashMap::new(), asked: HashMap::new(), sessions: HashMap::new() }
+        Service { recovery_after: None, reduced_at: None, host: None, wall: 0, reserved: vec![], requested: vec![], refused: None, host_used: None, board, cfg: cfg.clone(), version: version.into(), kids: vec![], instance: String::new(), machine: String::new(), focus: vec![], focus_error: None, delivered: HashMap::new(), cache: HashMap::new(), deps: HashMap::new(), label_fixes: HashMap::new(), pruned: HashSet::new(), start, recover: None, #[cfg(test)] agent_status: json!([]), log: vec![], snapshot: None, tasks_read: None, ownership_known: false, host_issue: None, observations: BTreeMap::new(), owner_comments: vec![], seen: HashMap::new(), gone_after: None, moved_after: None, events_since: None, cap, gate: Gate::default(), mono: 0, held: vec![], pending: BTreeSet::new(), hold: None, refused_access: BTreeMap::new(), unknown: HashMap::new(), execution_waits: BTreeMap::new(), pending_releases: BTreeSet::new(), stopping: BTreeSet::new(), begun: HashMap::new(), asked: HashMap::new(), sessions: HashMap::new() }
     }
 
     /// Rebuild board-derived state after unwind; live handles, pending launches and delivery cursors stay owned.
@@ -659,6 +661,27 @@ impl<'a> Service<'a> {
     pub fn retained_attempts(&self)->Vec<u64> {
         self.entry().held.into_iter().map(|(_,attempt,_)|attempt).collect()
     }
+
+    /// Handles may cross a qualified image switch; childless uncertainty cannot.
+    pub fn handoff_waits(&self) -> Vec<String> {
+        let owns=|task,attempt|self.kids.iter().any(|k|k.task==task && k.attempt==attempt);
+        let mut waits=BTreeSet::new();
+        if !self.ownership_known {waits.insert("ownership unknown".into());}
+        for (task,attempt) in self.reserved.iter().map(|(n,a,_)|(*n,*a))
+            .chain(self.pending.iter().copied()).chain(self.held.iter().map(|l|(l.task,l.attempt))) {
+            if !owns(task,attempt) {waits.insert(format!("#{task} unresolved ownership"));}
+        }
+        for ((task,id),_) in &self.observations {
+            if !self.kids.iter().any(|k|k.task==*task && k.execution==*id) {waits.insert(format!("#{task} unresolved execution {id}"));}
+        }
+        for (task,_,_) in &self.pending_releases {waits.insert(format!("#{task} release unconfirmed"));}
+        for attempt in self.unknown.keys().chain(self.stopping.iter()) {
+            if !self.kids.iter().any(|k|k.attempt==*attempt) {waits.insert(format!("attempt {attempt} ownership unknown"));}
+        }
+        waits.into_iter().collect()
+    }
+
+    pub fn idle(&self) -> bool {self.kids.is_empty() && self.handoff_waits().is_empty()}
 
     /// Admission of one launch (§ 3): the load gate, then under Auto a reservation from the host authority, which
     /// refuses with a reason; the request stays `requested`. Fixed admits as before.
@@ -867,6 +890,7 @@ impl<'a> Service<'a> {
     /// One pass of § 4. Tasks written to in a step are left alone by later steps until the next pass re-reads them.
     #[tracing::instrument(name="service.Service.pass",skip_all)]
     pub fn pass(&mut self) -> Result<(), String> {
+        self.ownership_known = false;
         if self.host.is_none() {
             if let Err(e) = crate::profile::prune(&self.cfg.install) { eprintln!("taskq: telemetry unknown: {e}"); }
         }
@@ -909,9 +933,18 @@ impl<'a> Service<'a> {
         let ttl = self.cfg.ttl;
         let (views, hosts) = views(self.board, &mut self.cache, &mut self.deps)?;
         let now = self.board.now()?;
-        self.observations.retain(|(task,id),_|self.kids.iter().any(|k|k.task==*task && k.execution==*id));
+        for task in self.observations.keys().map(|(task,_)|*task).collect::<BTreeSet<_>>() {
+            let read;
+            let log=if let Some(v)=views.iter().find(|v|v.issue.number==task) {&v.log}
+                else {read=crate::board::entries(self.board,task)?;&read};
+            let current=core::executions(task,log);
+            // Open-list absence, label removal and missing history never release known ownership.
+            self.observations.retain(|(n,id),old|*n!=task || self.kids.iter().any(|k|k.task==task && k.execution==*id)
+                || !current.iter().any(|x|x.id==*id && x.attempt==old.attempt && x.host==old.host && x.runtime==old.runtime && x.release.is_some()));
+        }
         self.observations.extend(views.iter().flat_map(|v|core::executions(v.issue.number,&v.log).into_iter()
             .filter(|x|x.host==me && x.release.is_none()).map(|x|((v.issue.number,x.id),x))));
+        self.ownership_known = true;
         self.snapshot = Some(crate::snapshot::from_views("host", self.board, &self.cfg, now, &views, &hosts));
         self.tasks_read = Some(std::time::Instant::now());
         // § 4 one service per host name: another install's fresh heartbeat under this name holds every write (#933)
@@ -1079,6 +1112,11 @@ impl<'a> Service<'a> {
             }
         }
         let mut unresolved_local = BTreeSet::new();
+        for ((task,_),x) in &self.observations {
+            let reservation=(*task,x.attempt,x.runtime.clone());
+            unresolved_local.insert(reservation.clone());
+            if !self.kids.iter().any(|k|k.task==*task && k.execution==x.id) && !self.reserved.contains(&reservation) {self.reserved.push(reservation);}
+        }
         for v in &views {
             let (n,t) = (v.issue.number,&v.task);
             if let Some(a) = t.attempt.filter(|_| host_of(t) != Some(&me) && matches!(t.state,State::Doing|State::Review)) {
@@ -1095,13 +1133,6 @@ impl<'a> Service<'a> {
             }
             let unresolved: Vec<_> = core::executions(v.issue.number, &v.log).into_iter()
                 .filter(|x| x.release.is_none() && !released.contains(&x.id)).collect();
-            for x in &unresolved {
-                if x.host == me { unresolved_local.insert((v.issue.number, x.attempt, x.runtime.clone())); }
-                if x.host == me && !self.kids.iter().any(|k| k.execution == x.id) {
-                    let r = (v.issue.number, x.attempt, x.runtime.clone());
-                    if !self.reserved.contains(&r) { self.reserved.push(r); }
-                }
-            }
             if let Some(x) = unresolved.first().filter(|x| !self.held.iter().any(|l| l.attempt == x.id)) {
                 self.execution_waits.entry(v.issue.number).or_insert_with(|| format!("execution {} on {}: termination unconfirmed", x.id, x.host));
             } else if let Some(x) = core::executions(v.issue.number, &v.log).into_iter()
@@ -1960,6 +1991,45 @@ mod tests {
 
     type Exits = Rc<RefCell<Vec<(u64, Rc<RefCell<Option<i32>>>)>>>;
 
+    // H-A5: a childless service can still own an uncertain native execution.
+    #[test]
+    fn project_drain_retains_unresolved_execution_until_release() {
+        use std::fs;
+        let b=Fake::default();
+        let mut c=cfg("mac");
+        c.root=std::env::temp_dir().join(format!("taskq-drain-{}",crate::runtime::uuid()));
+        c.install=c.root.join("install");
+        fs::create_dir_all(crate::dot(&c.root)).unwrap();
+        let host=std::sync::Arc::new(std::sync::Mutex::new(crate::host::Host::new(Err("fixture holds admission".into()))));
+        host.lock().unwrap().draining.insert(c.root.clone());
+        let n=b.create("T","",&[TASK_LABEL.into()]).unwrap();
+        let a=b.comment(n,"taskq: spawn worker codex:session mac").unwrap();
+        let mut s=Service::new(&b,&c,"fixture",Box::new(|_|panic!("drain must never submit work")));
+        s.host=Some(host.clone());
+        assert!(!crate::stopped_handoff(&mut s,&host,&c).unwrap(),"no board observation is not an idle proof");
+        s.pass().unwrap();
+        assert!(s.kids.is_empty());
+        assert!(s.retained_attempts().contains(&a));
+        assert!(!crate::stopped_handoff(&mut s,&host,&c).unwrap(),"missing handle must retain the project and its slot");
+        assert_eq!(host.lock().unwrap().busy.get(&c.root),Some(&true));
+        b.labels(n,&[],&[TASK_LABEL.into()]).unwrap();s.pass().unwrap();
+        assert!(s.retained_attempts().contains(&a),"label removal is not native termination");
+        b.state.borrow_mut().comments.iter_mut().find(|(_,comment)|comment.id==a).unwrap().1.edited=true;
+        s.pass().unwrap();assert!(!s.idle(),"missing execution history cannot release an observed execution");
+        b.state.borrow_mut().comments.iter_mut().find(|(_,comment)|comment.id==a).unwrap().1.edited=false;
+        b.close(n).unwrap();b.state.borrow_mut().fail_comment_reads=1;
+        assert!(s.pass().is_err());
+        assert!(s.retained_attempts().contains(&a));
+        assert!(!crate::stopped_handoff(&mut s,&host,&c).unwrap(),"failed ownership read cannot certify idle");
+        s.pass().unwrap();
+        assert!(s.retained_attempts().contains(&a),"leaving the open-issue list is not native termination");
+        assert!(!crate::stopped_handoff(&mut s,&host,&c).unwrap());
+        release_execution(&b,n,a,a,"exit").unwrap();
+        s.pass().unwrap();
+        assert!(crate::stopped_handoff(&mut s,&host,&c).unwrap(),"verified release permits drain completion");
+        drop(s);fs::remove_dir_all(&c.root).unwrap();
+    }
+
     fn service<'a>(b: &'a Fake, c: &'a Config, exits: Exits) -> Service<'a> {
         let mut s = Service::new(b, c, "4.0.0", Box::new(move |l: &Launch| {
             let flag = Rc::new(RefCell::new(None));
@@ -2220,6 +2290,7 @@ mod tests {
         let a = b.comment(n, "taskq: spawn worker claude:fixture invented").unwrap();
         let exit = Rc::new(RefCell::new(None));
         s.kids.push(Kid { execution: a, task: n, attempt: a, rt: "claude".into(), proc: Box::new(FakeProc(exit.clone())) });
+        s.pass().unwrap();s.rebuild();
         { let mut h = host.lock().unwrap(); h.busy.insert(root.clone(), true); h.restart = true; }
         // This is the monitor entered after a reduced-loop panic: no board pass and no lease renewal.
         assert!(!crate::stopped_handoff(&mut s, &host, &c).unwrap());

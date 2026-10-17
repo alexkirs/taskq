@@ -88,7 +88,7 @@ pub struct Op {
     pub sent: bool,
 }
 
-fn local(o:&Op)->bool {o.bound.get("local_capacity").is_some()||o.bound.get("local_restart").is_some()}
+fn local(o:&Op)->bool {o.bound.get("local_capacity").is_some()||o.bound.get("local_restart").is_some()||o.bound.get("local_stop").is_some()}
 
 pub fn dir(install: &Path) -> PathBuf {
     install.join("resources")
@@ -506,7 +506,7 @@ pub(crate) fn prepare(s: &mut State, install: &Path, now: u64) -> Res<()> {
         o.sent = false;
     }
     s.ops.retain(|_,o|now<o.expires_at.saturating_add(RETAIN)
-        ||(o.bound.get("local_restart").is_some()&&o.receipt["state"]!="observed"));
+        ||((o.bound.get("local_restart").is_some()||o.bound.get("local_stop").is_some())&&o.receipt["state"]!="observed"));
     readback(s, now);
     Ok(())
 }
@@ -793,14 +793,16 @@ mod tests {
         assert_eq!(read(&t.install).unwrap().ops["local-op"],before);
         assert_eq!(fs::read(t.install.join("host.json")).unwrap(),policy);
         assert_eq!(log.len(),2,"remote cancel and ID reuse must both be explicitly refused");
-        with(&t.install,|state| {
-            state.ops.insert("local-restart".into(),Op {bound:json!({"local_restart":{"request":{"id":"local-restart"}}}),
-                receipt:json!({"id":"local-restart","state":"queued"}),expires_at:0,saved_at:Some(0),writing:false,sent:true});Ok(())
-        }).unwrap();
-        let original=read(&t.install).unwrap().ops["local-restart"].clone();
-        let mut cancel=fix()["cancel"].clone();cancel["op_id"]=json!("local-restart");
-        let (sent,log)=go(&t,&[submit("local-restart",json!({"runtime_limit":0}))],&[cancel],100);
-        assert!(sent.is_empty());assert_eq!(log.len(),2);assert_eq!(read(&t.install).unwrap().ops["local-restart"],original);
+        for (key,id) in [("local_restart","local-restart"),("local_stop","local-stop")] {
+            with(&t.install,|state| {
+                state.ops.insert(id.into(),Op {bound:json!({(key):{"request":{"id":id}}}),
+                    receipt:json!({"id":id,"state":"queued"}),expires_at:0,saved_at:Some(0),writing:false,sent:true});Ok(())
+            }).unwrap();
+            let original=read(&t.install).unwrap().ops[id].clone();
+            let mut cancel=fix()["cancel"].clone();cancel["op_id"]=json!(id);
+            let (sent,log)=go(&t,&[submit(id,json!({"runtime_limit":0}))],&[cancel],100);
+            assert!(sent.is_empty());assert_eq!(log.len(),2);assert_eq!(read(&t.install).unwrap().ops[id],original);
+        }
         capture.flush().unwrap();drop(guard);drop(capture);fs::remove_dir_all(t.base).unwrap();
     }
 

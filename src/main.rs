@@ -7,6 +7,7 @@ macro_rules! log {
 
 mod admission;
 mod host;
+mod host_control;
 mod board;
 mod core;
 mod control;
@@ -21,7 +22,7 @@ mod requests;
 mod platform;
 mod policy;
 mod resources;
-mod restart;
+mod lifecycle;
 #[cfg(target_os = "linux")]
 mod linux_sandbox;
 #[cfg(windows)]
@@ -915,7 +916,7 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
         for (k, v) in [("focus", if focus_error.is_some() { Value::Null } else { json!(s.focus) }), ("focus_error", json!(focus_error)), ("focus_command",command), ("kids", json!(kids)), ("issues", json!(issues)), ("log", json!(log)),
             ("tasks_age_seconds", json!(s.tasks_read.map(|t| t.elapsed().as_secs()))), ("request", json!(request)), ("events_since", json!(s.events_since)),
             ("execution_waits", json!(s.execution_waits)), ("capacity", s.capacity_json()), ("hold", json!(s.hold)), ("access", json!(access.iter().map(|e| e.json()).collect::<Vec<_>>())), ("agents", json!(agents.as_ref().map(|a| &a.1))),
-            ("restart_waits", json!((d.join("restart").exists()||host.as_ref().is_some_and(|h|h.lock().is_ok_and(|h|h.restart))).then(|| restart_waits(&s, &cfg.root)))),
+            ("restart_waits", json!((d.join("restart").exists()||host.as_ref().is_some_and(|h|h.lock().is_ok_and(|h|h.restart))).then(|| lifecycle_waits(&s, &cfg.root, host.as_ref().is_some_and(|h|h.lock().is_ok_and(|h|h.stopping)))))),
             ("incident", incident::status(&cfg.root)), ("incident_notice", json!(incident::notice(&cfg.root))),
             ("requests", requests_json), ("connection", json!(dashq.outcome)), ("telemetry",telemetry::diagnostic::health())]
         {
@@ -958,7 +959,7 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
         restart_watch(&mut restart_empty, cfg!(windows) && d.join("restart").exists() && s.kids.is_empty(), began.elapsed().as_secs(), cfg.update_every);
         if host.is_none() && is_installed && d.join("restart").exists() {
             // Windows re-exec waits for the live children; the request stays until it can go
-            let waits = restart_waits(&s, &cfg.root).join(", ");
+            let waits = lifecycle_waits(&s, &cfg.root, false).join(", ");
             if waits.is_empty() {
                 let _ = fs::remove_file(d.join("restart"));
                 log!("restart requested");
@@ -989,7 +990,7 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
             let drained = s.idle() && !operator::running(&cfg.root);
             if !registered && drained { h.sync(&cfg.root, vec![]); h.ready(&cfg.root, false); return Err("project drained".into()); }
             if registered { h.busy.insert(cfg.root.clone(), !drained); }
-            if h.restart && restart_waits(&s, &cfg.root).is_empty() {
+            if h.restart && (if h.stopping {drained}else{lifecycle_waits(&s, &cfg.root, false).is_empty()}) {
                 match save_kids(&s, &cfg.root) {
                     Ok(()) => { h.prepared.insert(cfg.root.clone()); }
                     Err(e) => { h.prepared.remove(&cfg.root); log!("handoff unknown: {e}"); }
@@ -1120,7 +1121,7 @@ fn stopped_handoff(s: &mut Service, host: &host::Shared, cfg: &Config) -> Res<bo
     let mut h = host.lock().map_err(|_| "stopped project admission unknown")?;
     let idle = s.idle() && !operator::running(&cfg.root);
     h.busy.insert(cfg.root.clone(), !idle);
-    if h.restart && restart_waits(s, &cfg.root).is_empty() {
+    if h.restart && (if h.stopping {idle}else{lifecycle_waits(s, &cfg.root, false).is_empty()}) {
         save_kids(s, &cfg.root)?;
         h.prepared.insert(cfg.root.clone());
     }
@@ -1607,7 +1608,7 @@ fn kill_service(root: &Path) {
 fn reexec(s: &Service, cfg: &Config) -> Res<()> {
     use std::os::unix::process::CommandExt;
     // App turns have no adoptable child; keep their lease until completion.
-    if !restart_waits(s, &cfg.root).is_empty() {
+    if !lifecycle_waits(s, &cfg.root, false).is_empty() {
         return fs::write(dot(&cfg.root).join("restart"), "").map_err(|e| e.to_string());
     }
     save_kids(s, &cfg.root)?;
@@ -1623,7 +1624,7 @@ fn reexec(s: &Service, cfg: &Config) -> Res<()> {
 fn reexec(s: &Service, cfg: &Config) -> Res<()> {
     // ponytail: Windows cannot hand children to a new image; exit once no child is live and the unit restarts us.
     // The new `current` is already written, so the update waits only for the running attempts.
-    if restart_waits(s, &cfg.root).is_empty() {
+    if lifecycle_waits(s, &cfg.root, false).is_empty() {
         std::process::exit(75);
     }
     // update checks pause while the restart request carries the re-exec until the children end
@@ -1631,13 +1632,11 @@ fn reexec(s: &Service, cfg: &Config) -> Res<()> {
 }
 
 /// § 8 step 3: what a pending re-exec waits for. Windows waits for every live child; elsewhere CLI children pass over.
-fn restart_waits(s: &Service, root: &Path) -> Vec<String> {
-    let mut w: Vec<String> = s.kids.iter().filter(|k| cfg!(windows) || matches!(k.rt.as_str(), "codex-app" | "claude")).map(|k| format!("#{}", k.task)).collect();
+fn lifecycle_waits(s: &Service, root: &Path, stopping:bool) -> Vec<String> {
+    let mut w: Vec<String> = s.kids.iter().filter(|k| stopping || cfg!(windows) || matches!(k.rt.as_str(), "codex-app" | "claude")).map(|k| format!("#{}", k.task)).collect();
     w.dedup();
     w.extend(s.handoff_waits());
-    if operator::running(root) {
-        w.push("operator".into());
-    }
+    if let Some(reason)=operator::wait(root) {w.push(reason);}
     w
 }
 
@@ -1693,15 +1692,16 @@ fn service_report(a:&Args)->Res<()> {
             ||s["host_instance"].as_str().is_none_or(|id|!resources::id(id)) {return "unknown";}
         if s["pid"]==service["pid"]&&s["host_instance"]==service["instance"] {"current"}else{"other"}
     };
+    let lifecycle=lifecycle::status(&install,a.one("request"));
     if a.flags.contains_key("json") {
         let projects:Vec<_>=rows.into_iter().map(|(root,status)|json!({"root":root,"host_binding":binding(&status),
             "status":status.as_ref().ok().and_then(Option::as_ref),"error":status.as_ref().err()})).collect();
-        println!("{}",json!({"schema":"taskq.service/1","service":service,"projects":projects,"registry_error":registry.as_ref().err(),"restart":restart::status(&install,a.one("request"))}));
+        println!("{}",json!({"schema":"taskq.service/1","service":service,"projects":projects,"registry_error":registry.as_ref().err(),"restart":if lifecycle["action"]=="stop" {Value::Null}else{lifecycle.clone()},"lifecycle":lifecycle}));
     } else {
         println!("{}",host::service_line(&service));
-        let restart=restart::status(&install,a.one("request"));
-        if let Some(id)=restart["id"].as_str() {println!("Restart: {id} {}",restart["state"].as_str().unwrap_or("unknown"));}
-        if let Some(reason)=restart["reason"].as_str() {println!("Restart: unknown ({reason})");}
+        let restart=lifecycle;let title=if restart["action"]=="stop"{"Stop"}else{"Restart"};
+        if let Some(id)=restart["id"].as_str() {println!("{title}: {id} {}",restart["state"].as_str().unwrap_or("unknown"));}
+        if let Some(reason)=restart["reason"].as_str() {println!("{title}: unknown ({reason})");}
         if let Err(error)=&registry {println!("Projects: unknown ({error})");}
         for (root,status) in rows {
             let owner=binding(&status);
@@ -1717,7 +1717,7 @@ fn service_report(a:&Args)->Res<()> {
 }
 
 #[tracing::instrument(name="service.command",skip_all,fields(coreq_operation=match args.pos.get(1).map(String::as_str).unwrap_or("") {
-    sub @ ("install"|"run"|"focus"|"pause"|"resume"|"capacity"|"permissions"|"resources"|"hold"|"release"|"recover"|"status"|"restart"|"stop"|"uninstall"|"list")=>sub,
+    sub @ ("install"|"run"|"focus"|"pause"|"resume"|"capacity"|"permissions"|"resources"|"hold"|"release"|"recover"|"status"|"restart"|"stop"|"complete-stop"|"uninstall"|"list")=>sub,
     _=>"invalid",
 }))]
 fn service(args: &Args) -> Res<()> {
@@ -1729,21 +1729,34 @@ fn service(args: &Args) -> Res<()> {
     let projects = platform::default_install().join("projects");
     if matches!(sub,"status"|"list") {return service_report(args);}
     if sub == "capacity" {return capacity_cmd(args);}
-    if sub == "restart" {
-        if args.all("request").len()>1||args.flags.keys().any(|key|!["request","json","diagnose","diagnose-ms","diagnose-limit"].contains(&key.as_str())) {
-            return Err("usage: taskq service restart [--request ID] [--json]".into());
+    if sub=="complete-stop" {
+        platform::service_log();
+        if args.pos.len()!=2||args.all("request").len()!=1||args.flags.keys().any(|key|!["request","json"].contains(&key.as_str())) {return Err("usage: taskq service complete-stop --request ID [--json]".into());}
+        let result=lifecycle::complete_stop(&platform::default_install(),args.need("request")?)?;
+        if args.flags.contains_key("json") {println!("{result}");}return Ok(());
+    }
+    if matches!(sub,"restart"|"stop") {
+        if std::env::var_os("TASKQ_ATTEMPT").is_some() {return Err("a worker cannot restart the host service or request Stop".into());}
+        if args.pos.len()!=2||args.all("request").len()>1||args.flags.keys().any(|key|!["request","json","diagnose","diagnose-ms","diagnose-limit"].contains(&key.as_str())) {
+            return Err("usage: taskq service restart|stop [--request ID] [--json]".into());
         }
         let install=platform::default_install();
         let id=args.one("request").map(str::to_owned).unwrap_or_else(runtime::uuid);
-        let result=if let Some(receipt)=restart::receipt(&install,&id)? {receipt} else {
-            let reviewed=restart::review(&install,&id)?;
+        let mut result=if let Some(receipt)=lifecycle::receipt(&install,&id)? {receipt} else {
+            let reviewed=if sub=="stop" {lifecycle::stop_review(&install,&id)?}else{lifecycle::review(&install,&id)?};
             if !args.flags.contains_key("json") {
                 println!("Scope: host service; all registered projects");
                 for root in reviewed["roots"].as_array().into_iter().flatten() {println!("Project: {}",root.as_str().unwrap_or("unknown"));}
             }
-            restart::submit(&install,&reviewed)?
+            lifecycle::submit(&install,&reviewed)?
         };
-        if args.flags.contains_key("json") {println!("{result}");}else {println!("Restart: {id} {}",result["state"].as_str().unwrap_or("unknown"));}
+        if result["action"].as_str().unwrap_or("restart")!=sub {return Err("request ID belongs to another lifecycle action".into());}
+        if sub=="stop"&&result["state"]=="applied"&&let Some(p)=lifecycle::pending(&install)? {
+            if p.id()!=id {return Err("Stop replay binding changed; reconcile service status".into());}
+            host_control::dispatch(&install,&p)?.wait()?;
+            result=lifecycle::receipt(&install,&id)?.ok_or("Stop result no longer retained; outcome unknown")?;
+        }
+        if args.flags.contains_key("json") {println!("{result}");}else {println!("{}: {id} {}",if sub=="stop"{lifecycle::Action::Stop}else{lifecycle::Action::Restart}.title(),result["state"].as_str().unwrap_or("unknown"));if let Some(condition)=result["restart_condition"].as_str() {println!("Restart condition: {condition}");}}
         return Ok(());
     }
     if sub == "run" {
@@ -1798,16 +1811,9 @@ fn service(args: &Args) -> Res<()> {
         "resources" => resources_cmd(&root, args),
         "hold" | "release" => hold_cmd(sub == "hold", args.one("text")),
         "recover" => recover_cmd(&root, args.flags.contains_key("apply"), args.flags.contains_key("json")),
-        "install" | "uninstall" | "stop" => {
+        "install" | "uninstall" => {
             let (cfg, _) = load(&root)?;
             let u = platform::unit(&platform::tool(&cfg.install), &root, &project_name(&root));
-            if sub == "stop" {
-                platform::run_all(&u.stop, false)?;
-                kill_service(&root);
-                let condition=if cfg!(target_os="linux") {"explicit service install or user-manager startup"} else {"next logon or explicit service install"};
-                println!("Stop requested for {}; restart: {condition}", project_name(&root));
-                return Ok(());
-            }
             if sub == "install" {
                 let edit=host::ProjectEdit::new(&cfg.install,&root,true)?;
                 let off = install_focus(&root)?;
@@ -3621,7 +3627,7 @@ mod tests {
         s.kids.push(Kid { execution: 41, task: 7, attempt: 41, rt: "codex-app".into(), proc: Box::new(runtime::Adopted::new(coreq::process::identity(pid).unwrap().unwrap())) });
         reexec(&s, &c).unwrap();
         assert!(dot(&root).join("restart").exists());
-        assert_eq!(restart_waits(&s, &root), ["#7","ownership unknown"], "status names the active task and missing ownership read");
+        assert_eq!(lifecycle_waits(&s, &root, false), ["#7","ownership unknown"], "status names the active task and missing ownership read");
         assert_eq!(s.kids[0].attempt, 41);
         assert_eq!(adopted.exited(), Ok(None));
         s.kids.clear();
@@ -3630,7 +3636,7 @@ mod tests {
         fs::write(operator::answer_path(&root, "1"), r#"{"state":"running"}"#).unwrap();
         reexec(&s, &c).unwrap();
         assert!(dot(&root).join("restart").exists() && handover(&root));
-        assert_eq!(restart_waits(&s, &root), ["ownership unknown","operator"]);
+        assert_eq!(lifecycle_waits(&s, &root, false), ["ownership unknown","operator"]);
         fs::write(operator::answer_path(&root, "1"), r#"{"state":"result"}"#).unwrap();
         // an idle service reloads the unit, which would end a child
         fs::write(dot(&root).join("status.json"), r#"{"kids": []}"#).unwrap();

@@ -547,7 +547,7 @@ impl ActionQueue {
         let operation=if allowed.contains(&"capacity") {"tray.capacity.execute"}else{"tray.focus.execute"};
         let worker=std::thread::Builder::new().name(operation.into()).spawn(move || {
             while let Ok(job)=receiver.recv() {
-                let operation=if job.message["a"]=="restart" {"tray.restart.execute"}else{operation};
+                let operation=match job.message["a"].as_str() {Some("restart")=>"tray.restart.execute",Some("stop")=>"tray.stop.execute",_=>operation};
                 tracing::dispatcher::with_default(&job.dispatch,|| {
                     let _context=job.context.as_ref().map(|c|c.span().entered());
                     let result=coreq::telemetry::capture::operation(operation,||std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -564,7 +564,7 @@ impl ActionQueue {
     }
     fn submit(&self,message:&Value) -> crate::Res<()> {
         let action=message["a"].as_str().unwrap_or("");let id=message["id"].as_str().unwrap_or("");
-        let name=match action {"pause"=>"tray.pause.dispatch","resume"=>"tray.resume.dispatch","focus"=>"tray.focus.dispatch","capacity"=>"tray.capacity.dispatch","restart"=>"tray.restart.dispatch",_=>"tray.invalid.dispatch"};
+        let name=match action {"pause"=>"tray.pause.dispatch","resume"=>"tray.resume.dispatch","focus"=>"tray.focus.dispatch","capacity"=>"tray.capacity.dispatch","restart"=>"tray.restart.dispatch","stop"=>"tray.stop.dispatch",_=>"tray.invalid.dispatch"};
         coreq::telemetry::capture::operation(name,|| {
             if !self.allowed.contains(&action) {return Err(("invalid-command","Unsupported queued command"));}
             if id.is_empty() || id.len()>64 || !id.bytes().all(|b|b.is_ascii_alphanumeric()||b==b'-') {
@@ -751,7 +751,7 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
         let _=coreq::telemetry::capture::operation("tray.focus.report",||replies.send_event(Ev::Answer(json!({"focus_receipt":reply}))),|_|"ui-closed");
     })?;
     let replies=proxy.clone();
-    let capacity_actions=ActionQueue::start(install.clone(),&["capacity","restart"],capacity,move |root,id,result| {
+    let capacity_actions=ActionQueue::start(install.clone(),&["capacity","restart","stop"],capacity,move |root,id,result| {
         let mut reply=result.unwrap_or_else(|error|json!({"state":"unknown","reason":error}));reply["root"]=json!(root);reply["id"]=json!(id);
         let _=coreq::telemetry::capture::operation("tray.capacity.report",||replies.send_event(Ev::Answer(json!({"capmsg":reply}))),|_|"ui-closed");
     })?;
@@ -1043,7 +1043,7 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
                         push(&mut web,&ui, &st);
                     }
                     // `Edit limits` after the page's confirm: the same write as `service capacity` (§ 5), this host only
-                    "capacity" | "restart" => {
+                    "capacity" | "restart" | "stop" => {
                         let root = m["root"].as_str().unwrap_or("");
                         if let Err(error)=capacity_actions.submit(&m) {
                             push(&mut web,&ui, &json!({"capmsg": {"root": root, "id": m["id"], "state":"rejected","reason":error}}));
@@ -1243,7 +1243,7 @@ fn state(install: &Path, s: &Settings, dark: bool, snap: Option<(&str, &str)>, a
     let url = |rgba: &Rgba| format!("data:image/png;base64,{}", base64(&rgba.png()));
     let mut st = json!({"platform": if cfg!(windows) { "windows" } else { "macos" }, "version": crate::platform::VERSION,
         "host": ps.iter().find_map(|p| p["host"].as_str()).unwrap_or("?"), "view": s.view, "font": s.font, "period": s.period, "pinned": s.pin.pinned, "top": s.pin.top, "size": s.pin.size,
-        "now": now(), "service":crate::host::service_status(install),"restart":crate::restart::status(install,None),"restart_review":crate::restart::review(install,"review").unwrap_or_else(|reason|json!({"state":"unknown","reason":reason})),"projects": ps, "notify": notify_state(&s.notify, &ps), "agents": agents(&ps), "ai": {"target": target(install), "request": newest(install), "draft": requests_file(install)["draft"], "history": requests_file(install)["history"]}, "add": add, "history": {"start": start, "end": end, "tz": s.tz, "bins": sum.bins, "since": sum.since},
+        "now": now(), "service":crate::host::service_status(install),"lifecycle":crate::lifecycle::status(install,None),"restart_review":crate::lifecycle::review(install,"review").unwrap_or_else(|reason|json!({"state":"unknown","reason":reason})),"stop_review":crate::lifecycle::stop_review(install,"review").unwrap_or_else(|reason|json!({"state":"unknown","reason":reason})),"projects": ps, "notify": notify_state(&s.notify, &ps), "agents": agents(&ps), "ai": {"target": target(install), "request": newest(install), "draft": requests_file(install)["draft"], "history": requests_file(install)["history"]}, "add": add, "history": {"start": start, "end": end, "tz": s.tz, "bins": sum.bins, "since": sum.since},
         // § 4 Data: a corrupt tray.json names its reason while the defaults show
         "settings_error": crate::data::json(&install.join("tray.json")).err()});
     if cfg!(target_os = "macos") {
@@ -1434,8 +1434,8 @@ fn act(action: &str, root: &Path, label: Option<&str>) -> crate::Res<Option<Stri
             fs::write(d.join("update"), "").map_err(|e| e.to_string())?;
             crate::poke(root)?;
         }
-        "restart" => {
-            return Err("Restart needs a reviewed host request; refresh the Services panel".into());
+        "restart" | "stop" => {
+            return Err("Host lifecycle action needs a reviewed request; refresh the Services panel".into());
         }
         "log" => {
             let s: Value = fs::read_to_string(d.join("status.json")).ok().and_then(|x| serde_json::from_str(&x).ok()).unwrap_or_default();
@@ -1452,7 +1452,7 @@ fn act(action: &str, root: &Path, label: Option<&str>) -> crate::Res<Option<Stri
         }
         "incident-manual" => open(&format!("https://github.com/{}/issues/new", crate::platform::RELEASE_REPO)),
         // a separate process: on macOS `launchctl bootout` kills the service's process group, this tray included
-        "stop" | "uninstall" => {
+        "uninstall" => {
             let me = std::env::current_exe().map_err(|e| e.to_string())?;
             let mut c = std::process::Command::new(me);
             c.args(["service", action])
@@ -1577,10 +1577,11 @@ fn install_service(install: &Path, mut a: Value) -> Value {
 
 /// Write the page's capacity edit for this host; the outcome line for the page.
 fn capacity(install:&Path,_root: &Path,m: &Value) -> crate::Res<Value> {
-    if m["a"]=="restart" {
+    if matches!(m["a"].as_str(),Some("restart"|"stop")) {
         let mut request=m.clone();let object=request.as_object_mut().ok_or("invalid restart message")?;
         for key in ["context","a","root"] {object.remove(key);}
-        return crate::restart::submit(install,&request);
+        if request["action"].as_str().unwrap_or("restart")!=m["a"].as_str().unwrap_or("") {return Err("lifecycle action differs from its reviewed request".into());}
+        return crate::lifecycle::submit(install,&request);
     }
     let mut input=m.clone();input.as_object_mut().ok_or("invalid capacity message")?.remove("context");
     if !crate::resources::keys(&input,&["a","root","id","ops","issued_at","expires_at"]) {
@@ -1688,7 +1689,7 @@ fn fit_status_image(k: f32) {
     });
 }
 
-fn base64(b: &[u8]) -> String {
+pub(crate) fn base64(b: &[u8]) -> String {
     const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut s = String::new();
     for c in b.chunks(3) {

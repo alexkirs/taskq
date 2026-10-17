@@ -3,38 +3,43 @@ const ui=require('./ui-runtime.js');
 const execution=ui.execution;
 
 const {createState,create}=execution.module("tray",{
-createState:function(snapshot=null){return {manualSize:null,aiText:null,aiMenu:false,aiConfirm:null,addConfirm:false,S:snapshot,page:'home',taskFilter:null,working:null,workCard:null,ask:null,noted:null,pending:{},hostRestart:null,confirming:null,updating:null,draft:null,disclosures:[],pressedAt:null,stale:false,resizing:null};},
+createState:function(snapshot=null){return {manualSize:null,aiText:null,aiMenu:false,aiConfirm:null,addConfirm:false,S:snapshot,page:'home',taskFilter:null,working:null,workCard:null,ask:null,noted:null,pending:{},hostCommand:null,confirming:null,updating:null,draft:null,disclosures:[],pressedAt:null,stale:false,resizing:null};},
 create:function(view,ports){
 const api=execution.module("tray.create",{
 gutter:function(){if(ports.measureScrollbar)return ports.measureScrollbar();const d=document.createElement('div');d.style.cssText='position:absolute;top:-99px;width:60px;height:60px;overflow:scroll;scrollbar-width:thin';document.body.append(d);const g=d.offsetWidth-d.clientWidth;d.remove();return Math.ceil(g);},
 fit:function(){const size=view.manualSize||view.S.size,w=size?size[0]:view.S.font>=18?360:320;document.body.style.width='100%';menu.style.width=w+'px';send({a:'size',d:window.devicePixelRatio,g:size?0:gutter(),w,h:size?size[1]:Math.ceil(menu.getBoundingClientRect().height)});menu.style.width='100%';},
 actionReceipt:function(r){if(!view.S?.projects.some(p=>p.root===r.root))return;actionErrors.set(r.root,{text:r.text});present();},
 actionNotices:function(){return view.S.projects.filter(p=>actionErrors.has(p.root)).map(p=>'<div class="body alert" role="alert">'+esc(p.name)+': '+esc(actionErrors.get(p.root).text)+'</div>').join('');},
-restartStart:function(root){
-  if(view.hostRestart&&!view.hostRestart.unknown&&view.hostRestart.state!=='observed')return;
-  const review=view.S.restart_review;
-  if(!review||typeof review.instance!=='string'||!Array.isArray(review.roots)){actionErrors.set(root,{text:review?.reason||'Restart review unavailable; check host service status.'});present();return;}
+lifecycleStart:function(root,action='restart'){
+  if(view.hostCommand&&!view.hostCommand.unknown&&view.hostCommand.state!=='observed')return;
+  const review=action==='stop'?view.S.stop_review:view.S.restart_review;
+  if(!review||typeof review.instance!=='string'||!Array.isArray(review.roots)){actionErrors.set(root,{text:review?.reason||'Lifecycle review unavailable; check host service status.'});present();return;}
   const id=Array.from(crypto.getRandomValues(new Uint8Array(16)),b=>b.toString(16).padStart(2,'0')).join('');
-  const item={id,root,instance:review.instance,state:'sending',unknown:false};view.hostRestart=item;actionErrors.delete(root);
-  defer(()=>{if(view.hostRestart!==item||item.state==='observed')return;item.unknown=true;item.state='unknown';item.reason='Restart confirmation unknown; check service status for '+id+'.';present();},30000);
-  send({...review,id,a:'restart',root});present();
+  const item={id,root,action,instance:review.instance,state:'sending',unknown:false};view.hostCommand=item;actionErrors.delete(root);
+  defer(()=>{if(view.hostCommand!==item||item.state==='observed')return;item.unknown=true;item.state='unknown';item.reason=(action==='stop'?'Stop':'Restart')+' confirmation unknown; check service status for '+id+'.';present();},30000);
+  send({...review,id,a:action,root});present();
 },
-restartReceipt:function(r){
-  const item=view.hostRestart;if(!item||r.id!==item.id)return;
-  if(!['queued','applied','observed'].includes(r.state)){item.unknown=true;item.state='unknown';item.reason=r.reason||'Restart outcome unknown; check service status.';}
-  else if(r.state==='observed'&&!api.restartObserved(r,item.id,item.instance)){item.unknown=true;item.state='unknown';item.reason='Restart receipt is incomplete; check service status.';}
+lifecycleReceipt:function(r){
+  const item=view.hostCommand;if(!item||r.id!==item.id)return;
+  if(!['queued','applied','observed'].includes(r.state)){item.unknown=true;item.state='unknown';item.reason=r.reason||'Lifecycle outcome unknown; check service status.';}
+  else if(r.state==='observed'&&!api.lifecycleObserved(r,item.id,item.instance,item.action)){item.unknown=true;item.state='unknown';item.reason='Lifecycle receipt is incomplete; check service status.';}
   else {item.state=r.state;item.reason=r.reason||'';}
-  api.restartReadback();present();
+  api.lifecycleReadback();present();
 },
-restartObserved:function(r,id,origin){return r?.id===id&&r.state==='observed'&&['received_receipt','applied_receipt','observed_receipt'].every(k=>typeof r[k]==='string'&&/^[a-f0-9]{32}$/.test(r[k]))&&typeof r.service_instance==='string'&&/^[A-Za-z0-9_-]{1,64}$/.test(r.service_instance)&&typeof origin==='string'&&r.service_instance!==origin;},
-restartReadback:function(){
-  const item=view.hostRestart,r=view.S?.restart;
+lifecycleObserved:function(r,id,origin,action='restart'){
+  const receipts=(!r?.action||r.action===action)&&r?.id===id&&r.state==='observed'&&['received_receipt','applied_receipt','observed_receipt'].every(k=>typeof r[k]==='string'&&/^[a-f0-9]{32}$/.test(r[k]));
+  if(!receipts)return false;
+  if(action==='stop')return r.action==='stop'&&r.origin_instance===origin&&r.native_exit===true&&Number.isInteger(r.native_pid)&&r.native_pid>0&&typeof r.native_started==='string'&&/^[A-Za-z0-9-]{1,128}$/.test(r.native_started)&&typeof r.unit_revision==='string'&&/^[a-f0-9]{64}$/.test(r.unit_revision);
+  return typeof r.service_instance==='string'&&/^[A-Za-z0-9_-]{1,64}$/.test(r.service_instance)&&typeof origin==='string'&&r.service_instance!==origin;
+},
+lifecycleReadback:function(){
+  const item=view.hostCommand,r=view.S?.lifecycle;
   if(item&&r?.id===item.id&&['queued','applied'].includes(r.state)){item.state=r.state;item.reason=r.reason||'';}
-  if(item&&api.restartObserved(r,item.id,item.instance)){
-    item.state='observed';item.unknown=false;item.reason='New service generation observed.';
+  if(item&&api.lifecycleObserved(r,item.id,item.instance,item.action)){
+    item.state='observed';item.unknown=false;item.reason=item.action==='stop'?'Recorded host exit observed; restart: '+(r.restart_condition||'check native autostart conditions')+'.':'New service generation observed.';
   }
 },
-restartWaits:function(){
+lifecycleWaits:function(){
   if(!Array.isArray(view.S?.projects))return '<div class="body meta">Project registry unknown</div>';
   return view.S.projects.map(p=>{
     const current=view.S.service?.state==='running'&&typeof p.service_pid==='number'&&typeof p.host_instance==='string'&&typeof p.age==='number'&&p.age>=0&&p.age<=60&&p.service_pid===view.S.service?.pid&&p.host_instance===view.S.service?.instance;
@@ -42,12 +47,14 @@ restartWaits:function(){
     return '<div class="body meta">'+esc(p.name)+': '+esc(text)+'</div>';
   }).join('');
 },
-restartControl:function(p){
-  const review=view.S?.restart_review,r=view.hostRestart||view.S?.restart;
-  const pending=view.hostRestart&&!view.hostRestart.unknown&&view.hostRestart.state!=='observed'||['queued','applied'].includes(view.S?.restart?.state);
+lifecycleControl:function(p,action='restart'){
+  const title=action==='stop'?'Stop':'Restart',review=action==='stop'?view.S?.stop_review:view.S?.restart_review;
+  const all=view.hostCommand||view.S?.lifecycle,r=(all?.action||'restart')===action?all:null;
+  const pending=view.hostCommand&&!view.hostCommand.unknown&&view.hostCommand.state!=='observed'||['queued','applied'].includes(view.S?.lifecycle?.state);
   const projects=Array.isArray(view.S?.projects)?view.S.projects:[];
   const targets=Array.isArray(review?.roots)&&review.roots.every(root=>typeof root==='string')?review.roots.map(root=>projects.find(p=>p.root===root)?.name||root):null;
-  return '<details class="host-restart"><summary>Restart host service</summary><div class="body meta">Affects all registered projects: '+(targets?targets.length?targets.map(esc).join(', '):'none registered':'unknown')+'. Existing work is preserved; active turns can delay restart.</div>'+(!review?.instance?'<div class="body alert">'+esc(review?.reason||'Host restart protocol unavailable')+'</div>':'')+'<button class="project" data-a="restart" data-root="'+esc(p.root)+'"'+(pending||!review?.instance||!targets?' disabled':'')+'>Confirm host restart</button>'+(pending?api.restartWaits():'')+(r?.id||r?.reason?'<div class="body meta" role="status">Restart '+esc(r.id||'')+': '+esc(r.state||'unknown')+(r.reason?' · '+esc(r.reason):'')+'</div>':'')+'</details>';
+  const effect=action==='stop'?'Waits for all owned work to end; retains OS autostart. Explicit service install can start it again.':'Existing work is preserved; active turns can delay restart.';
+  return '<details class="host-'+action+'"><summary>'+title+' host service</summary><div class="body meta">Affects all registered projects: '+(targets?targets.length?targets.map(esc).join(', '):'none registered':'unknown')+'. '+effect+'</div>'+(!review?.instance?'<div class="body alert">'+esc(review?.reason||title+' protocol unavailable')+'</div>':'')+'<button class="project" data-a="'+action+'" data-root="'+esc(p.root)+'"'+(pending||!review?.instance||!targets?' disabled':'')+'>Confirm host '+action+'</button>'+(pending&&r?api.lifecycleWaits():'')+(r?.id||r?.reason?'<div class="body meta" role="status">'+title+' '+esc(r.id||'')+': '+esc(r.state||'unknown')+(r.reason?' · '+esc(r.reason):'')+'</div>':'')+'</details>';
 },
 focusStart:function(action,root,label){
   if(view.pending[root]&&!view.pending[root].unknown)return;
@@ -155,8 +162,8 @@ incidentNotice:function(p){return p.incident_notice?'<details class="group incid
 service:function(p){const s=view.S?.service;return '<details class="group service"><summary>⚙ Service <span class="meta">'+esc(p.name)+'</span></summary><div class="body meta" role="status">Host service: '+esc(s?.state==='running'?'running · PID '+s.pid+(s.fresh?' · fresh observation':' · stale observation'):s?.state==='exited'?'recorded process exited; worker outcomes separate':'unknown')+(s?.reason?': '+esc(s.reason):'')+'</div>'+incident(p)+
   (p.log?'<button class="project" data-a="log" data-root="'+esc(p.root)+'">Open log</button>':'<div class="body meta">Log path unknown</div>')+
   '<button class="project" data-a="folder" data-root="'+esc(p.root)+'">Open folder</button>'+
-  api.restartControl(p)+
-  '<button class="project" data-a="stop" data-root="'+esc(p.root)+'">Stop until next logon</button>'+
+  api.lifecycleControl(p)+
+  api.lifecycleControl(p,'stop')+
   '<details><summary>Uninstall service '+esc(p.name)+'</summary><div class="body meta">Removes this project\'s service; files and other projects stay.</div><button class="project" data-a="uninstall" data-root="'+esc(p.root)+'">Confirm uninstall '+esc(p.name)+'</button></details></details>';},
 when:function(t,tz){return new Date(t*1000).toLocaleString([],{timeZone:tz==='UTC'?'UTC':undefined,dateStyle:'short',timeStyle:'short'})+' '+(tz==='UTC'?'UTC':zone);},
 local:function(t,tz){const d=new Date(t*1000);return (tz==='UTC'?d.toISOString():new Date(d-d.getTimezoneOffset()*60000).toISOString()).slice(0,16);},
@@ -395,9 +402,9 @@ receive:function(s){
   if(s.action_error){actionReceipt(s.action_error);return;}
   if(s.focus_receipt){focusReceipt(s.focus_receipt);return;}
   if(s.answerReceipt){answerReceipt(s.answerReceipt);return;}
-  if(s.capmsg){if(view.hostRestart?.id===s.capmsg.id)api.restartReceipt(s.capmsg);else resourceReceipt(s.capmsg);return;}
+  if(s.capmsg){if(view.hostCommand?.id===s.capmsg.id)api.lifecycleReceipt(s.capmsg);else resourceReceipt(s.capmsg);return;}
   if(s.open){openCard(s.open);return;}
-  view.S=s;focusReadback();answerReadback();api.restartReadback();
+  view.S=s;focusReadback();answerReadback();api.lifecycleReadback();
   if(view.aiText===null)view.aiText=s.ai.draft||'';
   // snapshot mode names the page
   if(s.page!==undefined&&s.page!==view.page){view.page=s.page;view.taskFilter=null;view.working=null;view.workCard=null;trail.length=0;view.disclosures=[];present(true);return;}
@@ -459,7 +466,7 @@ const z=t(view.draft.end);
   if(d.a==='update'){view.updating={v:d.v,at:view.S.now};}
   if(d.a==='pick'){view.ask=d.root;present();return;}
   if(d.a==='pause-all'||d.a==='resume-all'){view.confirming=null;for(const p of view.S.projects.filter(p=>mode(p)===(d.a==='pause-all'?'run':'paused')))focusStart(d.a.slice(0,-4),p.root);present();menu.querySelector('[data-a="confirm"]')?.focus();return;}
-  if(d.a==='restart'){api.restartStart(d.root);return;}
+  if(d.a==='restart'||d.a==='stop'){api.lifecycleStart(d.root,d.a);return;}
   if(d.a==='pause'||d.a==='resume'||d.a==='focus'){focusStart(d.a,d.root,d.label);view.ask=null;present();return;}
   if(d.a){actionErrors.delete(d.root);send({a:d.a,root:d.root,label:d.label});}present();});
 ui.listen(menu,'input',e=>{if(e.target.id==='ai'){view.aiText=e.target.value;send({a:'ai-draft',text:view.aiText});return;}const k=e.target.dataset.draft;if(k&&view.draft)view.draft[k]=e.target.value;});

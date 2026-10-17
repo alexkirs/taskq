@@ -12,12 +12,30 @@ use std::path::{Path, PathBuf};
 pub const KEEP: usize = 20;
 const KINDS: [&str; 4] = ["result", "clarify", "proposal", "refuse"];
 
+fn state_error(reason:String)->String {
+    let _:Result<(),_>=coreq::telemetry::capture::operation("operator.state.read",||Err(reason.as_str()),|_|"local-state");reason
+}
+
 pub fn dir(root: &Path) -> PathBuf {
     crate::dot(root).join("requests")
 }
 
 pub fn read(p: &Path) -> Value {
-    fs::read_to_string(p).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(Value::Null)
+    let pending=p.with_file_name(format!("{}.pending",p.file_name().unwrap_or_default().to_string_lossy()));
+    let result=match fs::symlink_metadata(&pending) {Ok(_)=>Err("operator state has an interrupted replacement; file kept".into()),Err(e) if e.kind()==std::io::ErrorKind::NotFound=>crate::data::json(p),Err(e)=>Err(format!("operator state prepare unknown: {e}"))};
+    let result=result.and_then(|value| {
+        if p.file_name().is_some_and(|name|name.to_string_lossy().ends_with(".answer.json"))&&let Some(value)=&value {
+            if !matches!(value["state"].as_str(),Some("running"|"result"|"clarify"|"proposal"|"refuse"|"failed"|"applying"|"applied"|"apply failed"|"unknown"))
+                ||value.get("native_state").is_some_and(|s|!matches!(s.as_str(),Some("unknown"|"no-start"|"exited"))) {return Err("operator answer schema unknown; file kept".into());}
+        }
+        Ok(value)
+    });
+    match result {
+        Ok(Some(value))=>value,Ok(None)=>Value::Null,
+        Err(reason)=>{
+            json!({"state":"unknown","native_state":"unknown","reason":state_error(reason)})
+        }
+    }
 }
 
 pub fn answer_path(root: &Path, id: &str) -> PathBuf {
@@ -26,10 +44,17 @@ pub fn answer_path(root: &Path, id: &str) -> PathBuf {
 
 /// Write the answer of `id` with `rev` one above the last one.
 fn answer(root: &Path, id: &str, mut v: Value) {
+    if let Err(error)=save_answer(root,id,&mut v) {log!("operator answer unknown: {error}");}
+}
+
+fn save_answer(root:&Path,id:&str,v:&mut Value)->Result<(),String> {
+    let previous=read(&answer_path(root,id));
+    if previous["state"]=="unknown" {return Err("operator answer unknown; original file kept".into());}
     v["id"] = json!(id);
-    v["rev"] = json!(read(&answer_path(root, id))["rev"].as_u64().unwrap_or(0) + 1);
-    let _ = crate::platform::write_atomic(&answer_path(root, id), &v.to_string());
+    v["rev"] = json!(previous["rev"].as_u64().unwrap_or(0).checked_add(1).ok_or("operator revision exhausted; file kept")?);
+    coreq::write_durable(&answer_path(root, id), &v.to_string())?;
     let _ = crate::poke(root);
+    Ok(())
 }
 
 /// Request ids, oldest first: the tray names them by epoch milliseconds, so only digits.
@@ -107,22 +132,43 @@ fn comment_of(root: &Path, req: &Value) -> Value {
 /// After a restart no thread waits for a `running` operator: say so (§ 4).
 pub fn recover(root: &Path) {
     for id in ids(root) {
-        if read(&answer_path(root, &id))["state"] == "running" {
-            answer(root, &id, json!({"state": "failed", "reason": "service restarted; partial effects unknown; reconcile before retry"}));
+        let value=read(&answer_path(root,&id));
+        if matches!(value["state"].as_str(),Some("running"|"applying"))||value["state"]=="failed"&&value["reason"].as_str().is_some_and(|reason|reason.starts_with("service restarted; partial effects unknown")) {
+            let mut value=value;value["state"]=json!("failed");value["native_state"]=json!("unknown");
+            value["reason"]=json!("service restarted; partial effects unknown; original native exit unconfirmed; reconcile the original session before retry");
+            answer(root,&id,value);
         }
     }
 }
 
 /// A running operator can edit files; restart and another turn must wait for it.
 pub fn running(root: &Path) -> bool {
-    ids(root).iter().any(|id| read(&answer_path(root, id))["state"] == "running")
+    wait(root).is_some()
+}
+
+fn unresolved(value:&Value)->bool {
+    matches!(value["state"].as_str(),Some("running"|"applying"|"unknown"))||value["native_state"]=="unknown"
+}
+
+pub fn wait(root:&Path)->Option<String> {
+    let entries=match fs::read_dir(dir(root)) {Ok(entries)=>entries,Err(e) if e.kind()==std::io::ErrorKind::NotFound=>return None,Err(e)=>return Some(state_error(format!("operator state unknown: {e}")))};
+    for entry in entries {
+        let entry=match entry {Ok(entry)=>entry,Err(e)=>return Some(state_error(format!("operator state unknown: {e}")))};
+        let name=entry.file_name();let name=name.to_string_lossy();
+        let name=name.strip_suffix(".pending").unwrap_or(&name);
+        if name.strip_suffix(".answer.json").is_none_or(|id|id.is_empty()||!id.bytes().all(|b|b.is_ascii_digit())) {continue;}
+        let value=read(&dir(root).join(name));
+        if value.is_null() {return Some("operator state changed while reading; native ownership unknown".into());}
+        if unresolved(&value) {return Some(if value["native_state"]=="unknown" {format!("operator native ownership unknown: {}",value["reason"].as_str().unwrap_or("inspect original session"))}else{"operator".into()});}
+    }
+    None
 }
 
 /// One service pass: start an operator for each new request, apply a confirmed proposal, drop all but the newest 20.
 pub fn step(root: &Path, install: &Path, exe: &Path, rt: Option<&str>) {
     let ids = ids(root);
     for id in ids.iter().rev().skip(KEEP) {
-        if read(&answer_path(root, id))["state"] == "running" { continue; }
+        if unresolved(&read(&answer_path(root, id))) { continue; }
         for f in [format!("{id}.json"), format!("{id}.answer.json"), format!("{id}.confirm"), format!("{id}.out"), format!("{id}.err")] {
             let _ = fs::remove_file(dir(root).join(f));
         }
@@ -145,7 +191,7 @@ pub fn step(root: &Path, install: &Path, exe: &Path, rt: Option<&str>) {
         // only the proposal the owner saw, once: a stale or repeated confirm does nothing (M-A7)
         // ponytail: files are not signed; whoever can write them can run the same allowlisted `taskq` commands anyway
         if a["state"] == "proposal" && rev.trim().parse::<u64>().ok() == a["rev"].as_u64() {
-            answer(root, id, json!({"state": "applying", "text": a["text"], "ops": a["ops"], "effects": a["effects"]}));
+            if let Err(error)=save_answer(root,id,&mut json!({"state": "applying", "text": a["text"], "ops": a["ops"], "effects": a["effects"]})) {log!("operator proposal not applied: {error}");continue;}
             let ops = a["ops"].as_array().map_or(&[][..], |v| v);
             let (ok, lines, receipts) = match onboard(root, &read(&dir(root).join(format!("{id}.json")))) {
                 Some(r) => {
@@ -161,14 +207,16 @@ pub fn step(root: &Path, install: &Path, exe: &Path, rt: Option<&str>) {
 
 fn start(root: &Path, install: &Path, id: &str, rt: Option<&str>) {
     let req = read(&dir(root).join(format!("{id}.json")));
+    if req["state"]=="unknown" {return answer(root,id,json!({"state":"failed","reason":req["reason"],"native_state":"no-start"}));}
     let prior = req["after"].as_str().filter(|s| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit()))
         .map(|after| read(&answer_path(root, after)));
     let Some(rt) = prior.as_ref().and_then(|p| p["rt"].as_str()).or(rt).map(String::from) else {
         return answer(root, id, json!({"state": "failed", "reason": "no runtime with a nonzero limit on this host"}));
     };
-    answer(root, id, json!({"state": "running", "rt": rt}));
+    if let Err(error)=save_answer(root,id,&mut json!({"state":"running","rt":rt})) {log!("operator not started: {error}");return;}
     let (root, install, id) = (root.to_path_buf(), install.to_path_buf(), id.to_string());
-    std::thread::spawn(move || {
+    let failed_root=root.clone();let failed_id=id.clone();
+    if let Err(error)=coreq::telemetry::capture::operation("operator.dispatch",||std::thread::Builder::new().name("taskq-operator".into()).spawn(coreq::telemetry::capture::bind(move || {
         let mut v = match run(&root, &install, &id, &rt) {
             Ok(text) => {
                 let req = read(&dir(&root).join(format!("{id}.json")));
@@ -179,7 +227,7 @@ fn start(root: &Path, install: &Path, id: &str, rt: Option<&str>) {
         v["rt"] = json!(rt);
         v["session"] = json!(session(&rt, &dir(&root).join(format!("{id}.out"))));
         answer(&root, &id, v);
-    });
+    })),|_|"thread-spawn") {answer(&failed_root,&failed_id,json!({"state":"failed","native_state":"no-start","reason":format!("operator thread not started: {error}")}));}
 }
 
 /// Resume only the recorded conversation; failure never silently repeats work in a fresh one.
@@ -847,19 +895,30 @@ mod tests {
             confirm("2");
             confirm(&rev.to_string());
             assert_eq!((a()["rev"].clone(), focus().as_str()), (rev, "area-y"), "a repeated confirm applies nothing");
-            // a request without a runtime fails as an AI failure, not a task; a restart ends a running one
+            // AI failure is not task failure; a restart cannot certify that the native operator ended.
             fs::write(dir(&root).join("6.json"), r#"{"text": "x"}"#).unwrap();
             step(&root, &install, Path::new("/nonexistent"), None);
             assert_eq!(read(&answer_path(&root, "6"))["state"], "failed");
             answer(&root, "6", json!({"state": "running"}));
             recover(&root);
             assert_eq!(read(&answer_path(&root, "6"))["state"], "failed");
+            assert_eq!(read(&answer_path(&root,"6"))["native_state"],"unknown");assert!(running(&root));
+            fs::write(answer_path(&root,"6"),"[").unwrap();assert!(running(&root),"corrupt ownership cannot certify an idle operator");
+            assert_eq!(read(&answer_path(&root,"6"))["state"],"unknown");
+            assert!(save_answer(&root,"6",&mut json!({"state":"result"})).is_err());
+            assert_eq!(fs::read(answer_path(&root,"6")).unwrap(),b"[","a late thread answer cannot overwrite corrupt ownership");
+            let pending=dir(&root).join("5.answer.json.pending");fs::write(&pending,"interrupted").unwrap();
+            let original=fs::read(answer_path(&root,"5")).unwrap();
+            assert!(save_answer(&root,"5",&mut json!({"state":"applying"})).is_err());
+            assert_eq!(fs::read(answer_path(&root,"5")).unwrap(),original);assert!(pending.is_file());
+            fs::remove_file(pending).unwrap();
             for i in 10..40 {
                 fs::write(dir(&root).join(format!("{i}.json")), "{}").unwrap();
             }
             step(&root, &install, Path::new("/nonexistent"), None);
-            assert_eq!(ids(&root).len(), KEEP);
-            assert_eq!(ids(&root).first().map(String::as_str), Some("20"), "the newest 20 stay");
+            assert_eq!(ids(&root).len(), KEEP+1,"unresolved native ownership stays beside the newest requests");
+            assert_eq!(ids(&root).first().map(String::as_str),Some("6"));
+            assert_eq!(ids(&root).get(1).map(String::as_str),Some("20"),"the newest 20 still stay");
             let page=store.export(0,0,1024).unwrap();
             let receipts:Vec<_>=page["events"].as_array().unwrap().iter().map(|r|&r["observation"])
                 .filter(|r|r["source"]=="command").collect();

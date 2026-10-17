@@ -348,6 +348,8 @@ pub struct Host {
     turn: Option<PathBuf>,
     pub held: Option<String>,
     pub restart: bool,
+    pub stopping: bool,
+    pub stop_controller:Option<crate::host_control::Control>,
     /// Each thread reports active turns/children before the host considers an image switch.
     pub busy: BTreeMap<PathBuf, bool>,
     pub prepared: BTreeSet<PathBuf>,
@@ -365,7 +367,7 @@ pub struct Host {
 impl Host {
     pub fn new(policy: Res<Policy>) -> Self {
         Self { instance:crate::runtime::uuid(),policy, capacity_command:None, slots: BTreeMap::new(), gate: Gate::default(), began: Instant::now(), last: None,
-            ready: BTreeSet::new(), turn: None, held: None, restart: false, busy: BTreeMap::new(), prepared: BTreeSet::new(), recovered:BTreeSet::new(),updating:None, draining: BTreeSet::new(),
+            ready: BTreeSet::new(), turn: None, held: None, restart: false, stopping:false,stop_controller:None,busy: BTreeMap::new(), prepared: BTreeSet::new(), recovered:BTreeSet::new(),updating:None, draining: BTreeSet::new(),
             request_since: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()), hour_start: crate::requests::totals(), last_hour: None,
             rebuilding: false, rebuilt: BTreeSet::new(), published: BTreeMap::new() }
     }
@@ -417,6 +419,7 @@ impl Host {
 
     pub fn handoff_ready(&self) -> bool {
         self.restart && !self.rebuilding && self.held.is_none()&&self.updating.is_none()
+            &&(!self.stopping||(self.slots.is_empty()&&self.busy.values().all(|busy|!*busy)))
             && self.busy.keys().all(|root|self.prepared.contains(root))
             && self.slots.keys().all(|(root,_,_)|self.prepared.contains(root))
     }
@@ -486,6 +489,7 @@ impl Host {
 struct ServiceRecord {
     schema:u8,pid:u32,started:String,instance:String,at:u64,version:String,
     #[serde(default)] restart_protocol:Option<u8>,
+    #[serde(default)] stop_protocol:Option<u8>,
 }
 enum OwnerRecord { Legacy(u32), Current(ServiceRecord) }
 
@@ -505,14 +509,14 @@ fn service_record(install:&Path)->Res<Option<OwnerRecord>> {
     }
     let r:ServiceRecord=serde_json::from_str(&text).map_err(|_|"host service owner unknown: malformed record")?;
     if r.schema!=1||r.pid==0||r.pid>i32::MAX as u32||r.started.is_empty()||r.started.len()>128
-        ||!r.started.bytes().all(|c|c.is_ascii_alphanumeric()||c==b'-')||!crate::resources::id(&r.instance)||r.version.is_empty()||r.version.len()>80||r.restart_protocol.is_some_and(|v|v!=1) {
+        ||!r.started.bytes().all(|c|c.is_ascii_alphanumeric()||c==b'-')||!crate::resources::id(&r.instance)||r.version.is_empty()||r.version.len()>80||r.restart_protocol.is_some_and(|v|v!=1)||r.stop_protocol.is_some_and(|v|v!=1) {
         return Err("host service owner unknown: unsupported record; kept".into());
     }
     Ok(Some(OwnerRecord::Current(r)))
 }
 
 fn publish_service(install:&Path,native:&coreq::process::Identity,instance:&str)->Res<()> {
-    let record=ServiceRecord {schema:1,pid:native.pid,started:native.started.clone(),instance:instance.into(),at:wall()?,version:crate::platform::VERSION.into(),restart_protocol:Some(1)};
+    let record=ServiceRecord {schema:1,pid:native.pid,started:native.started.clone(),instance:instance.into(),at:wall()?,version:crate::platform::VERSION.into(),restart_protocol:Some(1),stop_protocol:Some(1)};
     crate::platform::write_atomic(&install.join("service"),&(serde_json::to_string(&record).map_err(|e|e.to_string())?+"\n"))
 }
 
@@ -538,7 +542,7 @@ pub fn service_status(install:&Path)->Value {
         let age=wall()?.checked_sub(r.at);
         let fresh=live&&age.is_some_and(|age|age<=60);
         Ok(json!({"state":if live {"running"}else{"exited"},"pid":r.pid,"started":r.started,"instance":r.instance,"version":r.version,
-            "at":r.at,"age_seconds":age,"fresh":fresh,"restart_protocol":r.restart_protocol,"reason":if !live {Some("recorded host process exited; worker outcomes remain separate")}else if !fresh {Some("host observation stale or clock unknown")}else{None}}))
+            "at":r.at,"age_seconds":age,"fresh":fresh,"restart_protocol":r.restart_protocol,"stop_protocol":r.stop_protocol,"reason":if !live {Some("recorded host process exited; worker outcomes remain separate")}else if !fresh {Some("host observation stale or clock unknown")}else{None}}))
     },|_|"owner-unknown");
     result.unwrap_or_else(|reason|json!({"state":"unknown","fresh":false,"reason":reason}))
 }
@@ -613,7 +617,7 @@ pub fn run(install: &Path) -> Res<()> {
     let mut hour = (Instant::now(), crate::requests::totals());
     let mut tray = None;
     let mut registry = Registry::default();
-    let mut restart=crate::restart::Monitor::default();
+    let mut restart=crate::lifecycle::Monitor::default();
     loop {
         if let Err(e) = crate::profile::prune(install) { eprintln!("taskq: telemetry unknown: {e}"); }
         let publication=publish_service(install,&native,&instance).err();
@@ -630,7 +634,13 @@ pub fn run(install: &Path) -> Res<()> {
             h.reload(policy);
             h.held = registry.error.clone().or_else(|| old.as_ref().err().cloned()).or_else(||restart.current.as_ref().err().cloned())
                 .or_else(||publication.as_ref().map(|e|format!("host publication unavailable: {e}")));
-            if restart.current.as_ref().ok().and_then(Option::as_ref).is_some_and(|p|p.origin()==instance) {h.restart=true;}
+            if let Some(p)=restart.current.as_ref().ok().and_then(Option::as_ref) {
+                if p.action()==crate::lifecycle::Action::Stop {
+                    if !h.stopping {h.prepared.clear();}
+                    h.restart=true;h.stopping=true;
+                    if p.origin()!=instance {h.held=Some("Stop belongs to another host generation; reconcile original owner via service status --request".into());}
+                } else if p.origin()==instance {h.restart=true;}
+            }
             let now = h.elapsed();
             if h.gate.last.is_none_or(|l| now.saturating_sub(l.0) >= 30) {
                 h.gate.host_mem = crate::platform::host_memory();
@@ -708,8 +718,15 @@ pub fn run(install: &Path) -> Res<()> {
         let h = shared.lock().unwrap_or_else(|e| e.into_inner());
         let recovered=h.publications_ready(&roots)&&roots.iter().all(|r|h.recovered.contains(r));
         drop(h);
-        if let Err(e)=crate::restart::observe(install,&instance,recovered) {if reported!=e {crate::platform::log(&e);reported=e;}}
+        if let Err(e)=crate::lifecycle::observe(install,&instance,recovered) {if reported!=e {crate::platform::log(&e);reported=e;}}
         let mut h=shared.lock().unwrap_or_else(|e|e.into_inner());
+        let finished=h.stop_controller.as_mut().and_then(|control|control.poll().map(|result|(control.id.clone(),result)));
+        if let Some((id,result))=finished {
+            drop(h);
+            let error=result.err().unwrap_or_else(||"controller exited without an observed host stop".into());
+            let _=crate::lifecycle::failed(install,&id,&error);crate::platform::log(&format!("Stop controller: {}",crate::compact(&error,153)));
+            h=shared.lock().unwrap_or_else(|e|e.into_inner());
+        }
         let timers = h.policy.as_ref().map(|p| (p.update_every, p.rollback_after)).unwrap_or((60, 600));
         if h.updating.as_ref().is_some_and(|job|job.is_finished()) {
             let updated=h.updating.take().unwrap().join().unwrap_or_else(|_|Err("host update panicked; partial effects unknown".into()));
@@ -735,13 +752,26 @@ pub fn run(install: &Path) -> Res<()> {
             }
             if h.updating.is_some() {
                 drop(h);
-                if let Err(e)=crate::restart::update_wait(install,&instance) {if reported!=e {crate::platform::log(&e);reported=e;}}
+                if let Err(e)=crate::lifecycle::update_wait(install,&instance) {if reported!=e {crate::platform::log(&e);reported=e;}}
                 h=shared.lock().unwrap_or_else(|e|e.into_inner());
             }
             if h.handoff_ready() {
+                if h.stopping&&h.stop_controller.is_some() {drop(h);std::thread::sleep(std::time::Duration::from_secs(1));continue;}
+                let stopping=h.stopping;
                 drop(h);
-                if let Err(e)=crate::restart::prepare(install,&instance) {
+                if let Err(e)=crate::lifecycle::prepare(install,&instance) {
+                    if stopping&&let Ok(Some(p))=crate::lifecycle::pending(install) {let _=crate::lifecycle::failed(install,p.id(),&e);}
                     if reported!=e {crate::platform::log(&e);reported=e;}
+                    std::thread::sleep(std::time::Duration::from_secs(1));continue;
+                }
+                if stopping {
+                    match crate::lifecycle::pending(install).and_then(|p|p.filter(|p|p.action()==crate::lifecycle::Action::Stop).ok_or("prepared Stop binding unavailable".into())) {
+                        Ok(p)=>match crate::host_control::dispatch(install,&p) {
+                        Ok(control)=>{shared.lock().unwrap_or_else(|e|e.into_inner()).stop_controller=Some(control);},
+                        Err(e)=>{let _=crate::lifecycle::failed(install,p.id(),&e);crate::platform::log(&e);}
+                        },
+                        Err(e)=>crate::platform::log(&e),
+                    }
                     std::thread::sleep(std::time::Duration::from_secs(1));continue;
                 }
                 let _ = fs::remove_file(install.join("restart"));
@@ -833,7 +863,7 @@ impl ProjectEdit {
     pub fn new(install:&Path,root:&Path,adding:bool)->Res<Self> {
         fs::create_dir_all(install).map_err(|e|e.to_string())?;
         let lock=coreq::file_lock::try_lock(&install.join("projects.lock")).map_err(|e|format!("project registry busy or lock unavailable: {e}"))?;
-        crate::restart::registry_guard(install)?;
+        crate::lifecycle::registry_guard(install)?;
         let path=install.join("projects");
         let original=project_text(install)?;
         if original.is_none() && !adding {return Err(format!("{}: project registry missing; nothing changed",path.display()));}
@@ -1132,6 +1162,12 @@ mod tests {
         assert!(!h.handoff_ready(),"an update owner must finish before image replacement");
         assert!(h.begin_pass(&a),"projects keep heartbeat/native monitoring while the update waits");
         h.prepared.insert(a);send.send(()).unwrap();h.updating.take().unwrap().join().unwrap().unwrap();assert!(h.handoff_ready());
+        h.stopping=true;
+        assert!(!h.handoff_ready(),"Stop cannot reuse a CLI handover acknowledgment while a native slot remains");
+        h.sync(&b,vec![]);assert!(!h.handoff_ready(),"Stop still waits for active project/operator ownership");
+        for busy in h.busy.values_mut() {*busy=false;}
+        assert!(h.handoff_ready(),"only the prepared host with no occupied work may stop");
+
     }
     fn temp(name: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!("taskq-host-{name}-{}", std::process::id()));

@@ -70,10 +70,10 @@ pub fn dispatch(install:&Path,pending:&lifecycle::Pending)->Res<Control> {
     #[cfg(windows)] {
         let args=controller_args(install,pending,&exe)?;
         let code=format!(r#"$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue'
-$s=New-Object -ComObject 'Schedule.Service';$s.Connect();$r=$s.GetFolder('\');$name={name};$path=(Get-Command powershell.exe -ErrorAction Stop).Source;$args={args};$cwd={cwd}
+$s=New-Object -ComObject 'Schedule.Service';$s.Connect();$r=$s.GetFolder('\');$name={name};$path=(Get-Command powershell.exe -ErrorAction Stop).Source;$args={args};$cwd={cwd};$identity=[Security.Principal.WindowsIdentity]::GetCurrent()
 try{{$t=$r.GetTask($name)}}catch{{if(($_.Exception.GetBaseException()).HResult -ne -2147024894){{throw}};$t=$null}}
-if($t){{$a=$t.Definition.Actions.Item(1);$identity=[Security.Principal.WindowsIdentity]::GetCurrent();if($t.Definition.Principal.LogonType -ne 3 -or $t.Definition.Principal.RunLevel -ne 0 -or ($t.Definition.Principal.UserId -ne $identity.Name -and $t.Definition.Principal.UserId -ne $identity.User.Value) -or $t.Definition.Triggers.Count -ne 0 -or $t.Definition.Settings.ExecutionTimeLimit -ne 'PT2M' -or $t.Definition.Actions.Count -ne 1 -or $a.Path -ne $path -or $a.Arguments -ne $args -or $a.WorkingDirectory -ne $cwd){{throw 'existing controller definition differs'}}}}
-else{{$d=$s.NewTask(0);$d.Principal.UserId=[Security.Principal.WindowsIdentity]::GetCurrent().Name;$d.Principal.LogonType=3;$d.Principal.RunLevel=0;$d.Settings.ExecutionTimeLimit='PT2M';$d.Settings.MultipleInstances=2;$d.Settings.DisallowStartIfOnBatteries=$false;$d.Settings.StopIfGoingOnBatteries=$false;$a=$d.Actions.Create(0);$a.Path=$path;$a.Arguments=$args;$a.WorkingDirectory=$cwd;$t=$r.RegisterTaskDefinition($name,$d,2,$null,$null,3)}}
+if($t){{$a=$t.Definition.Actions.Item(1);if($t.Definition.Principal.LogonType -ne 3 -or $t.Definition.Principal.RunLevel -ne 0 -or ($t.Definition.Principal.UserId -ne $identity.Name -and $t.Definition.Principal.UserId -ne $identity.User.Value) -or $t.Definition.Triggers.Count -ne 0 -or $t.Definition.Settings.ExecutionTimeLimit -ne 'PT2M' -or $t.Definition.Actions.Count -ne 1 -or $a.Path -ne $path -or $a.Arguments -ne $args -or $a.WorkingDirectory -ne $cwd){{throw 'existing controller definition differs'}}}}
+else{{$d=$s.NewTask(0);$d.Principal.UserId=$identity.Name;$d.Principal.LogonType=3;$d.Principal.RunLevel=0;$d.Settings.ExecutionTimeLimit='PT2M';$d.Settings.MultipleInstances=2;$d.Settings.DisallowStartIfOnBatteries=$false;$d.Settings.StopIfGoingOnBatteries=$false;$a=$d.Actions.Create(0);$a.Path=$path;$a.Arguments=$args;$a.WorkingDirectory=$cwd;$sddl='D:P(A;;GA;;;'+$identity.User.Value+')(A;;GA;;;SY)';$t=$r.RegisterTaskDefinition($name,$d,2,$null,$null,3,$sddl)}}
 if($t.State -ne 4){{$null=$t.Run($null)}}"#,name=quote(&format!("TaskQ-Stop-{}",pending.id())),args=quote(&args),cwd=quote(&install.to_string_lossy()));
         output("host.stop.dispatch",&mut powershell(&code))?;
     }
@@ -179,7 +179,8 @@ pub fn retire_controller(install:&Path,id:&str)->Res<()> {
         let code=format!(r#"$ErrorActionPreference='Stop';$s=New-Object -ComObject 'Schedule.Service';$s.Connect();$r=$s.GetFolder('\');$name={name}
 try{{$t=$r.GetTask($name)}}catch{{if(($_.Exception.GetBaseException()).HResult -ne -2147024894){{throw}};$t=$null}}
 if($t){{$a=$t.Definition.Actions.Item(1);if($t.Definition.Actions.Count -ne 1 -or $a.Path -ne (Get-Command powershell.exe -ErrorAction Stop).Source -or $a.Arguments -ne {args} -or $a.WorkingDirectory -ne {cwd} -or $t.Definition.Principal.RunLevel -ne 0 -or $t.Definition.Triggers.Count -ne 0){{throw 'controller ownership differs; definition kept'}};$r.DeleteTask($name,0)}}
-try{{$null=$r.GetTask($name);throw 'controller definition remains'}}catch{{if(($_.Exception.GetBaseException()).HResult -ne -2147024894){{throw}}}}"#,name=quote(&format!("TaskQ-Stop-{id}")),args=quote(&args),cwd=quote(&install.to_string_lossy()));
+try{{$null=$r.GetTask($name);throw 'controller definition remains'}}catch{{if(($_.Exception.GetBaseException()).HResult -ne -2147024894){{throw}}}}
+exit 0"#,name=quote(&format!("TaskQ-Stop-{id}")),args=quote(&args),cwd=quote(&install.to_string_lossy()));
         output("host.stop.controller.retire",&mut powershell(&code))?;
     }
     #[cfg(not(windows))] let _=(install,id);
@@ -197,6 +198,7 @@ mod tests {
     fn native_unit_stop() {
         let install=PathBuf::from(std::env::var_os("TASKQ_NATIVE_STOP_CASE").expect("owned fixture root required"));
         let nonce=install.file_name().unwrap().to_str().unwrap().strip_prefix("taskq-stop-native-").unwrap();
+        let id=nonce;
         assert_eq!(nonce.len(),32);assert!(nonce.bytes().all(|b|b.is_ascii_hexdigit()));
         let name=Box::leak(format!("taskq-stop-probe-{nonce}").into_boxed_str());
         let title=Box::leak(format!("TaskQ-Stop-Probe-{nonce}").into_boxed_str());
@@ -208,19 +210,27 @@ mod tests {
         let (capture,guard)=crate::profile::tests::collecting(&install);
         let command=coreq::telemetry::capture::CommandReceipt::decode(&json!({"wire":1,"product":"taskq","version":"fixture","operation":"taskq.host.stop.request","trace":format!("{}.1","a".repeat(32)),"span":format!("{}.2","a".repeat(32)),"parent":null,"started_ms":1}).to_string()).unwrap();
         crate::resources::with(&install,|state| {
-            state.ops.insert("native-stop".into(),crate::resources::Op {
-                bound:json!({"local_stop":{"request":{"id":"native-stop","instance":"original","roots":[],"issued_at":1,"expires_at":301,"action":"stop"},"command":command.encode()}}),
-                receipt:json!({"id":"native-stop","state":"applied","received_receipt":command.event_id("received")?,"applied_receipt":command.event_id("applied")?,"native_pid":native.pid,"native_started":native.started,"unit_revision":revision}),
+            state.ops.insert(id.into(),crate::resources::Op {
+                bound:json!({"local_stop":{"request":{"id":id,"instance":"original","roots":[],"issued_at":1,"expires_at":301,"action":"stop"},"command":command.encode()}}),
+                receipt:json!({"id":id,"state":"applied","received_receipt":command.event_id("received")?,"applied_receipt":command.event_id("applied")?,"native_pid":native.pid,"native_started":native.started,"unit_revision":revision}),
                 expires_at:301,saved_at:Some(1),writing:false,sent:true,
             });Ok(())
         }).unwrap();
-        assert!(stop_unit(&tool,"native-stop",&native,&"0".repeat(64)).is_err());
+        #[cfg(windows)] {
+            dispatch(&install,&lifecycle::pending(&install).unwrap().unwrap()).unwrap().wait().unwrap();
+            let check=format!(r#"$ErrorActionPreference='Stop';$s=New-Object -ComObject 'Schedule.Service';$s.Connect();$t=$s.GetFolder('\').GetTask({name});$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$acl=[Security.AccessControl.RawSecurityDescriptor]::new($t.GetSecurityDescriptor(4));$allowed=@($acl.DiscretionaryAcl|Where-Object {{$_.AceQualifier -eq 'AccessAllowed' -and $_.SecurityIdentifier.Value -eq $sid -and (($_.AccessMask -band 0x10000000) -ne 0 -or ($_.AccessMask -band 0x10000) -ne 0)}})
+if($allowed.Count -eq 0){{throw 'limited controller cannot retire its own task'}}"#,name=quote(&format!("TaskQ-Stop-{id}")));
+            let checked=output("host.stop.controller.permissions",&mut powershell(&check));
+            let cleaned=retire_controller(&install,id);cleaned.unwrap();checked.unwrap();
+        }
+        assert!(stop_unit(&tool,id,&native,&"0".repeat(64)).is_err());
         let mut foreign=native.clone();foreign.started.push_str("-foreign");
-        assert!(stop_unit(&tool,"native-stop",&foreign,&revision).is_err());
+        assert!(stop_unit(&tool,id,&foreign,&revision).is_err());
         assert_eq!(coreq::process::identity(native.pid).unwrap().as_ref(),Some(&native),"refused requests must preserve the original daemon");
-        stop_unit(&tool,"native-stop",&native,&revision).unwrap();
+        stop_unit(&tool,id,&native,&revision).unwrap();
         assert_ne!(coreq::process::identity(native.pid).unwrap().as_ref(),Some(&native));
-        stop_unit(&tool,"native-stop",&native,&revision).unwrap();
+        stop_unit(&tool,id,&native,&revision).unwrap();
         assert_eq!(fs::read(&definition).unwrap(),original,"Stop retains the native definition");
         capture.flush().unwrap();drop(guard);drop(capture);
         fs::write(install.join("adapter-result.json"),json!({"unit":name,"native_pid":native.pid,"native_started":native.started,"unit_revision":revision,"exit":true,"replay":true,"definition_retained":true}).to_string()).unwrap();

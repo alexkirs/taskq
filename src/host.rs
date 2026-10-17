@@ -608,6 +608,10 @@ fn native_inventory_ready(inventory:&Res<Vec<String>>,checked:Option<Instant>)->
     Ok(())
 }
 
+fn native_inventory_due(inventory:&Res<Vec<String>>,checked:Option<Instant>)->bool {
+    checked.is_none_or(|at|at.elapsed().as_secs()>=if inventory.as_ref().is_ok_and(Vec::is_empty) {60}else{5})
+}
+
 pub fn run(install: &Path) -> Res<()> {
     fs::create_dir_all(install).map_err(|e| e.to_string())?;
     let mut reported=String::new();
@@ -765,7 +769,7 @@ pub fn run(install: &Path) -> Res<()> {
             if maintenance_result!=text {crate::platform::log(&text);for root in &roots {append_project(install,root,&text);}maintenance_result=text;}
             if crate::installed(install)&&matches!(updated,Ok(Maintenance::Update(Some(_)))) {h.restart=true;}
         }
-        if h.updating.is_none()&&native_checked.is_none_or(|at|at.elapsed().as_secs()>=if native_legacy.is_ok() {60}else{5}) {
+        if h.updating.is_none()&&native_inventory_due(&native_legacy,native_checked) {
             native_checked=Some(Instant::now());native_legacy=Err("native legacy inventory pending; host admission held".into());
             let install=install.to_path_buf();
             let lifecycle_controller=restart.current.as_ref().ok().and_then(Option::as_ref).filter(|p|p.stops()&&p.prepared()).map(|p|p.id().to_string());
@@ -1211,6 +1215,11 @@ mod tests {
         assert!(native_inventory_ready(&inventory,None).is_err());
         assert!(native_inventory_ready(&Err("native read denied".into()),Some(Instant::now())).unwrap_err().contains("denied"));
         assert!(native_inventory_ready(&Ok(vec!["retained-unit".into()]),Some(Instant::now())).unwrap_err().contains("retained-unit"));
+        let retained=Ok(vec!["retained-unit".into()]);
+        let retry=Some(Instant::now()-std::time::Duration::from_secs(6));
+        assert!(native_inventory_due(&retained,retry),"retired legacy units need fresh native proof before lifecycle can proceed");
+        assert!(!native_inventory_due(&inventory,retry),"fresh empty inventory keeps the ordinary cadence");
+        assert!(native_inventory_ready(&retained,retry).is_err(),"a refresh being due cannot release the native barrier");
         h.policy=native_inventory_ready(&inventory,Some(Instant::now())).map(|_|p.clone());
         assert!(h.reserve(root,2,8,"codex",&p.cap,true,0).is_ok());
     }

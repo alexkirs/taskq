@@ -1,6 +1,6 @@
 [package]
 name = "taskq"
-version = "4.6.5"
+version = "4.6.6"
 edition = "2024"
 publish = false
 

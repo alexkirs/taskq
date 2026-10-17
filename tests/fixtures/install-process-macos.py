@@ -53,7 +53,16 @@ def manager():
                 temporary = install / 'stop-legacy.pending'
                 temporary.write_text(json.dumps(legacy))
                 temporary.replace(install / 'stop-legacy.json')
-            return 0
+            # The fixture parent must reap its child before acknowledging native Stop.
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                exited = install / 'legacy-exited.json'
+                if exited.exists():
+                    observed = json.loads(exited.read_text())
+                    assert observed == {'pid': legacy['pid'], 'started': legacy['started'], 'exit': 0}
+                    return 0
+                time.sleep(.02)
+            raise RuntimeError('owned legacy native exit unconfirmed')
         active.unlink(missing_ok=True)
         return 0
     raise RuntimeError('unexpected substituted native action: ' + repr(args))
@@ -135,6 +144,13 @@ def run_case(phase):
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
             ensure_host()
+            if legacy_actor is not None and legacy_actor.poll() is not None:
+                native = json.loads((install / 'legacy-native.json').read_text())
+                assert native['pid'] == legacy_actor.pid
+                if not (install / 'legacy-exited.json').exists():
+                    pending = install / 'legacy-exited.pending'
+                    pending.write_text(json.dumps({'pid': native['pid'], 'started': native['started'], 'exit': legacy_actor.returncode}))
+                    pending.replace(install / 'legacy-exited.json')
             if predicate():
                 return
             if actor is not None and actor.poll() is not None:
@@ -181,6 +197,8 @@ def run_case(phase):
             item['controller'] = json.loads((install / 'controller-ready.json').read_text())
             (install / 'allow-retirement').touch()
             until(lambda: (install / 'controller-finished').exists())
+            item['legacy_native_exit'] = json.loads((install / 'legacy-exited.json').read_text())
+            assert item['legacy_native_exit'] == {'pid': legacy_actor.pid, 'started': pending['legacy']['owner']['started'], 'exit': 0}
             until(lambda: legacy_actor.poll() is not None)
             assert legacy_actor.returncode == 0
             until(lambda: json.loads((root / '.taskq/status.json').read_text()).get('pid') == host.pid)

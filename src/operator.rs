@@ -211,7 +211,7 @@ fn start(root: &Path, install: &Path, id: &str, rt: Option<&str>) {
     let prior = req["after"].as_str().filter(|s| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit()))
         .map(|after| read(&answer_path(root, after)));
     let Some(rt) = prior.as_ref().and_then(|p| p["rt"].as_str()).or(rt).map(String::from) else {
-        return answer(root, id, json!({"state": "failed", "reason": "no runtime with a nonzero limit on this host"}));
+        return answer(root, id, json!({"state": "failed", "native_state": "no-start", "reason": "operator runtime selection unavailable; check service status and host limits"}));
     };
     if let Err(error)=save_answer(root,id,&mut json!({"state":"running","rt":rt})) {log!("operator not started: {error}");return;}
     let (root, install, id) = (root.to_path_buf(), install.to_path_buf(), id.to_string());
@@ -940,6 +940,7 @@ mod tests {
             fs::write(dir(&root).join("6.json"), r#"{"text": "x"}"#).unwrap();
             step(&root, &install, Path::new("/nonexistent"), None);
             assert_eq!(read(&answer_path(&root, "6"))["state"], "failed");
+            assert_eq!(read(&answer_path(&root, "6"))["native_state"], "no-start", "unavailable runtime selection refuses before native dispatch");
             answer(&root, "6", json!({"state": "running"}));
             recover(&root);
             assert_eq!(read(&answer_path(&root, "6"))["state"], "failed");

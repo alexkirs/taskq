@@ -95,7 +95,7 @@ impl Args {
         while let Some(x) = it.next() {
             match x.strip_prefix("--") {
                 Some(k) => {
-                    let val = if matches!(k, "later" | "hold" | "start" | "check" | "force" | "help" | "json" | "apply" | "headless" | "host-policy") { String::new() } else { it.next().cloned().ok_or(format!("--{k} needs a value"))? };
+                    let val = if matches!(k, "later" | "hold" | "start" | "check" | "force" | "help" | "json" | "apply" | "headless" | "host-policy") || k=="host"&&a.pos==["service","uninstall"] { String::new() } else { it.next().cloned().ok_or(format!("--{k} needs a value"))? };
                     a.flags.entry(k.to_string()).or_default().push(val);
                 }
                 None => a.pos.push(x.clone()),
@@ -171,6 +171,12 @@ fn hostname() -> String {
 }
 
 fn load(root: &Path) -> Res<(Config, Value)> {
+    let (mut cfg,raw)=project_config(root)?;
+    if let Ok(policy)=host::Policy::read(&cfg.install) {policy.apply(&mut cfg);}
+    Ok((cfg,raw))
+}
+
+fn project_config(root:&Path)->Res<(Config,Value)> {
     let p = root.join("taskq.json");
     let v: Value = serde_json::from_str(&fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display()))?).map_err(|e| format!("{}: {e}", p.display()))?;
     let str_or = |k: &str, d: &str| v[k].as_str().unwrap_or(d).to_string();
@@ -185,7 +191,7 @@ fn load(root: &Path) -> Res<(Config, Value)> {
     };
     let board = board::kind(&str_or("board", "github"))?;
     let (publish, delivery, delivery_revision) = delivery(&v)?;
-    let mut cfg = Config {
+    let cfg = Config {
         root: root.to_path_buf(),
         install: platform::default_install(),
         board,
@@ -207,7 +213,6 @@ fn load(root: &Path) -> Res<(Config, Value)> {
     if cfg.repo.is_empty() {
         return Err("taskq.json: repo is required".into());
     }
-    if let Ok(policy) = host::Policy::read(&cfg.install) { policy.apply(&mut cfg); }
     profile::project(&cfg.repo);
     profile::host(&cfg.me);
     Ok((cfg, v))
@@ -700,6 +705,11 @@ fn kids_file(install:&Path,root: &Path) -> Res<Vec<data::KidLine>> {
 fn adopt(s: &mut Service, install:&Path, root: &Path) -> Res<()> {
     let kids = kids_file(install,root)?;
     for k in kids {
+        if let Some(owned)=s.kids.iter().find(|owned|owned.task==k.task||owned.execution==k.execution) {
+            if owned.task==k.task&&owned.attempt==k.attempt&&owned.execution==k.execution&&owned.rt==k.runtime
+                &&owned.proc.native_identity()?==k.process {continue;}
+            return Err("native recovery differs from the retained handle; file kept".into());
+        }
         let history=board::entries(s.board,k.task)?;
         let execution=core::executions(k.task,&history).into_iter().find(|x|x.id==k.execution && x.attempt==k.attempt && x.host==s.cfg.me && x.runtime==k.runtime)
             .ok_or("native recovery identity does not match board ownership; file kept")?;
@@ -738,7 +748,7 @@ fn adopt(s: &mut Service, install:&Path, root: &Path) -> Res<()> {
     Ok(())
 }
 
-fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
+fn service_run(c: &Ctx, host: Option<host::Shared>,legacy:Option<&host_control::LegacyOwner>) -> Res<()> {
     let cfg = &c.cfg;
     let exe = launcher(&cfg.install);
     let board_env = cfg.board.worker_env(&platform::tool(&cfg.install), &cfg.web_host)?;
@@ -752,6 +762,7 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
         } else { runtime::spawn(&env, l) }
     };
     let mut s = Service::new(c.board.as_ref(), cfg, platform::VERSION, Box::new(start));
+    s.legacy_handoff=legacy.is_some();
     s.recover = Some(Box::new(|task, execution| runtime::recover(&cfg.root, &cfg.install, task, execution)));
     s.host = host.clone();
     s.instance = enrollment::installation_id(&cfg.install).map(|id| service_id(&id))?;
@@ -770,7 +781,8 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
         }
         std::thread::sleep(Duration::from_secs(cfg.poll.max(1)));
     }
-    adopt(&mut s, &cfg.install, &cfg.root)?;
+    let mut adoption=adopt(&mut s, &cfg.install, &cfg.root);
+    if legacy.is_none() {adoption.as_ref().map_err(Clone::clone)?;}
     let is_installed = installed(&cfg.install);
     let began = Instant::now();
     log!("{}", incident::disclosure(Some(&cfg.root)));
@@ -778,8 +790,8 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
     let mut update: Option<String> = None;
     let mut restart_empty: Option<u64> = None;
     let mut waits_logged = String::new();
-    let _ = fs::remove_file(d.join("restart"));
-    operator::recover(&cfg.root);
+    if legacy.is_none() {let _ = fs::remove_file(d.join("restart"));}
+    if legacy.is_none() {operator::recover(&cfg.root);}
     // ponytail: the operator takes no slot of `limits`; count it when operators crowd out workers
     let mut tray = None;
     let project = project_name(&cfg.root);
@@ -800,6 +812,10 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
     let mut dashq = enrollment::Sender::default();
     let mut policy_exchange = resources::Exchanger::default();
     let mut panics = host::Panics::default();
+    let mut legacy_installation:Option<std::thread::JoinHandle<Res<String>>>=None;
+    let mut legacy_controller:Option<host_control::Control>=None;
+    let mut legacy_retry:Option<Instant>=None;
+    let mut legacy_error:Option<String>=None;
     let pokes = [d.join("poke"), cfg.install.join("poke")];
     let mut observed_poke = None;
     let mut observed_command = None;
@@ -812,10 +828,14 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
         let poke_start = poke_times(&pokes);
         telemetry::diagnostic::poll(&cfg.install);
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Res<()> {
+        if legacy.is_some()&&adoption.is_err() {adoption=adopt(&mut s,&cfg.install,&cfg.root);}
+        let latch=legacy.map(|owner|host::legacy_latched(&cfg.install,owner)).transpose();
+        if matches!(latch,Ok(Some(true))) {s.legacy_prepared=true;}
+        let handoff_error=adoption.as_ref().err().cloned().or_else(||legacy.and_then(|owner|owner.verify(&platform::tool(&cfg.install)).err())).or_else(||latch.err());
         let control = control::snapshot(&cfg.root,&mut observed_poke,&mut observed_command);
         let command=match &control {Ok(snapshot)=>snapshot.command.clone(),Err(e)=>json!({"state":"unknown","reason":e})};
         let wakeup = control.as_ref().ok().and_then(|s|s.link.as_ref()).map(|link| link.span().entered());
-        let reduced = panics.quarantined() || began.elapsed().as_secs() < panics.until;
+        let reduced = panics.quarantined() || began.elapsed().as_secs() < panics.until||handoff_error.is_some()||s.legacy_prepared;
         // § 3: capacity reloads before each admission decision; children are untouched
         let cap = fs::read_to_string(cfg.root.join("taskq.json")).map_err(|e| e.to_string())
             .and_then(|t| serde_json::from_str::<Value>(&t).map_err(|e| format!("taskq.json: {e}")))
@@ -853,7 +873,7 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
             if let Ok(h) = host.lock() { if h.draining.contains(&cfg.root) { s.focus.clear(); } }
         }
         s.focus_error = focus_error.clone();
-        let r = if reduced { s.reduced().and_then(|_| Err(panics.reason.clone().unwrap_or_default())) } else { s.pass() };
+        let r = if s.legacy_prepared {s.reduced()}else if reduced { s.reduced().and_then(|_| Err(handoff_error.clone().or_else(||panics.reason.clone()).unwrap_or_default())) } else { s.pass() };
         s.sync_host();
         for l in s.log.drain(..) {
             log!("{l}");
@@ -922,20 +942,24 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
         {
             status[k] = v;
         }
+        if let Some(owner)=legacy {
+            status["handoff"]=json!({"state":if handoff_error.is_some()||legacy_error.is_some() {"unknown"}else if s.legacy_prepared {"prepared"}else{"draining"},"owner":owner,
+                "reason":handoff_error.as_ref().or(legacy_error.as_ref()),"waits":lifecycle_waits(&s,&cfg.root,true)});
+        }
         let published = publish_status(&tool, &cfg.root, &status, host.as_ref());
         drop(wakeup);
-        if host.is_none() && is_installed && published && began.elapsed().as_secs() >= cfg.rollback_after {
+        if host.is_none() && legacy.is_none() && is_installed && published && began.elapsed().as_secs() >= cfg.rollback_after {
             let h = cfg.install.join("releases").join(platform::VERSION).join("healthy");
             if !h.exists() {
                 if let Err(e) = fs::write(h, "") { log!("release health unknown: {e}"); }
             }
         }
         // § 4 step 7: a not installed service only reports a newer version; `<root>/.taskq/update` checks at once
-        let asked = fs::remove_file(d.join("update")).is_ok();
+        let asked = legacy.is_none()&&fs::remove_file(d.join("update")).is_ok();
         // § 8 step 3: a pending restart already goes to `current`; repeating the check would only repeat its log line
         let pending = is_installed && d.join("restart").exists();
         if host.is_some() && (asked || pending) { touch(&cfg.install.join(if asked { "update" } else { "restart" })); }
-        if host.is_none() && !pending && (asked || checked.is_none_or(|t| t.elapsed().as_secs() >= cfg.update_every)) {
+        if host.is_none() && legacy.is_none() && !pending && (asked || checked.is_none_or(|t| t.elapsed().as_secs() >= cfg.update_every)) {
             checked = Some(Instant::now());
             if is_installed {
                 match platform::service_update(&cfg.install) {
@@ -957,7 +981,7 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
             }
         }
         restart_watch(&mut restart_empty, cfg!(windows) && d.join("restart").exists() && s.kids.is_empty(), began.elapsed().as_secs(), cfg.update_every);
-        if host.is_none() && is_installed && d.join("restart").exists() {
+        if host.is_none() && legacy.is_none() && is_installed && d.join("restart").exists() {
             // Windows re-exec waits for the live children; the request stays until it can go
             let waits = lifecycle_waits(&s, &cfg.root, false).join(", ");
             if waits.is_empty() {
@@ -977,11 +1001,11 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
                 log!("{l}");
             }
         }
-        if !reduced && host.as_ref().is_none_or(|h| h.lock().is_ok_and(|h| !h.restart && !h.draining.contains(&cfg.root))) {
+        if legacy.is_none() && !reduced && host.as_ref().is_none_or(|h| h.lock().is_ok_and(|h| !h.restart && !h.draining.contains(&cfg.root))) {
             operator::owner_comments(&cfg.root, &project, &issues, &s.owner_comments);
             operator::step(&cfg.root, &cfg.install, &exe, op_rt);
         }
-        if host.is_none() && is_installed {
+        if host.is_none() && legacy.is_none() && is_installed {
             keep_tray(&cfg.install, &mut tray);
         }
         if let Some(host) = &host {
@@ -996,6 +1020,29 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
                     Err(e) => { h.prepared.remove(&cfg.root); log!("handoff unknown: {e}"); }
                 }
             } else { h.prepared.remove(&cfg.root); }
+            }
+        }
+        if let Some(owner)=legacy {
+            if legacy_installation.as_ref().is_some_and(|job|job.is_finished()) {
+                let outcome=legacy_installation.take().unwrap().join().unwrap_or_else(|_|Err("legacy installation owner panicked; original transition retained".into()));
+                if let Err(reason)=outcome {if legacy_error.as_ref()!=Some(&reason) {log!("legacy installation: {reason}");}legacy_error=Some(reason);}
+            }
+            if !s.legacy_prepared&&legacy_installation.is_none()&&legacy_retry.is_none_or(|at|at.elapsed().as_secs()>=5) {
+                legacy_retry=Some(Instant::now());let install=cfg.install.clone();let owner=owner.clone();
+                match std::thread::Builder::new().name("taskq-legacy-install".into()).spawn(coreq::telemetry::capture::bind(move ||host::legacy_install(&install,&owner))) {
+                    Ok(job)=>legacy_installation=Some(job),Err(e)=>legacy_error=Some(format!("legacy installation not started: {e}")),
+                }
+            }
+            if (!reduced||s.legacy_prepared)&&handoff_error.is_none()&&error.is_none()&&s.idle()&&!operator::running(&cfg.root) {
+                match host::prepare_legacy(&cfg.install,owner) {
+                    Ok(true)=>{s.legacy_prepared=true;legacy_error=None;},Ok(false)=>{},Err(e)=>legacy_error=Some(e),
+                }
+            }
+            if let Some(outcome)=legacy_controller.as_mut().and_then(host_control::Control::poll) {
+                legacy_controller=None;if let Err(e)=outcome {legacy_error=Some(e);}
+            }
+            if s.legacy_prepared&&legacy_controller.is_none() {
+                match host::dispatch_legacy(&cfg.install) {Ok(control)=>legacy_controller=Some(control),Err(e)=>legacy_error=Some(e)}
             }
         }
         // every 30 s, also between board polls: a gate sample (when enabled) and a fresh capacity in status.json (§ 4)
@@ -1025,14 +1072,15 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
         }));
         match outcome {
             Ok(Ok(())) => {}
+            Ok(Err(e)) if legacy.is_some()=>{log!("legacy supervision: {e}; ownership retained");std::thread::sleep(Duration::from_secs(1));},
             Ok(Err(e)) => return Err(e),
             Err(payload) => {
-                if host.is_none() { std::panic::resume_unwind(payload); }
-                if panics.quarantined() {
+                if host.is_none()&&legacy.is_none() { std::panic::resume_unwind(payload); }
+                if panics.quarantined()&&let Some(host)=&host {
                     // Stop the board loop, retaining its handles solely for safe exit/update monitoring (R11).
                     s.unready();
                     loop {
-                        let monitored = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| stopped_handoff(&mut s, host.as_ref().unwrap(), cfg)));
+                        let monitored = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| stopped_handoff(&mut s, host, cfg)));
                         if matches!(monitored, Ok(Ok(true))) { return Err("project drained".into()); }
                         std::thread::sleep(Duration::from_secs(1));
                     }
@@ -1051,9 +1099,33 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
     }
 }
 
+fn legacy_service(install:&Path,owner:&host_control::LegacyOwner)->Res<()> {
+    PROJECT_ROOT.set(Some(owner.root.clone()));
+    platform::project_log(install.join(format!("{}.log",owner.project)));
+    let mut reported=String::new();
+    loop {
+        let outcome=(|| {
+            owner.verify(&platform::tool(install))?;
+            // The host policy cannot change the permissions/capacity of an owner still draining its old unit.
+            let (cfg,raw)=project_config(&owner.root)?;
+            if cfg.install.canonicalize().ok()!=Some(install.canonicalize().map_err(|e|e.to_string())?) {
+                return Err("legacy installation scope differs; ownership retained".into());
+            }
+            let board=cfg.board.open(&cfg.web_host,&cfg.repo,raw["label_schema"].as_str(),&platform::tool(install))?;
+            service_run(&Ctx {cfg,raw,board},None,Some(owner))
+        })();
+        let error=outcome.err().unwrap_or_else(||"legacy supervision ended; ownership retained".into());
+        if reported!=error {log!("{error}; legacy handoff waiting");reported=error;}
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
 fn publish_status(tool: &coreq::Tool, root: &Path, status: &Value, host: Option<&host::Shared>) -> bool {
     let mut status=status.clone();
-    if let Some(host)=host {status["host_instance"]=host.lock().map(|h|json!(h.instance)).unwrap_or(Value::Null);}
+    if let Some(host)=host {
+        status["host_instance"]=host.lock().map(|h|json!(h.instance)).unwrap_or(Value::Null);
+        status["host_install"]=status["host_instance"].as_str().and_then(|instance|host::install_acknowledgement(&tool.install,root,instance)).map_or(Value::Null,|id|json!(id));
+    }
     let written = coreq::status::write(tool, root, &status);
     if let Err(e) = &written { log!("status publication failed: {e}; observed state unknown"); }
     let qualified = written.is_ok() && snapshot::complete(&status) && status["error"].is_null() && status["focus_error"].is_null();
@@ -1482,15 +1554,14 @@ fn tray_app(install: &Path, exe: &Path) -> Option<PathBuf> {
 /// The tray `open` started (`keep_tray`): `<install>/TaskQ.app/Contents/MacOS/taskq` with no args runs the tray of
 /// `<install>`, its stderr appended to `<install>/tray.log`.
 #[cfg(target_os = "macos")]
-fn bundled_tray(exe: &Path) -> Option<PathBuf> {
+fn bundled_tray(exe: &Path, install:&Path) -> bool {
     use std::os::fd::AsRawFd;
-    let app = exe.ancestors().nth(3).filter(|a| exe.ends_with("TaskQ.app/Contents/MacOS/taskq") && a.ends_with("TaskQ.app"))?;
-    let install = app.parent()?.to_path_buf();
+    if !exe.ends_with("TaskQ.app/Contents/MacOS/taskq") {return false;}
     if let Ok(f) = fs::OpenOptions::new().create(true).append(true).open(install.join("tray.log")) {
         // SAFETY: both descriptors are open; fd 2 now refers to the log for the life of the process
         unsafe { libc::dup2(f.as_raw_fd(), 2) };
     }
-    Some(install)
+    true
 }
 
 /// Labels of the open tasks in the last `status.json`, for a resume that has no focus to restore (§ 4).
@@ -1552,28 +1623,6 @@ fn resume(root: &Path) -> Res<(String,String)> {
     })
 }
 
-/// `service install` hands over instead of reloading the unit (§ 8 step 5) while this project's fresh `status.json` lists
-/// live children or is unreadable (unknown keeps them, § 4 Data).
-fn handover(root: &Path) -> bool {
-    if operator::running(root) { return true; }
-    let p = dot(root).join("status.json");
-    file_age(&p).is_some_and(|a| a <= 60) && data::json(&p).map_or(true, |s| s.is_some_and(|s| s["kids"].as_array().is_some_and(|k| !k.is_empty())))
-}
-
-/// § 8 step 5: live children pass to the new image through the step 3 re-exec; a unit reload would end them. True
-/// when the running service was asked to re-exec instead of the unit being reloaded.
-fn load_unit(u: &platform::Unit, root: &Path) -> Res<bool> {
-    if handover(root) {
-        fs::write(dot(root).join("restart"), "").map_err(|e| e.to_string())?;
-        poke(root)?;
-        return Ok(true);
-    }
-    platform::run_all(&u.unload, true)?;
-    kill_service(root); // Windows: `/End` left the old service running beside the new one (#933)
-    platform::run_all(&u.load, false)?;
-    Ok(false)
-}
-
 /// The heartbeat's `service <id>` (§ 4): public, so a hash of the installation id, never the id itself.
 fn service_id(installation: &str) -> String {
     let d = ring::digest::digest(&ring::digest::SHA256, installation.as_bytes());
@@ -1588,20 +1637,6 @@ fn other_service(root: &Path) -> Option<u32> {
     }
     let pid = data::json(&p).ok()??["pid"].as_u64()? as u32;
     (pid != std::process::id() && runtime::alive(pid)).then_some(pid)
-}
-
-/// Windows: `schtasks /End` ends only the launcher; the service, its children and the tray go with this (§ 8).
-fn kill_service(root: &Path) {
-    let status = dot(root).join("status.json");
-    if !cfg!(windows) || file_age(&status).is_none_or(|a| a > 600) {
-        return;
-    }
-    let pid = fs::read_to_string(&status).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()).and_then(|v| v["pid"].as_u64());
-    if let Some(pid) = pid.filter(|p| *p != std::process::id() as u64) {
-        // the image filter guards against a reused pid
-        let cmd = ["taskkill", "/F", "/T", "/FI", &format!("PID eq {pid}"), "/FI", "IMAGENAME eq taskq.exe"].map(String::from).to_vec();
-        let _ = platform::run_all(&[cmd], true);
-    }
 }
 
 #[cfg(unix)]
@@ -1692,16 +1727,19 @@ fn service_report(a:&Args)->Res<()> {
             ||s["host_instance"].as_str().is_none_or(|id|!resources::id(id)) {return "unknown";}
         if s["pid"]==service["pid"]&&s["host_instance"]==service["instance"] {"current"}else{"other"}
     };
-    let lifecycle=lifecycle::status(&install,a.one("request"));
+    let installation=host::installation_status(&install,a.one("request"));
+    let lifecycle=if a.one("request").is_some()&&installation["id"].is_string() {installation.clone()}else{lifecycle::status(&install,a.one("request"))};
     if a.flags.contains_key("json") {
         let projects:Vec<_>=rows.into_iter().map(|(root,status)|json!({"root":root,"host_binding":binding(&status),
             "status":status.as_ref().ok().and_then(Option::as_ref),"error":status.as_ref().err()})).collect();
-        println!("{}",json!({"schema":"taskq.service/1","service":service,"projects":projects,"registry_error":registry.as_ref().err(),"restart":if lifecycle["action"].as_str().is_some_and(|action|action!="restart") {Value::Null}else{lifecycle.clone()},"lifecycle":lifecycle}));
+        println!("{}",json!({"schema":"taskq.service/1","service":service,"projects":projects,"registry_error":registry.as_ref().err(),"restart":if lifecycle["action"].as_str().is_some_and(|action|action!="restart") {Value::Null}else{lifecycle.clone()},"lifecycle":lifecycle,"installation":installation}));
     } else {
         println!("{}",host::service_line(&service));
-        let restart=lifecycle;let title=match restart["action"].as_str() {Some("stop")=>"Stop",Some("uninstall")=>"Uninstall",_=>"Restart"};
+        let restart=lifecycle;let title=match restart["action"].as_str() {Some("stop")=>"Stop",Some("uninstall")=>"Uninstall",Some("install")=>"Install",_=>"Restart"};
         if let Some(id)=restart["id"].as_str() {println!("{title}: {id} {}",restart["state"].as_str().unwrap_or("unknown"));}
         if let Some(reason)=restart["reason"].as_str() {println!("{title}: unknown ({reason})");}
+        if a.one("request").is_none()&&let Some(id)=installation["id"].as_str() {println!("Install: {id} {}",installation["state"].as_str().unwrap_or("unknown"));}
+        if a.one("request").is_none()&&let Some(reason)=installation["reason"].as_str() {println!("Install: unknown ({reason})");}
         if let Err(error)=&registry {println!("Projects: unknown ({error})");}
         for (root,status) in rows {
             let owner=binding(&status);
@@ -1717,7 +1755,7 @@ fn service_report(a:&Args)->Res<()> {
 }
 
 #[tracing::instrument(name="service.command",skip_all,fields(coreq_operation=match args.pos.get(1).map(String::as_str).unwrap_or("") {
-    sub @ ("install"|"run"|"focus"|"pause"|"resume"|"capacity"|"permissions"|"resources"|"hold"|"release"|"recover"|"status"|"restart"|"stop"|"complete-stop"|"uninstall"|"list")=>sub,
+    sub @ ("install"|"run"|"focus"|"pause"|"resume"|"capacity"|"permissions"|"resources"|"hold"|"release"|"recover"|"status"|"restart"|"stop"|"complete-stop"|"complete-legacy"|"uninstall"|"list")=>sub,
     _=>"invalid",
 }))]
 fn service(args: &Args) -> Res<()> {
@@ -1728,10 +1766,11 @@ fn service(args: &Args) -> Res<()> {
     }
     if matches!(sub,"status"|"list") {return service_report(args);}
     if sub == "capacity" {return capacity_cmd(args);}
-    if sub=="complete-stop" {
+    if matches!(sub,"complete-stop"|"complete-legacy") {
         platform::service_log();
         if args.pos.len()!=2||args.all("request").len()!=1||args.flags.keys().any(|key|!["request","json"].contains(&key.as_str())) {return Err("usage: taskq service complete-stop --request ID [--json]".into());}
-        let result=lifecycle::complete_stop(&platform::default_install(),args.need("request")?)?;
+        let result=if sub=="complete-legacy" {host::complete_legacy(&platform::default_install(),args.need("request")?)?;json!({"id":args.need("request")?,"state":"legacy-retired"})}
+            else{lifecycle::complete_stop(&platform::default_install(),args.need("request")?)?};
         if args.flags.contains_key("json") {println!("{result}");}return Ok(());
     }
     if matches!(sub,"restart"|"stop"|"uninstall") {
@@ -1764,7 +1803,17 @@ fn service(args: &Args) -> Res<()> {
         return Ok(());
     }
     if sub == "run" {
+        if std::env::var_os("TASKQ_ATTEMPT").is_some() {return Err("a worker cannot run the host service".into());}
         let install=platform::default_install();
+        let mut reported=String::new();
+        loop {
+            match host_control::legacy_owner(&platform::tool(&install)) {
+                Ok(Some(owner))=>return legacy_service(&install,&owner),
+                Ok(None)=>break,
+                Err(error)=>if reported!=error {log!("{error}; native service scope unknown, launches held");reported=error;},
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
         let in_install=std::env::current_dir().and_then(|p|p.canonicalize()).ok()
             .zip(install.canonicalize().ok()).is_some_and(|(cwd,install)|cwd==install);
         if !in_install {
@@ -1817,19 +1866,7 @@ fn service(args: &Args) -> Res<()> {
         "recover" => recover_cmd(&root, args.flags.contains_key("apply"), args.flags.contains_key("json")),
         "install" => {
             let (cfg, _) = load(&root)?;
-            let u = platform::unit(&platform::tool(&cfg.install), &root, &project_name(&root));
-            if sub == "install" {
-                let edit=host::ProjectEdit::new(&cfg.install,&root,true)?;
-                let off = install_focus(&root)?;
-                platform::install_self(&platform::tool(&cfg.install))?;
-                platform::write_unit(&u)?;
-                let handover = load_unit(&u, &root)?;
-                edit.commit().map_err(|e|format!("unit prepared; project registration unknown: {e}"))?;
-                println!("installed {}{}", u.path.display(), if handover { "; live children kept: the running service re-execs" } else { "" });
-                if off {
-                    println!("Focus: off; nothing admitted until `taskq service focus all|<label..>`");
-                }
-            }
+            println!("{}",host::install_project(&cfg.install,&root)?);
             Ok(())
         }
         _ => Err("usage: taskq service install|run|focus|pause|resume|capacity|permissions|hold|release|recover|status|restart|stop|uninstall|list".into()),
@@ -2570,9 +2607,9 @@ fn application() {
         coreq::launcher::launch(&t, &args);
     }
     #[cfg(target_os = "macos")]
-    if let Some(i) = args.is_empty().then(|| exe.as_deref().and_then(bundled_tray)).flatten() {
-        profile::init(&i);
-        if let Err(e) = tray(i, None, &[], None) {
+    if args.is_empty()&&exe.as_deref().is_some_and(|exe|bundled_tray(exe,&install)) {
+        profile::init(&install);
+        if let Err(e) = tray(install, None, &[], None) {
             platform::die(&e);
         }
         return;
@@ -2749,7 +2786,7 @@ mod tests {
         }
     }
 
-    // Chain: § 5 CLI arguments. Risk: stray words silently dropped from a command.
+    // Chain: § 5 CLI arguments. Risk: stray words or a consumed scope/JSON flag change the requested command.
     #[test]
     fn unused_positionals_are_rejected() {
         let parse = |v: &[&str]| Args::parse(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
@@ -2762,6 +2799,16 @@ mod tests {
         assert_eq!(parse(&["add", "T", "--goal", "G", "--acceptance", "A", "--acceptance", "B"]).unwrap().all("acceptance"), vec!["A", "B"]);
         for v in [vec!["close", "1", "2"], vec!["answer", "1.1", "2.1"], vec!["service", "focus", "code", "docs"]] {
             assert!(parse(&v).is_ok());
+        }
+        for flags in [vec!["--host"],vec!["--host","--json"],vec!["--json","--host","--request","original-id"]] {
+            let mut v=vec!["service","uninstall"];v.extend_from_slice(&flags);
+            let parsed=parse(&v).unwrap();
+            assert_eq!(parsed.one("host"),Some(""),"host uninstall scope consumed another option");
+            assert_eq!(parsed.flags.contains_key("json"),flags.contains(&"--json"));
+            if flags.contains(&"--request") {assert_eq!(parsed.one("request"),Some("original-id"));}
+        }
+        for v in [vec!["service","capacity","--host","fixture-host"],vec!["add","T","--host","fixture-host"]] {
+            assert_eq!(parse(&v).unwrap().one("host"),Some("fixture-host"),"host-name option lost its value");
         }
     }
 
@@ -3506,6 +3553,8 @@ mod tests {
         }
         let checkpoint=fs::read_to_string(kids_path(&c.install,&root).unwrap()).unwrap();
         adopt(&mut s,&c.install,&root).unwrap();
+        adopt(&mut s,&c.install,&root).unwrap();
+        assert_eq!(s.kids.len(),1,"retry after partial recovery retains the same native handle");
         assert_eq!(s.kids[0].execution,execution); assert_eq!(s.delivered(a),a);
         let pid=s.kids[0].proc.id();
         if cold=="live" && !cfg!(any(target_os="macos",target_os="linux")) {
@@ -3558,24 +3607,16 @@ mod tests {
         while !root.join("exit").exists() { assert!(Instant::now()<until); std::thread::sleep(Duration::from_millis(10)); }
     }
 
-    // Chain: service install, § 8 step 3 kids file, adoption. Risk: an install from a project with a live child ends it
+    // § 8 re-exec preserves native CLI identity and defers for app/operator ownership; no unit reload path remains.
     #[cfg(unix)]
     #[test]
-    fn install_with_a_live_child_keeps_it_through_reexec_and_adoption() {
+    fn live_child_survives_reexec_preparation_and_native_adoption() {
         use runtime::Proc;
         let root = std::env::temp_dir().join(format!("taskq-install-live-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(dot(&root)).unwrap();
-        let child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
         let pid = child.id();
-        // the unit reload stands for launchctl bootout: it ends the service's process tree, the child included
-        let reloaded = root.join("reloaded");
-        let u = platform::Unit { path: root.join("unit"), text: String::new(), stop: vec![],
-            unload: vec![vec!["kill".into(), "-9".into(), pid.to_string()]],
-            load: vec![vec!["touch".into(), reloaded.display().to_string()]] };
-        fs::write(dot(&root).join("status.json"), format!(r#"{{"kids": [{{"task": 7, "attempt": 41, "rt": "claude", "pid": {pid}}}]}}"#)).unwrap();
-        assert!(load_unit(&u, &root).unwrap(), "live child: hand over");
-        assert!(dot(&root).join("restart").exists() && !reloaded.exists(), "the running service re-execs; no reload");
         let mut adopted = runtime::Adopted::new(coreq::process::identity(pid).unwrap().unwrap());
         let mut wrong=coreq::process::identity(pid).unwrap().unwrap(); wrong.started.push_str("-wrong");
         let mut wrong=runtime::Adopted::new(wrong);
@@ -3604,33 +3645,21 @@ mod tests {
         fs::write(operator::dir(&root).join("1.json"), "{}").unwrap();
         fs::write(operator::answer_path(&root, "1"), r#"{"state":"running"}"#).unwrap();
         reexec(&s, &c).unwrap();
-        assert!(dot(&root).join("restart").exists() && handover(&root));
+        assert!(dot(&root).join("restart").exists());
         assert_eq!(lifecycle_waits(&s, &root, false), ["ownership unknown","operator"]);
         fs::write(operator::answer_path(&root, "1"), r#"{"state":"result"}"#).unwrap();
-        // an idle service reloads the unit, which would end a child
-        fs::write(dot(&root).join("status.json"), r#"{"kids": []}"#).unwrap();
-        assert!(!load_unit(&u, &root).unwrap() && reloaded.exists());
-        std::thread::sleep(Duration::from_millis(200));
-        assert!(adopted.exited().is_ok_and(|c| c.is_some()), "a reload ends it");
+        coreq::process::terminate(&coreq::process::identity(pid).unwrap().unwrap()).unwrap();
+        child.wait().unwrap();
         let _ = fs::remove_dir_all(&root);
     }
 
-    // Chain: service install and the § 8 step 3 handover. Risk: a reinstall or a corrupt kids file ends live children
+    // § 8 recovery: corrupt/legacy identities stay unknown and preserved; no timestamp can discard them.
     #[test]
-    fn install_hands_live_children_over_and_corrupt_kids_stay() {
+    fn native_recovery_preserves_corrupt_and_legacy_evidence() {
         let root = std::env::temp_dir().join(format!("taskq-handover-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(dot(&root)).unwrap();
-        assert!(!handover(&root), "no service: reload");
         let st = dot(&root).join("status.json");
-        fs::write(&st, r#"{"kids": []}"#).unwrap();
-        assert!(!handover(&root), "idle service: reload");
-        fs::write(&st, r#"{"kids": [{"task": 7, "attempt": 41, "rt": "claude", "pid": 1}]}"#).unwrap();
-        assert!(handover(&root), "live children: re-exec");
-        fs::write(&st, "{\"kids\": [").unwrap();
-        assert!(handover(&root), "unknown keeps them");
-        fs::File::options().write(true).open(&st).unwrap().set_modified(SystemTime::now() - Duration::from_secs(120)).unwrap();
-        assert!(!handover(&root), "a stale status.json: no running service");
         let kids = kids_path(&root,&root).unwrap(); fs::create_dir_all(kids.parent().unwrap()).unwrap();
         assert!(kids_file(&root,&root).unwrap().is_empty());
         let legacy=dot(&root).join("kids"); fs::write(&legacy,"untrusted project recovery record").unwrap();

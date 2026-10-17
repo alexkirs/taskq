@@ -1,5 +1,6 @@
 //! Source-process fixture: real CLI -> host re-exec -> native generation -> original durable receipts.
 //! No board, model, native service unit, grant or installed host is used. Windows' parent supplies exit75 restart.
+//! Unix native inventory reads are substituted; real manager behavior has separate adapter checks.
 use std::{fs,io::{Read,Write},net::{TcpListener,TcpStream},path::Path,process::{Child,Command,Stdio},sync::{Arc,atomic::{AtomicBool,AtomicUsize,Ordering}},time::{Duration,Instant,SystemTime,UNIX_EPOCH}};
 use serde_json::Value;
 
@@ -31,6 +32,11 @@ fn command(install:&Path,proxy:&Proxy,cwd:&Path,args:&[&str])->Command {
     c.args(args).current_dir(cwd).env("TASKQ_INSTALL",install)
         .env_remove("TASKQ_ROOT").env_remove("TASKQ_ATTEMPT").env_remove("TASKQ_TASK").env_remove("COREQ_TRACE_CONTEXT")
         .env("TASKQ_INCIDENT_REPORTS","off").env("TASKQ_SELFTEST_OFFLINE","1").env("CURL_HOME",cwd).env("NO_PROXY","").env("no_proxy","");
+    #[cfg(unix)] {
+        let base=install.parent().unwrap();
+        let paths=std::iter::once(base.join("bin")).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())).collect::<Vec<_>>();
+        c.env("HOME",base.join("home")).env("PATH",std::env::join_paths(paths).unwrap());
+    }
     for key in ["HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","http_proxy","https_proxy","all_proxy"] {c.env(key,&proxy.url);}c
 }
 fn run(install:&Path,proxy:&Proxy,cwd:&Path,args:&[&str])->Value {
@@ -45,6 +51,16 @@ fn real_host_restart_preserves_request_after_the_caller_exits() {
     let base=std::env::temp_dir().join(format!("taskq-restart-native-{}-{nonce}",std::process::id()));
     let install=base.join("install");let outside=base.join("outside");let proxy=Proxy::new();
     for dir in [&install,&outside] {fs::create_dir_all(dir).unwrap();}
+    #[cfg(unix)] {
+        use std::os::unix::fs::PermissionsExt;
+        for name in ["home","bin"] {fs::create_dir(base.join(name)).unwrap();}
+        let name=if cfg!(target_os="macos") {"launchctl"}else{"systemctl"};
+        let expected=if cfg!(target_os="macos") {"[ \"$#\" = 2 ] && [ \"$1\" = print ] && [ \"$2\" = gui/$(id -u) ]"}
+            else {"[ \"$*\" = '--user list-units --all --plain --no-legend --no-pager' ]"};
+        let path=base.join("bin").join(name);
+        fs::write(&path,format!("#!/bin/sh\n{expected} || exit 64\nprintf 'read\\n' >> \"$0.calls\"\n")).unwrap();
+        fs::set_permissions(path,fs::Permissions::from_mode(0o700)).unwrap();
+    }
     fs::write(install.join("projects"),"").unwrap();fs::write(install.join("host.json"),"{}").unwrap();
     let warm=run(&install,&proxy,&outside,&["service","status","--json"]);assert_eq!(warm["service"]["state"],"unknown");
     let log=base.join("service.log");
@@ -120,6 +136,10 @@ fn real_host_restart_preserves_request_after_the_caller_exits() {
     let until=Instant::now()+Duration::from_secs(20);
     while proxy.hits.load(Ordering::Acquire)<2 {
         assert!(Instant::now()<until,"both service generations must reach the owned rejecting proxy");std::thread::sleep(Duration::from_millis(10));
+    }
+    #[cfg(unix)] {
+        let name=if cfg!(target_os="macos") {"launchctl.calls"}else{"systemctl.calls"};
+        assert!(fs::read_to_string(base.join("bin").join(name)).unwrap().lines().count()>=2,"each source generation must use only the owned inventory substitute");
     }
     drop(owner);fs::remove_dir_all(&base).unwrap_or_else(|e|panic!("fixture cleanup {}: {e}",base.display()));
     println!("Native host restart: source generation {} -> {}; original request/trace and all three durable receipts retained",original["instance"],current["instance"]);

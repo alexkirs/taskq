@@ -245,6 +245,9 @@ pub struct Kid {
 
 pub struct Service<'a> {
     pub host: Option<crate::host::Shared>,
+    /// A verified legacy native owner drains its own attempts without claiming a new worker/reviewer.
+    pub legacy_handoff:bool,
+    pub legacy_prepared:bool,
     pub board: &'a dyn Board,
     pub cfg: Config,
     pub version: String,
@@ -554,7 +557,7 @@ pub fn record(path: &std::path::Path, now: i64, moves: &[(u64, &str, u64)]) -> R
 impl<'a> Service<'a> {
     pub fn new(board: &'a dyn Board, cfg: &'a Config, version: &str, start: Box<dyn FnMut(&Launch) -> Result<Box<dyn Proc>, crate::runtime::StartError> + 'a>) -> Self {
         let cap = Ok(Capacity::fixed(cfg.limits.clone(), GATE_DEFAULT));
-        Service { recovery_after: None, reduced_at: None, host: None, wall: 0, reserved: vec![], requested: vec![], refused: None, host_used: None, board, cfg: cfg.clone(), version: version.into(), kids: vec![], instance: String::new(), machine: String::new(), focus: vec![], focus_error: None, delivered: HashMap::new(), cache: HashMap::new(), deps: HashMap::new(), label_fixes: HashMap::new(), pruned: HashSet::new(), start, recover: None, #[cfg(test)] agent_status: json!([]), log: vec![], snapshot: None, tasks_read: None, ownership_known: false, host_issue: None, observations: BTreeMap::new(), owner_comments: vec![], seen: HashMap::new(), gone_after: None, moved_after: None, events_since: None, cap, gate: Gate::default(), mono: 0, held: vec![], pending: BTreeSet::new(), hold: None, refused_access: BTreeMap::new(), unknown: HashMap::new(), execution_waits: BTreeMap::new(), pending_releases: BTreeSet::new(), stopping: BTreeSet::new(), begun: HashMap::new(), asked: HashMap::new(), sessions: HashMap::new() }
+        Service { recovery_after: None, reduced_at: None, host: None, legacy_handoff:false, legacy_prepared:false, wall: 0, reserved: vec![], requested: vec![], refused: None, host_used: None, board, cfg: cfg.clone(), version: version.into(), kids: vec![], instance: String::new(), machine: String::new(), focus: vec![], focus_error: None, delivered: HashMap::new(), cache: HashMap::new(), deps: HashMap::new(), label_fixes: HashMap::new(), pruned: HashSet::new(), start, recover: None, #[cfg(test)] agent_status: json!([]), log: vec![], snapshot: None, tasks_read: None, ownership_known: false, host_issue: None, observations: BTreeMap::new(), owner_comments: vec![], seen: HashMap::new(), gone_after: None, moved_after: None, events_since: None, cap, gate: Gate::default(), mono: 0, held: vec![], pending: BTreeSet::new(), hold: None, refused_access: BTreeMap::new(), unknown: HashMap::new(), execution_waits: BTreeMap::new(), pending_releases: BTreeSet::new(), stopping: BTreeSet::new(), begun: HashMap::new(), asked: HashMap::new(), sessions: HashMap::new() }
     }
 
     /// Rebuild board-derived state after unwind; live handles, pending launches and delivery cursors stay owned.
@@ -739,6 +742,11 @@ impl<'a> Service<'a> {
     /// Admission of one launch (§ 3): the load gate, then under Auto a reservation from the host authority, which
     /// refuses with a reason; the request stays `requested`. Fixed admits as before.
     fn reserve(&mut self, task: u64, attempt: u64, rt: &str) -> bool {
+        if self.legacy_prepared||self.legacy_handoff&&attempt==0 {
+            tracing::info!(coreq_refusal="handoff");
+            self.refused=Some(("handoff","legacy service draining; no new attempt claims".into()));
+            return false;
+        }
         if !self.may_launch() {
             return false;
         }
@@ -811,6 +819,10 @@ impl<'a> Service<'a> {
             Err(e) => ("unknown", vec![("config", e.clone())]),
             Ok(_) => self.gate.state(self.mono),
         };
+        if self.legacy_handoff {
+            if matches!(gate,"open"|"off") {gate="held";}
+            reasons.insert(0,("handoff","legacy service draining; owned attempts remain supervised".into()));
+        }
         if let Some(h) = &self.hold {
             (gate, reasons) = ("held", [vec![("hold", h.clone())], reasons].concat());
         }
@@ -1295,6 +1307,11 @@ impl<'a> Service<'a> {
         if pending != self.pending {
             self.pending = pending;
             self.beat()?;
+        }
+        if self.legacy_handoff {
+            self.unready();
+            tracing::info!(coreq_refusal="handoff");
+            return Ok(());
         }
         if self.focus.is_empty() {
             tracing::info!(coreq_refusal = "focus");
@@ -3383,6 +3400,49 @@ mod tests {
         s.pass().unwrap();
         assert!(task(&b, n1).attempt.is_some_and(|a| a != a1) && task(&b, n3).state == State::Doing);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // H-A5: legacy Fixed/Auto drain forbids new workers/reviewers, but preserves and resumes its existing attempt.
+    #[test]
+    fn legacy_handoff_preserves_owned_answers_and_blocks_new_claims() {
+        let b=Fake::default();let n=b.create("Owned","",&[TASK_LABEL.into()]).unwrap();
+        let mut c=cfg("mac");c.limits.insert("claude".into(),3);
+        let exits:Exits=Default::default();let mut s=service(&b,&c,exits.clone());
+        s.pass().unwrap();let attempt=task(&b,n).attempt.unwrap();
+        s.legacy_handoff=true;
+        let ready=b.create("New worker","",&[TASK_LABEL.into()]).unwrap();
+        let review=b.create("New reviewer","",&[TASK_LABEL.into()]).unwrap();
+        let previous=b.comment(review,"taskq: spawn worker codex:invented mac").unwrap();
+        b.comment(review,&core::entry("result",&["0123456789abcdef0123456789abcdef01234567"],Some(previous),"candidate")).unwrap();
+        release_execution(&b,review,previous,previous,"exit").unwrap();
+        s.pass().unwrap();
+        assert_eq!(exits.borrow().len(),1,"handoff must refuse fresh worker and reviewer claims even with spare Fixed capacity");
+        assert_eq!(task(&b,ready).state,State::Ready);assert_eq!(task(&b,review).attempt,None);
+        b.comment(n,&core::entry("ask",&[],Some(attempt),"Choose?\n1. x ★\n2. y")).unwrap();
+        b.comment(n,&core::entry("answer",&["1"],None,"x")).unwrap();
+        *exits.borrow()[0].1.borrow_mut()=Some(0);s.pass().unwrap();
+        assert_eq!(exits.borrow().len(),2,"the same owned attempt must still receive its answer");
+        assert_eq!((task(&b,n).state,task(&b,n).attempt,task(&b,n).retries),(State::Doing,Some(attempt),0));
+        *exits.borrow()[1].1.borrow_mut()=Some(-999);s.pass().unwrap();
+        assert!(!s.idle());assert!(s.retained_attempts().contains(&attempt));
+        assert!(s.capacity_json()["reasons"].as_array().unwrap().iter().any(|r|r["code"]=="handoff"));
+        assert_eq!(task(&b,ready).state,State::Ready);assert_eq!(task(&b,review).attempt,None);
+    }
+
+    // H-A5: ready is a latch; an answer arriving after preparation belongs to the future host owner.
+    #[test]
+    fn prepared_legacy_drain_defers_late_answers_without_replaying_work() {
+        let b=Fake::default();let n=b.create("Owned","",&[TASK_LABEL.into()]).unwrap();let c=cfg("mac");
+        let exits:Exits=Default::default();let mut s=service(&b,&c,exits.clone());s.pass().unwrap();
+        let attempt=task(&b,n).attempt.unwrap();s.legacy_handoff=true;
+        b.comment(n,&core::entry("ask",&[],Some(attempt),"Choose?\n1. x ★\n2. y")).unwrap();
+        *exits.borrow()[0].1.borrow_mut()=Some(0);s.pass().unwrap();assert!(s.idle());
+        s.legacy_prepared=true;
+        b.comment(n,&core::entry("answer",&["1"],None,"x")).unwrap();
+        for _ in 0..3 {s.pass().unwrap();}
+        assert_eq!(exits.borrow().len(),1,"prepared service cannot resume after its drain proof");
+        assert_eq!(task(&b,n).attempt,Some(attempt));assert_eq!(task(&b,n).retries,0);
+        assert!(entries(&b,n).unwrap().iter().any(|entry|entry.body.starts_with("taskq: answer")),"input remains on the board for the new host");
     }
 
     // Chain: § 2 early answer. Risk: an early answer marks the attempt gone.

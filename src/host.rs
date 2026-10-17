@@ -329,12 +329,17 @@ fn replace_owned(path:&Path, original:&str, next:&str)->Res<()> {
     result.map_err(|e:String|format!("{} write uncertain: {e}",path.display()))
 }
 
+// The atomic registry publisher reserves projects.pending for its own bytes.
+pub(crate) const INSTALL_PENDING:&str="projects.installing";
+
 pub type Shared = Arc<Mutex<Host>>;
 type Slot = (PathBuf, u64, u64);
 fn slot(project: &Path, task: u64, attempt: u64) -> Slot {
     // Before claim there is no fencing token; only that provisional slot uses the issue number.
     (project.into(), if attempt == 0 { task } else { 0 }, attempt)
 }
+pub enum Maintenance {Update(Option<String>),Installation(String),Inventory(Res<Vec<String>>)}
+
 pub struct Host {
     pub instance: String,
     pub policy: Res<Policy>,
@@ -354,7 +359,7 @@ pub struct Host {
     pub busy: BTreeMap<PathBuf, bool>,
     pub prepared: BTreeSet<PathBuf>,
     pub recovered: BTreeSet<PathBuf>,
-    pub updating:Option<std::thread::JoinHandle<Res<Option<String>>>>,
+    pub updating:Option<std::thread::JoinHandle<Res<Maintenance>>>,
     pub draining: BTreeSet<PathBuf>,
     pub request_since: u64,
     pub hour_start: BTreeMap<String, u64>,
@@ -491,6 +496,7 @@ struct ServiceRecord {
     #[serde(default)] restart_protocol:Option<u8>,
     #[serde(default)] stop_protocol:Option<u8>,
     #[serde(default)] uninstall_protocol:Option<u8>,
+    #[serde(default)] install_protocol:Option<u8>,
 }
 enum OwnerRecord { Legacy(u32), Current(ServiceRecord) }
 
@@ -510,14 +516,14 @@ fn service_record(install:&Path)->Res<Option<OwnerRecord>> {
     }
     let r:ServiceRecord=serde_json::from_str(&text).map_err(|_|"host service owner unknown: malformed record")?;
     if r.schema!=1||r.pid==0||r.pid>i32::MAX as u32||r.started.is_empty()||r.started.len()>128
-        ||!r.started.bytes().all(|c|c.is_ascii_alphanumeric()||c==b'-')||!crate::resources::id(&r.instance)||r.version.is_empty()||r.version.len()>80||r.restart_protocol.is_some_and(|v|v!=1)||r.stop_protocol.is_some_and(|v|v!=1)||r.uninstall_protocol.is_some_and(|v|v!=1) {
+        ||!r.started.bytes().all(|c|c.is_ascii_alphanumeric()||c==b'-')||!crate::resources::id(&r.instance)||r.version.is_empty()||r.version.len()>80||r.restart_protocol.is_some_and(|v|v!=1)||r.stop_protocol.is_some_and(|v|v!=1)||r.uninstall_protocol.is_some_and(|v|v!=1)||r.install_protocol.is_some_and(|v|v!=1) {
         return Err("host service owner unknown: unsupported record; kept".into());
     }
     Ok(Some(OwnerRecord::Current(r)))
 }
 
 fn publish_service(install:&Path,native:&coreq::process::Identity,instance:&str)->Res<()> {
-    let record=ServiceRecord {schema:1,pid:native.pid,started:native.started.clone(),instance:instance.into(),at:wall()?,version:crate::platform::VERSION.into(),restart_protocol:Some(1),stop_protocol:Some(1),uninstall_protocol:Some(1)};
+    let record=ServiceRecord {schema:1,pid:native.pid,started:native.started.clone(),instance:instance.into(),at:wall()?,version:crate::platform::VERSION.into(),restart_protocol:Some(1),stop_protocol:Some(1),uninstall_protocol:Some(1),install_protocol:Some(1)};
     crate::platform::write_atomic(&install.join("service"),&(serde_json::to_string(&record).map_err(|e|e.to_string())?+"\n"))
 }
 
@@ -525,10 +531,10 @@ fn publish_service(install:&Path,native:&coreq::process::Identity,instance:&str)
 pub fn other(install: &Path) -> Res<Option<u32>> {
     match service_record(install)? {
         None=>Ok(None),
-        Some(OwnerRecord::Legacy(pid))=>Ok((pid!=std::process::id()&&crate::runtime::liveness(pid)?).then_some(pid)),
+        Some(OwnerRecord::Legacy(pid))=>Ok((pid!=std::process::id()&&crate::runtime::liveness(pid)?&&!installation::legacy_projection(install,pid,None)?).then_some(pid)),
         Some(OwnerRecord::Current(r))=> {
             let live=coreq::process::identity(r.pid).map_err(|e|format!("host service owner unknown: {e}"))?;
-            Ok((r.pid!=std::process::id()&&live.as_ref().is_some_and(|p|p.started==r.started)).then_some(r.pid))
+            Ok((r.pid!=std::process::id()&&live.as_ref().is_some_and(|p|p.started==r.started)&&!installation::legacy_projection(install,r.pid,Some(&r.started))?).then_some(r.pid))
         }
     }
 }
@@ -543,7 +549,7 @@ pub fn service_status(install:&Path)->Value {
         let age=wall()?.checked_sub(r.at);
         let fresh=live&&age.is_some_and(|age|age<=60);
         Ok(json!({"state":if live {"running"}else{"exited"},"pid":r.pid,"started":r.started,"instance":r.instance,"version":r.version,
-            "at":r.at,"age_seconds":age,"fresh":fresh,"restart_protocol":r.restart_protocol,"stop_protocol":r.stop_protocol,"uninstall_protocol":r.uninstall_protocol,"reason":if !live {Some("recorded host process exited; worker outcomes remain separate")}else if !fresh {Some("host observation stale or clock unknown")}else{None}}))
+            "at":r.at,"age_seconds":age,"fresh":fresh,"restart_protocol":r.restart_protocol,"stop_protocol":r.stop_protocol,"uninstall_protocol":r.uninstall_protocol,"install_protocol":r.install_protocol,"reason":if !live {Some("recorded host process exited; worker outcomes remain separate")}else if !fresh {Some("host observation stale or clock unknown")}else{None}}))
     },|_|"owner-unknown");
     result.unwrap_or_else(|reason|json!({"state":"unknown","fresh":false,"reason":reason}))
 }
@@ -569,7 +575,8 @@ pub fn project_service(root: &Path) -> Res<Option<u32>> {
     }
 }
 
-fn legacy(roots: &[PathBuf]) -> Res<()> {
+fn legacy(install:&Path,roots: &[PathBuf]) -> Res<()> {
+    if !installation::legacy_definitions(install)?.is_empty() {return Err("handoff: legacy native definitions remain; host admission held".into());}
     for root in roots {
         if project_service(root)?.is_some() { return Err("handoff: legacy service still running".into()); }
     }
@@ -594,6 +601,13 @@ fn owner(install:&Path)->Res<Option<coreq::file_lock::Lock>> {
     }
 }
 
+fn native_inventory_ready(inventory:&Res<Vec<String>>,checked:Option<Instant>)->Res<()> {
+    let names=inventory.as_ref().map_err(Clone::clone)?;
+    if let Some(name)=names.first() {return Err(format!("handoff: {} native legacy unit(s) remain, including {}",names.len(),crate::compact(name,128)));}
+    if checked.is_none_or(|at|at.elapsed().as_secs()>=60) {return Err("native legacy inventory stale; host admission held".into());}
+    Ok(())
+}
+
 pub fn run(install: &Path) -> Res<()> {
     fs::create_dir_all(install).map_err(|e| e.to_string())?;
     let mut reported=String::new();
@@ -615,6 +629,10 @@ pub fn run(install: &Path) -> Res<()> {
     let mut stopped = BTreeSet::new();
     let mut drained_roots = BTreeSet::new();
     let mut checked: Option<Instant> = None;
+    let mut installation_checked:Option<Instant>=None;
+    let mut native_checked:Option<Instant>=None;
+    let mut native_legacy:Res<Vec<String>>=Err("native legacy inventory pending; host admission held".into());
+    let mut maintenance_result=String::new();
     let began = Instant::now();
     let mut hour = (Instant::now(), crate::requests::totals());
     let mut tray = None;
@@ -629,14 +647,14 @@ pub fn run(install: &Path) -> Res<()> {
         registry.refresh(install, began.elapsed().as_secs());
         restart.refresh(install);
         roots.clone_from(&registry.roots);
-        let old = legacy(&roots);
+        let old = legacy(install,&roots).and_then(|_|native_inventory_ready(&native_legacy,native_checked));
         let policy = match &old { Ok(()) => migrate(install, &roots).and_then(|_| Policy::read(install)), Err(e) => Err(e.clone()) };
         let removal=restart.current.as_ref().ok().and_then(Option::as_ref).and_then(|p|p.removal().map(Path::to_path_buf));
         drained_roots.retain(|root|removal.as_ref()==Some(root));
         {
             let mut h = shared.lock().unwrap_or_else(|e| e.into_inner());
             h.reload(policy);
-            h.held = registry.error.clone().or_else(|| old.as_ref().err().cloned()).or_else(||restart.current.as_ref().err().cloned())
+            h.held = installation::admission_reason(install).or_else(||registry.error.clone()).or_else(|| old.as_ref().err().cloned()).or_else(||restart.current.as_ref().err().cloned())
                 .or_else(||publication.as_ref().map(|e|format!("host publication unavailable: {e}")));
             if let Some(p)=restart.current.as_ref().ok().and_then(Option::as_ref) {
                 if p.stops() {
@@ -673,7 +691,7 @@ pub fn run(install: &Path) -> Res<()> {
                             Ok(crate::Ctx { cfg, raw, board })
                         });
                         match context {
-                            Ok(c) => return crate::service_run(&c, Some(host)),
+                            Ok(c) => return crate::service_run(&c, Some(host),None),
                             Err(e) => {
                                 if let Ok(mut h) = host.lock() {
                                     // No board/native reconciliation exists while configuration is invalid.
@@ -741,18 +759,38 @@ pub fn run(install: &Path) -> Res<()> {
         }
         let timers = h.policy.as_ref().map(|p| (p.update_every, p.rollback_after)).unwrap_or((60, 600));
         if h.updating.as_ref().is_some_and(|job|job.is_finished()) {
-            let updated=h.updating.take().unwrap().join().unwrap_or_else(|_|Err("host update panicked; partial effects unknown".into()));
-            let text=match &updated {Ok(Some(v))=>format!("update: {v}"),Ok(None)=>"update: up to date".into(),Err(e)=>format!("update: {e}")};
-            crate::platform::log(&text);for root in &roots {append_project(install,root,&text);}
-            if crate::installed(install)&&matches!(updated,Ok(Some(_))) {h.restart=true;}
+            let updated=h.updating.take().unwrap().join().unwrap_or_else(|_|Err("host maintenance panicked; partial effects unknown".into()));
+            if let Ok(Maintenance::Inventory(result))=&updated {native_legacy=result.clone();}
+            let text=match &updated {Ok(Maintenance::Update(Some(v)))=>format!("update: {v}"),Ok(Maintenance::Update(None))=>"update: up to date".into(),Ok(Maintenance::Installation(result))=>format!("installation: {result}"),Ok(Maintenance::Inventory(Ok(names)))=>format!("native legacy inventory: {} unit(s)",names.len()),Ok(Maintenance::Inventory(Err(e)))=>format!("native legacy inventory unknown: {e}"),Err(e)=>format!("maintenance: {e}")};
+            if maintenance_result!=text {crate::platform::log(&text);for root in &roots {append_project(install,root,&text);}maintenance_result=text;}
+            if crate::installed(install)&&matches!(updated,Ok(Maintenance::Update(Some(_)))) {h.restart=true;}
         }
-        let asked=!h.restart&&h.updating.is_none()&&(fs::remove_file(install.join("update")).is_ok()||roots.iter().any(|r|fs::remove_file(crate::dot(r).join("update")).is_ok()));
-        if !h.restart&&h.updating.is_none()&&(asked || checked.is_none_or(|t| t.elapsed().as_secs() >= timers.0)) {
+        if h.updating.is_none()&&native_checked.is_none_or(|at|at.elapsed().as_secs()>=if native_legacy.is_ok() {60}else{5}) {
+            native_checked=Some(Instant::now());native_legacy=Err("native legacy inventory pending; host admission held".into());
+            let install=install.to_path_buf();
+            let lifecycle_controller=restart.current.as_ref().ok().and_then(Option::as_ref).filter(|p|p.stops()&&p.prepared()).map(|p|p.id().to_string());
+            let job=coreq::telemetry::capture::operation("host.legacy.inventory.dispatch",||std::thread::Builder::new().name("taskq-native-inventory".into()).spawn(coreq::telemetry::capture::bind(move || {
+                let result=(|| {let mut controllers:Vec<_>=lifecycle_controller.into_iter().collect();controllers.extend(installation::controller_id(&install)?);crate::host_control::legacy_inventory(&crate::platform::tool(&install),&controllers)})();
+                Ok(Maintenance::Inventory(result))
+            })),|_|"spawn");
+            match job {Ok(job)=>h.updating=Some(job),Err(error)=>crate::platform::log(&format!("native inventory not started: {error}"))}
+        }
+        let transition_ready=crate::platform::transition_ready(install).is_ok();
+        if !transition_ready&&h.updating.is_none()&&installation_checked.is_none_or(|at|at.elapsed().as_secs()>=5) {
+            installation_checked=Some(Instant::now());
+            let install=install.to_path_buf();
+            let job=coreq::telemetry::capture::operation("host.install.recover.dispatch",||std::thread::Builder::new().name("taskq-install-recovery".into()).spawn(coreq::telemetry::capture::bind(move || {
+                coreq::telemetry::capture::operation("host.install.recover",||installation::recover(&install).map(Maintenance::Installation),|_|"install-pending")
+            })),|_|"spawn");
+            match job {Ok(job)=>h.updating=Some(job),Err(error)=>crate::platform::log(&format!("installation recovery not started: {error}"))}
+        }
+        let asked=transition_ready&&!h.restart&&h.updating.is_none()&&(fs::remove_file(install.join("update")).is_ok()||roots.iter().any(|r|fs::remove_file(crate::dot(r).join("update")).is_ok()));
+        if transition_ready&&!h.restart&&h.updating.is_none()&&(asked || checked.is_none_or(|t| t.elapsed().as_secs() >= timers.0)) {
             checked = Some(Instant::now());
             let install=install.to_path_buf();
             let job=coreq::telemetry::capture::operation("host.update.dispatch",||std::thread::Builder::new().name("taskq-update".into()).spawn(coreq::telemetry::capture::bind(move || {
                 coreq::telemetry::capture::operation("host.update",|| {
-                    if crate::installed(&install) {crate::platform::service_update(&install)}else{crate::platform::update(&install,true)}
+                    (if crate::installed(&install) {crate::platform::service_update(&install)}else{crate::platform::update(&install,true)}).map(Maintenance::Update)
                 },|_|"update-failed")
             })),|_|"spawn");
             match job {Ok(job)=>h.updating=Some(job),Err(error)=>crate::platform::log(&format!("update not started: {error}"))}
@@ -830,10 +868,18 @@ fn append_project(install: &Path, root: &Path, text: &str) {
 }
 
 fn project_text(install:&Path)->Res<Option<String>> {
-    match fs::symlink_metadata(install.join("projects.pending")) {
-        Ok(_)=>return Err("projects.pending retained; project membership unknown".into()),
+    let prepare=format!("{INSTALL_PENDING}.pending");
+    for name in ["projects.pending",prepare.as_str()] {
+        match fs::symlink_metadata(install.join(name)) {
+            Ok(_)=>return Err(format!("{name} retained; registry publication unknown")),
+            Err(e) if e.kind()==std::io::ErrorKind::NotFound=>{},
+            Err(e)=>return Err(format!("projects prepare unknown: {e}")),
+        }
+    }
+    match fs::symlink_metadata(install.join(INSTALL_PENDING)) {
+        Ok(_)=>return installation::registered_projects(install),
         Err(e) if e.kind()==std::io::ErrorKind::NotFound=>{},
-        Err(e)=>return Err(format!("projects prepare unknown: {e}")),
+        Err(e)=>return Err(format!("installation prepare unknown: {e}")),
     }
     let path=install.join("projects");
     match fs::read_to_string(&path) {
@@ -882,6 +928,7 @@ impl ProjectEdit {
         fs::create_dir_all(install).map_err(|e|e.to_string())?;
         let lock=coreq::file_lock::try_lock(&install.join("projects.lock")).map_err(|e|format!("project registry busy or lock unavailable: {e}"))?;
         guard()?;
+        crate::platform::transition_ready(install)?;
         let path=install.join("projects");
         let original=project_text(install)?;
         if original.is_none() && !adding {return Err(format!("{}: project registry missing; nothing changed",path.display()));}
@@ -925,6 +972,20 @@ impl ProjectEdit {
         else {crate::resources::unregister(&self.install,&self.removed,write)?;}
         crate::platform::write_atomic(&self.install.join("poke"),"").map_err(|e|format!("project registry saved; host notification unknown: {e}"))
     }
+}
+
+#[path="host_install.rs"]
+mod installation;
+pub use installation::install_project;
+pub use installation::install_acknowledgement;
+pub use installation::installation_status;
+pub use installation::{legacy_install,prepare_legacy,legacy_latched,dispatch_legacy,complete_legacy};
+
+fn installation_observed(service:&Value,status:Option<&Value>,version:&str)->bool {
+    service["state"]=="running"&&service["fresh"]==true&&service["version"]==version
+        &&service["pid"].as_u64().is_some_and(|pid|pid>0)
+        &&service["instance"].as_str().is_some_and(crate::resources::id)
+        &&status.is_some_and(|status|status["pid"]==service["pid"]&&status["host_instance"]==service["instance"])
 }
 
 #[derive(Default)]
@@ -1133,6 +1194,27 @@ impl Panics {
 mod tests {
     use super::*;
 
+    // H-A5: a busy maintenance owner cannot prolong an old native absence observation.
+    #[test]
+    fn stale_native_inventory_holds_new_work_without_releasing_owned_slots() {
+        let p=policy();let mut h=Host::new(Ok(p.clone()));
+        let root=Path::new("owned");h.sync(root,vec![(1,7,"codex".into())]);
+        let (send,receive)=std::sync::mpsc::channel();
+        h.updating=Some(std::thread::spawn(move || {receive.recv().map_err(|e|e.to_string())?;Ok(Maintenance::Update(None))}));
+        let inventory=Ok(vec![]);
+        let checked=Instant::now()-std::time::Duration::from_secs(61);
+        h.policy=native_inventory_ready(&inventory,Some(checked)).map(|_|p.clone());
+        assert!(h.reserve(root,2,8,"codex",&p.cap,true,0).unwrap_err().contains("stale"));
+        assert_eq!(h.used()["codex"],1,"missing freshness cannot release owned work");
+        assert!(!h.updating.as_ref().unwrap().is_finished());
+        send.send(()).unwrap();h.updating.take().unwrap().join().unwrap().unwrap();
+        assert!(native_inventory_ready(&inventory,None).is_err());
+        assert!(native_inventory_ready(&Err("native read denied".into()),Some(Instant::now())).unwrap_err().contains("denied"));
+        assert!(native_inventory_ready(&Ok(vec!["retained-unit".into()]),Some(Instant::now())).unwrap_err().contains("retained-unit"));
+        h.policy=native_inventory_ready(&inventory,Some(Instant::now())).map(|_|p.clone());
+        assert!(h.reserve(root,2,8,"codex",&p.cap,true,0).is_ok());
+    }
+
     // H-A4/H-A5: first launch waits for every project's occupancy, including unknown native ownership.
     #[test]
     fn cold_host_accounts_every_project_before_admission() {
@@ -1176,7 +1258,7 @@ mod tests {
         assert!(h.begin_pass(&a));assert!(!h.prepared.contains(&a));
         h.prepared.insert(a.clone());h.prepared.insert(b.clone());
         let (send,receive)=std::sync::mpsc::channel();
-        h.updating=Some(std::thread::spawn(move || {receive.recv().map_err(|e|e.to_string())?;Ok(None)}));
+        h.updating=Some(std::thread::spawn(move || {receive.recv().map_err(|e|e.to_string())?;Ok(Maintenance::Update(None))}));
         assert!(!h.handoff_ready(),"an update owner must finish before image replacement");
         assert!(h.begin_pass(&a),"projects keep heartbeat/native monitoring while the update waits");
         h.prepared.insert(a);send.send(()).unwrap();h.updating.take().unwrap().join().unwrap().unwrap();assert!(h.handoff_ready());
@@ -1193,6 +1275,43 @@ mod tests {
     }
     fn policy() -> Policy {
         Policy::parse(json!({"limits": {"codex": 2}, "admission": {"max": 2}, "load_gate": {"enabled": false}}), "invented").unwrap()
+    }
+
+    // H-A5: native owner + exact host generation acknowledge install; project PID or freshness alone cannot.
+    #[test]
+    fn installation_observed_requires_current_native_owner_and_project_generation() {
+        let service=json!({"state":"running","fresh":true,"version":crate::platform::VERSION,"pid":123,"instance":"owned-host"});
+        let project=json!({"pid":123,"host_instance":"owned-host"});
+        assert!(installation_observed(&service,Some(&project),crate::platform::VERSION));
+        for (key,value) in [("state",json!("unknown")),("fresh",json!(false)),("version",json!("older")),("pid",json!(0)),("instance",json!(""))] {
+            let mut other=service.clone();other[key]=value;assert!(!installation_observed(&other,Some(&project),crate::platform::VERSION),"{key}");
+        }
+        for other in [None,Some(json!({"pid":124,"host_instance":"owned-host"})),Some(json!({"pid":123,"host_instance":"prior-host"}))] {
+            assert!(!installation_observed(&service,other.as_ref(),crate::platform::VERSION));
+        }
+    }
+
+    // H-A5: refusal precedes native installation, focus changes, release replacement and registry publication.
+    #[test]
+    fn host_install_refuses_unresolved_legacy_owner_without_effects() {
+        let base=temp("install-legacy-owner");let install=base.join("install");let root=base.join("project");
+        fs::create_dir_all(&install).unwrap();fs::create_dir_all(crate::dot(&root)).unwrap();
+        fs::write(install.join("projects"),format!("{}\n",root.display())).unwrap();
+        fs::write(crate::dot(&root).join("focus"),"retained-focus").unwrap();
+        let mut child=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","runtime::tests::stop_child","--ignored"])
+            .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+        fs::write(crate::dot(&root).join("status.json"),json!({"pid":child.id(),"kids":[{"task":7}]}).to_string()).unwrap();
+        let before=fs::read(install.join("projects")).unwrap();
+        let result=install_project(&install,&root);
+        child.kill().unwrap();child.wait().unwrap();
+        assert!(result.unwrap_err().contains("legacy project owner"));
+        assert_eq!(fs::read(install.join("projects")).unwrap(),before);
+        assert_eq!(fs::read_to_string(crate::dot(&root).join("focus")).unwrap(),"retained-focus");
+        assert!(!install.join("releases").exists()&&!install.join("poke").exists());
+        fs::write(install.join("service"),"{broken").unwrap();
+        assert!(install_project(&install,&root).unwrap_err().contains("malformed"));
+        assert_eq!(fs::read(install.join("projects")).unwrap(),before);
+        fs::remove_dir_all(base).unwrap();
     }
 
     // H-A5: one editor preserves unrelated roots/permissions, rejects interrupted state and removes canonical aliases.
@@ -1680,7 +1799,7 @@ mod tests {
         fs::write(crate::dot(&install).join("status.json"), &legacy_status).unwrap();
         assert!(startup_status(&install, &install, "invented malformed config","fixture").is_err());
         assert_eq!(fs::read_to_string(crate::dot(&install).join("status.json")).unwrap(), legacy_status, "startup failure cannot overwrite a live legacy pid");
-        assert!(legacy(&[install.clone()]).is_err());
+        assert!(legacy(&install,&[install.clone()]).is_err());
         fs::write(install.join("service"), child.id().to_string()).unwrap(); assert_eq!(other(&install).unwrap(), Some(child.id()));
         let stale=std::time::SystemTime::now()-std::time::Duration::from_secs(120);
         fs::OpenOptions::new().write(true).open(install.join("service")).unwrap()

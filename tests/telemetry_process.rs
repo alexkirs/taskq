@@ -216,6 +216,33 @@ fn commands_collect_without_configuration_and_flush_on_exit() {
             && r["observation"]["outcome"] == if success { "ok" } else { "failed" }));
         assert!(!export.to_string().contains(root.to_str().unwrap()), "host paths leaked");
         drop(store);
+        if success {
+            // Installed bootstrap must collect in the executable's root before launcher/bundle dispatch.
+            let home=root.join("home");let local=root.join("local");
+            fs::create_dir(&home).unwrap();fs::create_dir(&local).unwrap();
+            let release=install.join("releases").join(env!("CARGO_PKG_VERSION")).join(format!("taskq{}",std::env::consts::EXE_SUFFIX));
+            fs::create_dir_all(release.parent().unwrap()).unwrap();
+            fs::write(install.join("current"),env!("CARGO_PKG_VERSION")).unwrap();
+            let mut entrypoints=vec![install.join(format!("taskq{}",std::env::consts::EXE_SUFFIX)),release];
+            #[cfg(target_os="macos")]
+            entrypoints.push(install.join("TaskQ.app/Contents/MacOS/taskq"));
+            for executable in &entrypoints {
+                fs::create_dir_all(executable.parent().unwrap()).unwrap();fs::copy(env!("CARGO_BIN_EXE_taskq"),executable).unwrap();
+            }
+            fs::remove_dir_all(install.join("telemetry.log")).unwrap();
+            for executable in entrypoints {
+                let mut command=Command::new(executable);
+                command.arg("help").current_dir(&root).env_remove("TASKQ_INSTALL").env_remove("COREQ_TRACE_CONTEXT")
+                    .env("HOME",&home).env("LOCALAPPDATA",&local).env("TASKQ_ROOT",&root).env("TASKQ_INCIDENT_REPORTS","off");
+                let out=coreq::process::output("test.installed-capture",&mut command,std::time::Duration::from_secs(15)).unwrap();
+                assert!(String::from_utf8_lossy(&out.stdout).starts_with("taskq agents"));
+                let reader=coreq::telemetry::Reader::open(&install.join("telemetry.log/universal.sqlite3")).unwrap();
+                let history=reader.export(0,0,1024).unwrap();
+                assert!(history["events"].as_array().unwrap().iter().any(|r|r["observation"]["operation"]=="taskq.run"&&r["observation"]["kind"]=="method"));
+                drop(reader);fs::remove_dir_all(install.join("telemetry.log")).unwrap();
+                assert!(!home.join(".local").exists()&&!local.join("taskq").exists(),"installed bootstrap created a second installation");
+            }
+        }
         fs::remove_dir_all(root).unwrap();
     }
 }
@@ -242,7 +269,30 @@ fn selftest_requires_committed_local_capture() {
     assert!(String::from_utf8_lossy(&success.stdout).contains("telemetry: local capture committed"));
     let store=coreq::telemetry::Store::open(&good.join("telemetry.log/universal.sqlite3")).unwrap();
     assert!(!store.export(0,0,1024).unwrap()["events"].as_array().unwrap().is_empty());
-    drop(store);fs::remove_dir_all(root).unwrap();
+    drop(store);
+    #[cfg(unix)] {
+        use std::{io::Write,process::Stdio,time::{Duration,Instant}};
+        fs::write(good.join("telemetry.log/diagnostic.json"),"{broken control").unwrap();
+        let invalid_context=root.join("invalid-context");
+        for (install,context) in [(&blocked,""),(&good,""),(&invalid_context,"invalid-process-context")] {
+            // The shell waits until the reader is closed, then execs the actual product once.
+            let mut command=Command::new("/bin/sh");
+            command.args(["-c","read -r go || exit 2; exec \"$@\"","owned-capture-fixture",env!("CARGO_BIN_EXE_taskq"),"help"])
+                .current_dir(&root).env("TASKQ_INSTALL",install).env("TASKQ_ROOT",&root).env("TASKQ_INCIDENT_REPORTS","off").env_remove("COREQ_TRACE_CONTEXT")
+                .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+            if !context.is_empty() {command.env("COREQ_TRACE_CONTEXT",context);}
+            let mut child=command.spawn().unwrap();
+            drop(child.stderr.take());child.stdin.take().unwrap().write_all(b"go\n").unwrap();
+            let until=Instant::now()+Duration::from_secs(15);
+            while child.try_wait().unwrap().is_none()&&Instant::now()<until {std::thread::sleep(Duration::from_millis(10));}
+            let expired=child.try_wait().unwrap().is_none();if expired {child.kill().unwrap();}
+            let result=child.wait_with_output().unwrap();
+            assert!(!expired&&result.status.success(),"optional reporting changed ordinary help: {result:?}");
+            assert!(String::from_utf8_lossy(&result.stdout).starts_with("taskq agents"));
+        }
+        assert_eq!(fs::read_to_string(good.join("telemetry.log/diagnostic.json")).unwrap(),"{broken control");
+    }
+    fs::remove_dir_all(root).unwrap();
 }
 
 // Chain: actual maintenance CLI bypasses collector bootstrap and refuses an existing live owner.

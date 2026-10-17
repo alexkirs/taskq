@@ -1,6 +1,7 @@
 //! Product controls and read-only views over the existing collector.
 use std::{collections::BTreeMap,path::Path,time::{Duration,Instant},sync::Mutex};
 use serde_json::{Value,json};
+use std::io::Write;
 
 fn capture()->Result<coreq::telemetry::capture::Capture,String> {
     tracing::dispatcher::get_default(|d|d.downcast_ref::<coreq::telemetry::capture::Capture>().cloned())
@@ -78,7 +79,7 @@ pub fn poll(install:&Path) {
     if control.checked.is_some_and(|at|at.elapsed()<Duration::from_secs(1)) {return}
     control.checked=Some(Instant::now());
     let error=apply(install,&mut control.seen).err();
-    if error!=control.error {if let Some(error)=&error {eprintln!("Diagnostic control: unknown ({error})");}control.error=error;}
+    if error!=control.error {if let Some(error)=&error {let _=writeln!(std::io::stderr(),"Diagnostic control: unknown ({error})");}control.error=error;}
 }
 
 /// A scoped snapshot, never a claim about another process or the retained history.

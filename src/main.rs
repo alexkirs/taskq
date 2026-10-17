@@ -1382,22 +1382,20 @@ fn capacity_cmd(a: &Args) -> Res<()> {
     }
     // a write names its host explicitly (§ 5)
     let host = a.need("host")?.to_string();
-    let wrote = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    let (old,saved)=host::write_capacity(&install,&host,&e,None)?;
+    let (old,saved,command)=host::write_capacity(&install,&host,&e,None)?;
+    println!("Receipt: {}",command.event_id("observed")?);
     let changes=cap_changes(&old,&saved);
-    for root in &roots {poke(root).map_err(|e|format!("host policy saved; notification unknown: {e}"))?;}
-    // `Applied` only after a fresh service readback of the same values (R12)
+    let mut unknown=None;
     for _ in 0..20 {
-        if let Some(st) = status()
-            && st["at"].as_u64().is_some_and(|t| t >= wrote)
-            && st["capacity"]["host_policy"] == saved.json()
-        {
-            println!("Applied on {host}: {changes}; running tasks continue");
-            return Ok(());
+        match host::capacity_observed(&install,&command) {
+            Ok(true)=> {println!("Applied on {host}: {changes}; running tasks continue");return Ok(());}
+            Ok(false)=>{},
+            Err(e)=> {unknown=Some(e);break;}
         }
         std::thread::sleep(Duration::from_secs(1));
     }
     println!("Saved; waiting for host service on {host}: {changes}; running tasks continue");
+    if let Some(reason)=unknown {eprintln!("Capacity observation unknown: {reason}");}
     Ok(())
 }
 

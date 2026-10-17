@@ -34,12 +34,22 @@ fn capacity_command_changes_host_policy_not_project_settings() {
     assert!(rootless.status.success(),"host policy command required a project cwd: {}",String::from_utf8_lossy(&rootless.stderr));
     assert!(String::from_utf8_lossy(&rootless.stdout).contains("no fresh capacity status"),"future status was treated as current");
     let (status_path,policy_path,mut readback)=(root.join(".taskq/status.json"),install.join("host.json"),capacity);
+    let observer_install=install.clone();
     let publisher=std::thread::spawn(move|| {
         let until=std::time::Instant::now()+Duration::from_secs(8);
         while std::time::Instant::now()<until {
             let saved:Value=fs::read(&policy_path).ok().and_then(|b|serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
             if saved["limits"]["codex"]==3 {
+                use tracing_subscriber::prelude::*;
+                let receipt=coreq::telemetry::capture::CommandReceipt::decode(saved["_taskq_capacity_command"]["receipt"].as_str().unwrap()).unwrap();
+                let store=std::sync::Arc::new(coreq::telemetry::Store::open(&observer_install.join("telemetry.log/universal.sqlite3")).unwrap());
+                let capture=coreq::telemetry::capture::Capture::new(store.clone(),"taskq","fixture-observer").unwrap();
+                tracing::subscriber::with_default(tracing_subscriber::registry().with(capture.clone()),|| {
+                    receipt.checkpoint("applied").unwrap();receipt.checkpoint("observed").unwrap();
+                });
+                capture.flush().unwrap();drop(capture);drop(store);
                 readback["host_policy"]["limits"]["codex"]=json!(3);
+                readback["host_command"]=json!(receipt.event_id("observed").unwrap());
                 let at=SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
                 fs::write(status_path,json!({"host":"fixture-host","at":at,"capacity":readback}).to_string()).unwrap();
                 return;
@@ -55,6 +65,7 @@ fn capacity_command_changes_host_policy_not_project_settings() {
     assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
     assert!(String::from_utf8_lossy(&output.stdout).contains("Applied"),"host policy readback was confused with the narrowing project cap");
     assert_eq!(saved["limits"]["codex"],3,"CLI edited a different policy than the host service reads");
+    assert!(saved["_taskq_capacity_command"]["receipt"].is_string(),"equal values were reported Applied without an exact retained command binding");
     assert_eq!(after,project,"host edit changed narrowing project settings");
     assert_eq!(saved["codex"],json!(["-s","workspace-write"]));assert_eq!(saved["owner_field"],"host-private");
     let read=run(&["service","capacity"]);assert!(read.status.success());

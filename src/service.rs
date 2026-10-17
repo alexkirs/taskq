@@ -750,10 +750,10 @@ impl<'a> Service<'a> {
             *used.entry(rt).or_default() += 1;
         }
         let last = self.gate.last.filter(|_| self.gate.enabled());
-        let (host_policy,host_used)=self.host.as_ref().and_then(|h|h.lock().ok().map(|h| {
-            (h.policy.as_ref().map(|p|p.cap.json()).unwrap_or(Value::Null),json!(h.used()))
-        })).unwrap_or((Value::Null,Value::Null));
-        json!({"host_policy":host_policy,"host_runtime_used":host_used,"project_limits":self.cap.as_ref().ok().map(|_| &self.cfg.limits),"limits": limits, "used": used, "load_gate": self.cap.as_ref().map(|c| c.json()["load_gate"].clone()).unwrap_or(Value::Null),
+        let (host_policy,host_used,host_command)=self.host.as_ref().and_then(|h|h.lock().ok().map(|h| {
+            (h.policy.as_ref().map(|p|p.cap.json()).unwrap_or(Value::Null),json!(h.used()),json!(h.capacity_command))
+        })).unwrap_or((Value::Null,Value::Null,Value::Null));
+        json!({"host_policy":host_policy,"host_runtime_used":host_used,"host_command":host_command,"project_limits":self.cap.as_ref().ok().map(|_| &self.cfg.limits),"limits": limits, "used": used, "load_gate": self.cap.as_ref().map(|c| c.json()["load_gate"].clone()).unwrap_or(Value::Null),
             "admission": self.cap.as_ref().map(|c| c.json()["admission"].clone()).unwrap_or(Value::Null), "host_used": self.host_used,
             "min_service_version": crate::admission::MIN_SERVICE, "reservations": reservations,
             "gate": gate, "reasons": reasons.iter().map(|(c, t)| json!({"code": c, "text": t})).collect::<Vec<_>>(),

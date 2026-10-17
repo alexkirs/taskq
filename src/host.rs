@@ -1,9 +1,11 @@
 //! Host policy, occupied slots and project supervision (taskq.md § 3, § 4, § 9).
 use crate::{Res, service::{self, Capacity, Gate}};
 use serde_json::{Value, json};
+use coreq::telemetry::capture::CommandReceipt;
 use std::{collections::{BTreeMap, BTreeSet}, fs, path::{Path, PathBuf}, sync::{Arc, Mutex}, time::Instant};
 
 thread_local!(static ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) });
+const CAPACITY_COMMAND:&str="_taskq_capacity_command";
 pub fn active() -> bool { ACTIVE.get() }
 pub fn enter(root: &Path, install: &Path) {
     ACTIVE.set(true);
@@ -62,7 +64,30 @@ impl Policy {
         if off { c["load_gate"]["enabled"] = json!(true); }
         let mut cap = service::capacity(&c, &me)?;
         if off { cap.gate.enabled = false; }
-        Ok(Self { raw: v, cap, me, has, codex, permission_mode, update_every, rollback_after })
+        let policy=Self { raw: v, cap, me, has, codex, permission_mode, update_every, rollback_after };
+        policy.command()?;
+        Ok(policy)
+    }
+
+    fn command(&self)->Res<Option<CommandReceipt>> {
+        let Some(value)=self.raw.get(CAPACITY_COMMAND) else {return Ok(None)};
+        let invalid="host capacity command unsupported or corrupt; file kept";
+        let object=value.as_object().ok_or(invalid)?;
+        if object.len()!=4 || !["schema","host","policy","receipt"].iter().all(|key|object.contains_key(*key))
+            || value["schema"]!=1 || value["host"].as_str().is_none_or(str::is_empty) {
+            return Err(invalid.into());
+        }
+        let snapshot=value["policy"].as_object().ok_or(invalid)?;
+        if snapshot.len()!=3 || !["limits","admission","load_gate"].iter().all(|key|snapshot.contains_key(*key))
+            || value["policy"]["admission"]["mode"]!="auto" {return Err(invalid.into());}
+        let mut policy=value["policy"].clone();
+        policy["admission"].as_object_mut().ok_or(invalid)?.remove("mode");
+        if Self::parse(policy,&self.me)?.cap.json()!=value["policy"] {return Err(invalid.into());}
+        let text=value["receipt"].as_str().ok_or(invalid)?;
+        let receipt=CommandReceipt::decode(text).map_err(|_|invalid)?;
+        let metadata:Value=serde_json::from_str(text).map_err(|_|invalid)?;
+        if metadata["product"]!="taskq" || metadata["operation"]!="taskq.host.policy.write" {return Err(invalid.into());}
+        Ok(Some(receipt))
     }
 
     pub fn read(install: &Path) -> Res<Self> {
@@ -89,7 +114,7 @@ impl Policy {
 
 /// Existing resource-control lock serializes policy writers with grants and migration.
 #[tracing::instrument(name="host.policy.write",skip_all)]
-pub fn write_capacity(install:&Path, host:&str, edit:&crate::CapEdit, expect:Option<&Value>)->Res<(Capacity,Capacity)> {
+pub fn write_capacity(install:&Path, host:&str, edit:&crate::CapEdit, expect:Option<&Value>)->Res<(Capacity,Capacity,CommandReceipt)> {
     if std::env::var_os("TASKQ_ATTEMPT").is_some() {return Err("a worker cannot change host policy".into());}
     crate::resources::locked(install,|| {
         let migration=install.join("host-policy-migration");
@@ -121,11 +146,53 @@ pub fn write_capacity(install:&Path, host:&str, edit:&crate::CapEdit, expect:Opt
             if let Some(value)=edit.memory_min {next["load_gate"]["memory_min"]=json!(value);}
         }
         let candidate=Policy::parse(next,&hostname)?;
+        let command=CommandReceipt::current()?;
+        command.checkpoint("received")?;
+        let mut next=candidate.raw;
+        next[CAPACITY_COMMAND]=json!({"schema":1,"host":candidate.me,"policy":candidate.cap.json(),"receipt":command.encode()});
+        let candidate=Policy::parse(next,&hostname)?;
         replace_owned(&path,&original,&(serde_json::to_string_pretty(&candidate.raw).map_err(|e|e.to_string())?+"\n"))?;
         let saved=Policy::read(install)?;
         if saved.raw!=candidate.raw {return Err("host policy write uncertain: readback differs".into());}
-        Ok((old.cap,saved.cap))
+        #[cfg(test)]
+        if std::env::var("TASKQ_HOST_POLICY_PHASE").is_ok_and(|phase|phase=="before-applied") {
+            crate::platform::write_atomic(&install.join("ack"),"policy-saved")?;
+            loop {std::thread::park();}
+        }
+        command.checkpoint("applied").map_err(|e|format!("host policy saved; command receipt unknown: {e}"))?;
+        crate::platform::write_atomic(&install.join("poke"),"").map_err(|e|format!("host policy saved; host notification unknown: {e}"))?;
+        Ok((old.cap,saved.cap,command))
     })
+}
+
+/// The host already loaded this snapshot; a later writer cannot borrow its observation.
+pub fn observe_capacity(install:&Path,loaded:&Policy)->Res<Option<String>> {
+    let Some(command)=loaded.command()? else {return Ok(None)};
+    coreq::telemetry::capture::operation("host.policy.observe",||crate::resources::locked(install,|| {
+        let current=Policy::read(install)?;
+        let binding=&loaded.raw[CAPACITY_COMMAND];
+        if current.raw!=loaded.raw || binding["host"]!=loaded.me || binding["policy"]!=loaded.cap.json() {
+            return Err("capacity command changed or no longer matches the loaded policy; observation unknown".into());
+        }
+        command.checkpoint("applied")?;
+        command.checkpoint("observed").map(Some)
+    }),|_|"command-observation")
+}
+
+/// Read the exact durable acknowledgment, never infer it from equal values or wall-clock freshness.
+pub fn capacity_observed(install:&Path,command:&CommandReceipt)->Res<bool> {
+    let current=Policy::read(install)?;
+    if current.command()?.is_none_or(|saved|saved.encode()!=command.encode())
+        || current.raw[CAPACITY_COMMAND]["host"]!=current.me || current.raw[CAPACITY_COMMAND]["policy"]!=current.cap.json() {
+        return Err("host policy saved; command superseded or manually changed".into());
+    }
+    let metadata:Value=serde_json::from_str(&command.encode()).map_err(|e|e.to_string())?;
+    let id=command.event_id("observed")?;
+    let reader=coreq::telemetry::Reader::open(&install.join("telemetry.log/universal.sqlite3"))?;
+    let page=reader.export_kinds(&["command.observed"],metadata["started_ms"].as_i64().ok_or("capacity command time unknown")?,0,1024)?;
+    let found=page["events"].as_array().ok_or("capacity receipt page invalid")?.iter().any(|event|event["id"]==id);
+    if !found && page["more"]==true {return Err("capacity receipt page limit; observation unknown".into());}
+    Ok(found)
 }
 
 /// Reuse migration's native replacement so a settings edit preserves owner/group/ACL and file permissions.
@@ -166,6 +233,7 @@ fn slot(project: &Path, task: u64, attempt: u64) -> Slot {
 }
 pub struct Host {
     pub policy: Res<Policy>,
+    pub capacity_command:Option<String>,
     slots: BTreeMap<Slot, String>,
     pub gate: Gate,
     began: Instant,
@@ -189,13 +257,14 @@ pub struct Host {
 
 impl Host {
     pub fn new(policy: Res<Policy>) -> Self {
-        Self { policy, slots: BTreeMap::new(), gate: Gate::default(), began: Instant::now(), last: None,
+        Self { policy, capacity_command:None, slots: BTreeMap::new(), gate: Gate::default(), began: Instant::now(), last: None,
             ready: BTreeSet::new(), turn: None, held: None, restart: false, busy: BTreeMap::new(), prepared: BTreeSet::new(), draining: BTreeSet::new(),
             request_since: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()), hour_start: crate::requests::totals(), last_hour: None,
             rebuilding: false, rebuilt: BTreeSet::new(), published: BTreeMap::new() }
     }
 
     pub fn reload(&mut self, policy: Res<Policy>) {
+        if self.policy!=policy {self.capacity_command=None;}
         if let Ok(p) = &policy { self.gate.configure(p.cap.gate); }
         self.policy = policy;
     }
@@ -404,6 +473,17 @@ pub fn run(install: &Path) -> Res<()> {
                         }
                     }
                 }));
+            }
+        }
+        let loaded={let h=shared.lock().unwrap_or_else(|e|e.into_inner());
+            h.capacity_command.is_none().then(||h.policy.as_ref().ok().cloned()).flatten()};
+        if let Some(policy)=loaded {
+            match observe_capacity(install,&policy) {
+                Ok(command)=> {
+                    let mut h=shared.lock().unwrap_or_else(|e|e.into_inner());
+                    if h.policy.as_ref().ok()==Some(&policy) {h.capacity_command=command;}
+                }
+                Err(e)=> {if reported!=e {crate::platform::log(&e);reported=e;}}
             }
         }
         // Joining is nonblocking: failed projects do not stop unrelated loops, and their occupied slots stay held.
@@ -864,34 +944,77 @@ mod tests {
         if std::env::var_os("TASKQ_OWNER_HOLD").is_some() && claim.is_some() {loop {std::thread::park();}}
     }
 
-    // H-A3: acknowledged policy replacement survives killing its writer, preserving unrelated policy fields.
+    // H-A3: committed policy and its original command survive writer death, even before the applied receipt.
     #[test]
     fn acknowledged_policy_survives_writer_termination() {
-        let root=temp("policy-commit");
+        for phase in ["committed","before-applied"] {
+        let root=temp(&format!("policy-commit-{phase}"));
         fs::write(root.join("host.json"),json!({"limits":{"codex":2},"owner_field":"preserve"}).to_string()).unwrap();
         let mut child=std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact","host::tests::policy_writer","--ignored"])
-            .env("TASKQ_HOST_POLICY_FIXTURE",&root).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+            .env("TASKQ_HOST_POLICY_FIXTURE",&root).env("TASKQ_HOST_POLICY_PHASE",phase)
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
         let until=Instant::now()+std::time::Duration::from_secs(10);
         while !root.join("ack").is_file() && child.try_wait().unwrap().is_none() && Instant::now()<until {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        let acknowledged=root.join("ack").is_file();
+        let acknowledged=fs::read_to_string(root.join("ack")).unwrap_or_default();
         if child.try_wait().unwrap().is_none() {child.kill().unwrap();child.wait().unwrap();}
-        let read=Policy::read(&root);
-        fs::remove_dir_all(root).unwrap();
-        assert!(acknowledged,"writer did not acknowledge before the fixture deadline");
-        let read=read.unwrap();assert_eq!(read.cap.limits["codex"],3);assert_eq!(read.raw["owner_field"],"preserve");
+        assert_eq!(acknowledged,if phase=="committed" {"committed"} else {"policy-saved"},"writer did not reach {phase}");
+        let read=Policy::read(&root).unwrap();assert_eq!(read.cap.limits["codex"],3);assert_eq!(read.raw["owner_field"],"preserve");
+        let receipt=read.command().unwrap().unwrap();
+        let before=fs::read(root.join("host.json")).unwrap();
+        let (capture,guard)=crate::profile::tests::collecting(&root);
+        assert!(!capacity_observed(&root,&receipt).unwrap());
+        assert_eq!(observe_capacity(&root,&read).unwrap(),Some(receipt.event_id("observed").unwrap()));
+        assert!(capacity_observed(&root,&receipt).unwrap());
+        assert_eq!(fs::read(root.join("host.json")).unwrap(),before,"recovery replayed a settings mutation");
+        capture.flush().unwrap();drop(guard);drop(capture);fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]
     #[ignore="owned subprocess used by acknowledged_policy_survives_writer_termination"]
     fn policy_writer() {
         let root=PathBuf::from(std::env::var_os("TASKQ_HOST_POLICY_FIXTURE").unwrap());
+        let (_capture,_guard)=crate::profile::tests::collecting(&root);
         let owner=Policy::read(&root).unwrap().me;
         write_capacity(&root,&owner,&crate::CapEdit {limits:BTreeMap::from([("codex".into(),3)]),..Default::default()},None).unwrap();
-        fs::write(root.join("ack"),"committed").unwrap();
+        crate::platform::write_atomic(&root.join("ack"),"committed").unwrap();
         loop {std::thread::park();}
+    }
+
+    // H-A2: identical settings have different command identities; stale/manual readback cannot confirm a new edit.
+    #[test]
+    fn capacity_receipts_follow_the_loaded_command_not_equal_values() {
+        let root=temp("capacity-receipt");
+        fs::write(root.join("host.json"),"{\"limits\":{\"codex\":2}}").unwrap();
+        let owner=Policy::read(&root).unwrap().me;
+        let edit=crate::CapEdit {limits:BTreeMap::from([("codex".into(),3)]),gate:Some(false),..Default::default()};
+        assert!(write_capacity(&root,&owner,&edit,None).is_err(),"missing required receipts must refuse before effect");
+        assert_eq!(Policy::read(&root).unwrap().cap.limits["codex"],2);
+        let (capture,guard)=crate::profile::tests::collecting(&root);
+        let (_,_,first)=write_capacity(&root,&owner,&edit,None).unwrap();
+        let loaded=Policy::read(&root).unwrap();
+        assert!(!capacity_observed(&root,&first).unwrap());
+        let (_,_,second)=write_capacity(&root,&owner,&edit,None).unwrap();
+        let current=Policy::read(&root).unwrap();
+        assert_eq!(loaded.cap,current.cap);assert_ne!(first.encode(),second.encode());
+        assert!(observe_capacity(&root,&loaded).is_err(),"late old loader confirmed a different command");
+        assert!(!capacity_observed(&root,&second).unwrap());
+        assert_eq!(observe_capacity(&root,&current).unwrap(),Some(second.event_id("observed").unwrap()));
+        assert!(capacity_observed(&root,&second).unwrap());
+        assert!(capacity_observed(&root,&first).is_err());
+        let mut edited=current.raw.clone();edited["limits"]["codex"]=json!(4);
+        fs::write(root.join("host.json"),edited.to_string()).unwrap();
+        assert!(observe_capacity(&root,&Policy::read(&root).unwrap()).is_err(),"manual edit borrowed old receipt");
+        for invalid in [json!({"schema":2}),json!({"schema":1,"host":owner,"policy":current.cap.json(),"receipt":"{}"})] {
+            edited[CAPACITY_COMMAND]=invalid;
+            let bytes=edited.to_string();fs::write(root.join("host.json"),&bytes).unwrap();
+            assert!(Policy::read(&root).is_err());assert!(write_capacity(&root,&owner,&edit,None).is_err());
+            assert_eq!(fs::read_to_string(root.join("host.json")).unwrap(),bytes);
+        }
+        capture.flush().unwrap();drop(guard);drop(capture);fs::remove_dir_all(root).unwrap();
     }
 
     // Chain: published project passes -> host release qualification; failure keeps owned work and recovery can qualify.

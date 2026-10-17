@@ -46,7 +46,7 @@ jobs:
       - uses: actions/checkout@v4
       - run: rustup toolchain install stable-x86_64-pc-windows-gnu
       - run: npm ci --ignore-scripts --no-audit --no-fund
-      - run: cargo +stable-x86_64-pc-windows-gnu test --locked --test windows_install -- --show-output
+      - run: cargo +stable-x86_64-pc-windows-gnu test --locked --bin taskq platform::tests::installed_windows_release_starts_without_build_paths -- --exact --show-output
   shots:
     runs-on: ubuntu-latest
     steps:

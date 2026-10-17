@@ -307,7 +307,7 @@ pub fn exec(rt: &str, brief: &str, root: &Path, logs: &Path, name: &str, resume:
     if rt == "claude" && (resume.is_none() || crate::runtime::claude_background(root, &l.session)?) {
         let mut turn = crate::runtime::ClaudeTurn::start(&env, &l, &out, &text, &access).map_err(|e| e.to_string())?;
         let code=wait_native(&mut turn,root,logs,name,rt,std::time::Duration::from_millis(500));
-        if code!=0 {return Err(format!("Claude operator failed (exit {code}); partial effects unknown"));}
+        if code!=0 {return Err(format!("Claude operator failed (exit {code}): {}; partial effects unknown",crate::runtime::Proc::exit_reason(&turn).unwrap_or("inspect native request log")));}
         return fs::read_to_string(&out).map_err(|e| e.to_string())?.lines().rev().filter_map(|line| serde_json::from_str::<Value>(line).ok())
             .find_map(|v| (v["type"] == "result").then(|| v["result"].as_str().map(String::from)).flatten()).ok_or("Claude final response missing".into());
     }

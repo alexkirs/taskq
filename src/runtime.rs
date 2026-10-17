@@ -61,6 +61,7 @@ pub trait Proc {
     /// The exit code once the child has exited; `Err` is an unknown read (§ 4 reconciliation), never an exit.
     fn exited(&mut self) -> Result<Option<i32>, String>;
     fn exit_error(&self) -> Option<&'static str> { None }
+    fn exit_reason(&self) -> Option<&str> { None }
     /// Request termination; success is not exit. The owner retains this handle until `exited` confirms it.
     fn kill(&mut self) -> Result<(), String>;
     fn id(&self) -> u32;
@@ -1224,21 +1225,25 @@ struct ClaudeHistory {
     found: bool,
     ended: bool,
     answer: Option<String>,
+    failure: Option<(&'static str,String)>,
 }
 
 impl ClaudeHistory {
     fn read(&mut self,path:&Path,before:usize,input:&str,log:&Path)->Result<bool,String> {
         let mut output=File::options().create(true).append(true).open(log).map_err(|e|e.to_string())?;
-        let Self {reader,count,found,ended,answer}=self;
+        let Self {reader,count,found,ended,answer,failure}=self;
         let complete=reader.read(path,|v| {
             let starts=*count>=before && claude_input_event(&v,input);
             if starts && *found {return Err("Claude original input appears in multiple turns; inspect native submissions".into());}
             if (*found || starts) && !*ended {
                 writeln!(output,"{v}").map_err(|e|format!("Claude native observation log failed: {e}"))?;
                 if v["type"]=="assistant" {
-                    if let Some(text)=v["message"]["content"].as_array().and_then(|blocks|blocks.iter().rev().find_map(|b|(b["type"]=="text").then(||b["text"].as_str()).flatten())) {
-                        *answer=Some(text.to_owned());
-                    }
+                    let text=v["message"]["content"].as_array().and_then(|blocks|blocks.iter().rev().find_map(|b|(b["type"]=="text").then(||b["text"].as_str()).flatten()));
+                    if let Some(code)=v["error"].as_str().or_else(||(v["isApiErrorMessage"]==true).then_some("unknown")) {
+                        let text=text.unwrap_or("native API error without detail");
+                        let class=if code=="authentication_failed" {"auth"} else {crate::profile::class(text)};
+                        *failure=Some((class,format!("{code}: {text}")));*answer=None;
+                    } else if let Some(text)=text {*answer=Some(text.to_owned());*failure=None;}
                 }
                 *ended=v["type"]=="system" && v["subtype"]=="turn_duration";
             }
@@ -1414,7 +1419,7 @@ impl Proc for ClaudeTurn {
         if self.accepted {Ok(true)} else if let Some(e)=&self.launch_error {Err(e.clone())} else {Ok(false)}
     }
     fn exited(&mut self) -> Result<Option<i32>, String> {
-        if self.done { return Ok(Some(0)); }
+        if self.done { return Ok(Some(if self.failure.is_some() {-1} else {0})); }
         let rows = claude_agents(&self.root)?;
         self.recover_job(&rows,claude_home().as_deref())?;
         let row = rows.iter().find(|v| v["id"] == self.id).ok_or("Claude session unavailable; state unknown")?;
@@ -1424,6 +1429,7 @@ impl Proc for ClaudeTurn {
         observed
     }
     fn exit_error(&self) -> Option<&'static str> { self.failure }
+    fn exit_reason(&self) -> Option<&str> {self.history.failure.as_ref().map(|(_,reason)|reason.as_str())}
     fn kill(&mut self) -> Result<(), String> {
         let rows=claude_agents(&self.root)?;
         self.recover_job(&rows,claude_home().as_deref())?;
@@ -1438,6 +1444,13 @@ impl Proc for ClaudeTurn {
 }
 
 impl ClaudeTurn {
+    fn complete(&mut self)->Result<Option<i32>,String> {
+        if let Some((class,_))=&self.history.failure {self.failure=Some(*class);self.done=true;return Ok(Some(-1));}
+        let answer=self.history.answer.as_deref().ok_or("Claude completed without final text; inspect native logs")?;
+        let mut log=File::options().append(true).open(&self.log).map_err(|e|e.to_string())?;
+        writeln!(log,"{}",serde_json::json!({"type":"result","session_id":self.session,"result":answer})).map_err(|e|e.to_string())?;
+        self.done=true;Ok(Some(0))
+    }
     fn capture_identity(&mut self,row:&serde_json::Value)->Result<(),String> {
         if row["id"]!=self.id || !self.session.is_empty() && row["sessionId"]!=self.session {
             return Err("Claude process locator differs from the original native job".into());
@@ -1471,6 +1484,7 @@ impl ClaudeTurn {
                 return Err(format!("Claude job {state}; current input acceptance unconfirmed, reconcile the original submission"));
             }
             if !claude_stopped(row, self.native.as_ref())? { return Err(format!("Claude job {state}; native process exit unconfirmed; inspect the original job")); }
+            if self.history.ended {return self.complete();}
             self.failure = Some(claude_failure(row, &self.root, &self.id, claude_home().as_deref()));
             return Ok(Some(-1));
         }
@@ -1489,12 +1503,8 @@ impl ClaudeTurn {
         self.accepted=true;
         if row["status"]!="idle" && row["state"]!="done" && row["state"]!="blocked" {return Ok(None);}
         if !self.history.ended {return Ok(None);}
-        let answer=self.history.answer.as_deref().ok_or("Claude completed without final text; inspect native logs")?;
-        let mut log=File::options().append(true).open(&self.log).map_err(|e|e.to_string())?;
         claude_stop(&self.root, &self.id, self.native.as_ref())?;
-        writeln!(log, "{}", serde_json::json!({"type":"result", "session_id":self.session, "result":answer})).map_err(|e| e.to_string())?;
-        self.done = true;
-        Ok(Some(0))
+        self.complete()
     }
 }
 
@@ -2925,6 +2935,23 @@ mod tests {
         let row=serde_json::json!({"id":t.id,"state":"working","sessionId":t.session});
         assert!(t.observe(&row).unwrap_err().contains("transcript unavailable"),"no status field must not suppress the real observation error");
         assert!(t.announced);
+        // A completed input survives asynchronous stop; an API failure never becomes a valid final answer.
+        for api_error in [false,true] {
+            t.history=ClaudeHistory::default();t.done=false;t.failure=None;t.accepted=true;
+            let path=root.join(format!("completed-{api_error}.jsonl"));
+            let mut assistant=serde_json::json!({"type":"assistant","message":{"content":[{"type":"text","text":if api_error {"Login expired; please run /login"} else {"owned final"}}]}});
+            if api_error {assistant["error"]=serde_json::json!("authentication_failed");assistant["isApiErrorMessage"]=serde_json::json!(true);}
+            let events=[serde_json::json!({"type":"user","message":{"content":t.input}}),assistant,serde_json::json!({"type":"system","subtype":"turn_duration"})];
+            std::fs::write(&path,events.iter().map(|v|format!("{v}\n")).collect::<String>()).unwrap();
+            assert!(t.history.read(&path,0,&t.input,&t.log).unwrap());assert!(t.history.ended);
+            let row=serde_json::json!({"id":t.id,"sessionId":t.session,"state":"stopped","pid":null});
+            t.native=coreq::process::identity(std::process::id()).unwrap();
+            assert!(t.observe(&row).is_err(),"completed input and stop acknowledgment cannot replace process exit proof");
+            t.native=Some(identity.clone());
+            assert_eq!(t.observe(&row),Ok(Some(if api_error {-1} else {0})),"completed input outcome lost after stopped");
+            assert_eq!(t.exited(),Ok(Some(if api_error {-1} else {0})),"terminal result must remain stable");
+            if api_error {assert_eq!(t.exit_error(),Some("auth"));assert!(t.history.answer.is_none(),"native API error cannot be a success answer");assert!(t.exit_reason().unwrap().contains("authentication_failed: Login expired; please run /login"));}
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 

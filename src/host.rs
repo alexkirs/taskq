@@ -623,6 +623,12 @@ fn native_inventory_due(inventory:&Res<Vec<String>>,checked:Option<Instant>,tran
     checked.is_none_or(|at|at.elapsed().as_secs()>=if transitioning||inventory.is_err() {5}else{60})
 }
 
+// A legacy admission barrier does not replace valid host maintenance intervals.
+fn guarded_policy(configured:Res<Policy>,barrier:&Res<()>)->(Res<Policy>,(u64,u64)) {
+    let timers=configured.as_ref().map(|p|(p.update_every,p.rollback_after)).unwrap_or((60,600));
+    (barrier.as_ref().map_err(Clone::clone).and(configured),timers)
+}
+
 pub fn run(install: &Path) -> Res<()> {
     fs::create_dir_all(install).map_err(|e| e.to_string())?;
     let mut reported=String::new();
@@ -663,7 +669,8 @@ pub fn run(install: &Path) -> Res<()> {
         restart.refresh(install);
         roots.clone_from(&registry.roots);
         let old = legacy(install,&roots).and_then(|_|native_inventory_ready(&native_legacy,native_checked));
-        let policy = match &old { Ok(()) => migrate(install, &roots).and_then(|_| Policy::read(install)), Err(e) => Err(e.clone()) };
+        let configured = match &old { Ok(()) => migrate(install, &roots).and_then(|_| Policy::read(install)), Err(_) => Policy::read(install) };
+        let (policy,timers)=guarded_policy(configured,&old);
         let removal=restart.current.as_ref().ok().and_then(Option::as_ref).and_then(|p|p.removal().map(Path::to_path_buf));
         drained_roots.retain(|root|removal.as_ref()==Some(root));
         {
@@ -772,7 +779,6 @@ pub fn run(install: &Path) -> Res<()> {
             let _=crate::lifecycle::controller_exited(install,&id,&error);crate::platform::log(&format!("Stop controller: {}",crate::compact(&error,153)));
             h=shared.lock().unwrap_or_else(|e|e.into_inner());
         }
-        let timers = h.policy.as_ref().map(|p| (p.update_every, p.rollback_after)).unwrap_or((60, 600));
         if h.updating.as_ref().is_some_and(|job|job.is_finished()) {
             let updated=h.updating.take().unwrap().join().unwrap_or_else(|_|Err("host maintenance panicked; partial effects unknown".into()));
             if let Ok(Maintenance::Inventory(result))=&updated {native_legacy=result.clone();}
@@ -1234,6 +1240,12 @@ mod tests {
         assert!(!native_inventory_due(&inventory,retry,false),"fresh empty inventory keeps the ordinary cadence");
         assert!(native_inventory_due(&retained,Some(checked),false),"quiescent retained inventory still refreshes at its freshness bound");
         assert!(native_inventory_ready(&retained,retry).is_err(),"a refresh being due cannot release the native barrier");
+        let mut configured=p.clone();configured.update_every=86400;configured.rollback_after=1200;
+        let (blocked,timers)=guarded_policy(Ok(configured),&native_inventory_ready(&retained,retry));
+        assert!(blocked.unwrap_err().contains("retained-unit"),"native ownership still blocks admission");
+        assert_eq!(timers,(86400,1200),"valid maintenance intervals survive an admission hold");
+        let (invalid,timers)=guarded_policy(Err("host.json invalid".into()),&Ok(()));
+        assert!(invalid.is_err());assert_eq!(timers,(60,600),"unknown configuration retains safe maintenance defaults");
         h.policy=native_inventory_ready(&inventory,Some(Instant::now())).map(|_|p.clone());
         assert!(h.reserve(root,2,8,"codex",&p.cap,true,0).is_ok());
     }

@@ -619,8 +619,8 @@ fn native_inventory_ready(inventory:&Res<Vec<String>>,checked:Option<Instant>)->
     Ok(())
 }
 
-fn native_inventory_due(inventory:&Res<Vec<String>>,checked:Option<Instant>)->bool {
-    checked.is_none_or(|at|at.elapsed().as_secs()>=if inventory.as_ref().is_ok_and(Vec::is_empty) {60}else{5})
+fn native_inventory_due(inventory:&Res<Vec<String>>,checked:Option<Instant>,transitioning:bool)->bool {
+    checked.is_none_or(|at|at.elapsed().as_secs()>=if transitioning||inventory.is_err() {5}else{60})
 }
 
 pub fn run(install: &Path) -> Res<()> {
@@ -780,7 +780,9 @@ pub fn run(install: &Path) -> Res<()> {
             if maintenance_result!=text {crate::platform::log(&text);for root in &roots {append_project(install,root,&text);}maintenance_result=text;}
             if crate::installed(install)&&matches!(updated,Ok(Maintenance::Update(Some(_)))) {h.restart=true;}
         }
-        if h.updating.is_none()&&native_inventory_due(&native_legacy,native_checked) {
+        let transition_ready=crate::platform::transition_ready(install).is_ok();
+        let transitioning=h.restart||restart.current.as_ref().map_or(true,Option::is_some)||!transition_ready;
+        if h.updating.is_none()&&native_inventory_due(&native_legacy,native_checked,transitioning) {
             native_checked=Some(Instant::now());native_legacy=Err("native legacy inventory pending; host admission held".into());
             let install=install.to_path_buf();
             let lifecycle_controller=restart.current.as_ref().ok().and_then(Option::as_ref).filter(|p|p.stops()&&p.prepared()).map(|p|p.id().to_string());
@@ -790,7 +792,6 @@ pub fn run(install: &Path) -> Res<()> {
             })),|_|"spawn");
             match job {Ok(job)=>h.updating=Some(job),Err(error)=>crate::platform::log(&format!("native inventory not started: {error}"))}
         }
-        let transition_ready=crate::platform::transition_ready(install).is_ok();
         if !transition_ready&&h.updating.is_none()&&installation_checked.is_none_or(|at|at.elapsed().as_secs()>=5) {
             installation_checked=Some(Instant::now());
             let install=install.to_path_buf();
@@ -1227,8 +1228,11 @@ mod tests {
         assert!(native_inventory_ready(&Ok(vec!["retained-unit".into()]),Some(Instant::now())).unwrap_err().contains("retained-unit"));
         let retained=Ok(vec!["retained-unit".into()]);
         let retry=Some(Instant::now()-std::time::Duration::from_secs(6));
-        assert!(native_inventory_due(&retained,retry),"retired legacy units need fresh native proof before lifecycle can proceed");
-        assert!(!native_inventory_due(&inventory,retry),"fresh empty inventory keeps the ordinary cadence");
+        assert!(!native_inventory_due(&retained,retry,false),"quiescent retained units keep the ordinary cadence");
+        assert!(native_inventory_due(&retained,retry,true),"retired legacy units need fresh native proof before lifecycle can proceed");
+        assert!(native_inventory_due(&Err("native read denied".into()),retry,false),"unknown inventory retries promptly even without a transition");
+        assert!(!native_inventory_due(&inventory,retry,false),"fresh empty inventory keeps the ordinary cadence");
+        assert!(native_inventory_due(&retained,Some(checked),false),"quiescent retained inventory still refreshes at its freshness bound");
         assert!(native_inventory_ready(&retained,retry).is_err(),"a refresh being due cannot release the native barrier");
         h.policy=native_inventory_ready(&inventory,Some(Instant::now())).map(|_|p.clone());
         assert!(h.reserve(root,2,8,"codex",&p.cap,true,0).is_ok());

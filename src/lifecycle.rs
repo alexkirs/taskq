@@ -251,10 +251,28 @@ pub fn observe(install:&Path,instance:&str,ready:bool)->Res<()> {
     })
 }
 
-pub fn update_wait(install:&Path,instance:&str)->Res<()> {
+#[derive(Clone,Copy,Debug,PartialEq)]
+pub enum HandoffWait {Execution,Recovery,Project,Maintenance}
+impl HandoffWait {
+    fn reason(self)->&'static str {match self {
+        Self::Execution=>"native execution drain pending; preserving occupied capacity",
+        Self::Recovery=>"host ownership recovery pending; waiting for qualified reconciliation",
+        Self::Project=>"project handoff pending; waiting for owned work and preparation",
+        Self::Maintenance=>"host maintenance in progress; waiting for its bounded result",
+    }}
+}
+
+/// Refresh only our provisional reason; a concrete controller/recovery failure remains authoritative.
+pub fn handoff_wait(install:&Path,instance:&str,wait:Option<HandoffWait>)->Res<()> {
     resources::try_with(install,|state| {
-        if let Some(p)=active(state)? && p.origin()==instance && p.phase=="queued" && state.ops[p.id()].receipt["reason"].is_null() {
-            state.ops.get_mut(p.id()).unwrap().receipt["reason"]=json!("host maintenance in progress; waiting for its bounded result");
+        if let Some(p)=active(state)? && p.origin()==instance && p.phase=="queued" {
+            let reason=&state.ops[p.id()].receipt["reason"];
+            if reason.is_null()||[HandoffWait::Execution,HandoffWait::Recovery,HandoffWait::Project,HandoffWait::Maintenance].iter().any(|wait|reason==wait.reason()) {
+                match wait {
+                    Some(wait)=>{state.ops.get_mut(p.id()).unwrap().receipt["reason"]=json!(wait.reason());},
+                    None=>{state.ops.get_mut(p.id()).unwrap().receipt.as_object_mut().unwrap().remove("reason");},
+                }
+            }
         }
         Ok(())
     })
@@ -510,7 +528,7 @@ mod tests {
         controller_exited(&install,"exact-stop","process exited with exit status: 1").unwrap();
         assert_eq!(receipt(&install,"exact-stop").unwrap().unwrap()["reason"],failure,"outer controller exit cannot hide its retained inner cause");
         let origin=pending(&install).unwrap().unwrap().origin().to_string();
-        update_wait(&install,&origin).unwrap();
+        handoff_wait(&install,&origin,Some(HandoffWait::Maintenance)).unwrap();
         assert_eq!(receipt(&install,"exact-stop").unwrap().unwrap()["reason"],failure,"background maintenance cannot hide a prepared controller failure");
         assert_eq!(fs::read(install.join("projects")).unwrap(),registry);
         assert!(complete_stop_with(&install,"exact-stop",|_,_|Ok(())).unwrap_err().contains("native exit"));
@@ -546,12 +564,42 @@ mod tests {
         let mode=std::env::var("TASKQ_STOP_MODE").unwrap_or_else(|_|"stop".into());
         let request=if mode=="stop" {stop_review(&install,"exact-stop")}else{let root=scope(&install).unwrap().remove(0);uninstall_review(&install,"exact-stop",if mode=="project" {Some(&root)}else{None})}.unwrap();let queued=submit(&install,&request).unwrap();assert_eq!(queued["state"],"queued");
         assert_eq!(submit(&install,&request).unwrap(),queued);
+        if mode=="host" {assert_queued_uninstall_wait_tracks_ownership(&install,scope(&install).unwrap().remove(0));}
         let mut changed=request.clone();changed["action"]=json!("restart");assert!(submit(&install,&changed).is_err(),"same ID cannot change lifecycle action");
         assert!(complete_stop_with(&install,"exact-stop",|_,_|panic!("unprepared Stop cannot have an effect")).is_err());
         prepare_with(&install,"original",Some(&crate::host_control::revision(&install).unwrap())).unwrap();
         capture.flush().unwrap();drop(guard);drop(capture);
         fs::write(PathBuf::from(std::env::var_os("TASKQ_STOP_READY").unwrap()),"prepared").unwrap();
         let _=std::io::stdin().read(&mut [0]);
+    }
+
+    // H-A5: inventory progress must not hide the unresolved execution blocking this exact Uninstall.
+    fn assert_queued_uninstall_wait_tracks_ownership(install:&Path,root:PathBuf) {
+        let mut h=host::Host::new(Err("fixture policy unused".into()));h.restart=true;h.stopping=true;
+        h.busy.insert(root.clone(),false);h.prepared.insert(root.clone());
+        h.updating=Some(std::thread::spawn(||Ok(host::Maintenance::Inventory(Ok(vec![])))));
+        handoff_wait(install,"original",h.handoff_wait()).unwrap();
+        assert_eq!(receipt(install,"exact-stop").unwrap().unwrap()["reason"],HandoffWait::Maintenance.reason());
+        h.sync(&root,vec![(1,3,"codex".into())]);
+        for _ in 0..2 {
+            handoff_wait(install,"original",h.handoff_wait()).unwrap();
+            let r=receipt(install,"exact-stop").unwrap().unwrap();
+            assert_eq!(r["state"],"queued");assert_eq!(r["reason"],HandoffWait::Execution.reason());assert!(!h.handoff_ready());assert!(h.stop_controller.is_none());
+        }
+        h.updating.take().unwrap().join().unwrap().unwrap();
+        handoff_wait(install,"original",h.handoff_wait()).unwrap();
+        assert_eq!(receipt(install,"exact-stop").unwrap().unwrap()["reason"],HandoffWait::Execution.reason());
+        h.sync(&root,vec![]);h.rebuilding=true;assert_eq!(h.handoff_wait(),Some(HandoffWait::Recovery));
+        h.rebuilding=false;h.prepared.clear();assert_eq!(h.handoff_wait(),Some(HandoffWait::Project));
+        h.prepared.insert(root.clone());assert!(h.handoff_ready());assert_eq!(h.handoff_wait(),None);
+        handoff_wait(install,"original",h.handoff_wait()).unwrap();assert!(receipt(install,"exact-stop").unwrap().unwrap()["reason"].is_null(),"ready handoff clears its own provisional reason");
+        failed(install,"exact-stop","native scope denied").unwrap();let failure=receipt(install,"exact-stop").unwrap().unwrap()["reason"].clone();
+        for wait in [Some(HandoffWait::Execution),Some(HandoffWait::Recovery),Some(HandoffWait::Project),Some(HandoffWait::Maintenance),None] {
+            handoff_wait(install,"original",wait).unwrap();assert_eq!(receipt(install,"exact-stop").unwrap().unwrap()["reason"],failure);
+        }
+        h.stopping=false;h.sync(&root,vec![(1,3,"codex".into())]);assert!(h.handoff_ready());assert_eq!(h.handoff_wait(),None,"non-stopping reexec preserves prepared live CLI work");
+        // The shared native-controller fixture continues with this same queued request.
+
     }
 
     // H-A5: one durable request -> qualified preparation -> new owner recovery -> the original receipt.
@@ -571,7 +619,7 @@ mod tests {
         failed(&install,"exact-restart","native definition unavailable").unwrap();
         assert!(receipt(&install,"exact-restart").unwrap().unwrap()["reason"].as_str().unwrap().contains("retry service restart --request exact-restart"));
         let failure=receipt(&install,"exact-restart").unwrap().unwrap()["reason"].clone();
-        update_wait(&install,"original").unwrap();
+        handoff_wait(&install,"original",Some(HandoffWait::Maintenance)).unwrap();
         assert_eq!(receipt(&install,"exact-restart").unwrap().unwrap()["reason"],failure,"queued failure survives a background progress tick");
         prepare(&install,"original").unwrap();assert_eq!(receipt(&install,"exact-restart").unwrap().unwrap()["state"],"applied");
         assert!(receipt(&install,"exact-restart").unwrap().unwrap()["reason"].is_null(),"qualified preparation clears the resolved queued failure");

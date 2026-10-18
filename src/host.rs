@@ -429,6 +429,17 @@ impl Host {
             && self.slots.keys().all(|(root,_,_)|self.prepared.contains(root))
     }
 
+    pub fn handoff_wait(&self)->Option<crate::lifecycle::HandoffWait> {
+        use crate::lifecycle::HandoffWait::*;
+        if self.handoff_ready() {None}
+        else if self.stopping&&!self.slots.is_empty() {Some(Execution)}
+        else if self.rebuilding||self.held.is_some() {Some(Recovery)}
+        else if self.stopping&&self.busy.values().any(|busy|*busy)
+            ||self.busy.keys().chain(self.slots.keys().map(|(root,_,_)|root)).any(|root|!self.prepared.contains(root)) {Some(Project)}
+        else if self.updating.is_some() {Some(Maintenance)}
+        else {None}
+    }
+
     /// Once all projects prepared, none can re-enter before the coordinator switches images.
     pub fn begin_pass(&mut self, root:&Path) -> bool {
         if self.handoff_ready() {return false;}
@@ -804,11 +815,10 @@ pub fn run(install: &Path) -> Res<()> {
             for root in &roots {
                 if let Err(e) = crate::poke(root) { append_project(install, root, &e); }
             }
-            if h.updating.is_some() {
-                drop(h);
-                if let Err(e)=crate::lifecycle::update_wait(install,&instance) {if reported!=e {crate::platform::log(&e);reported=e;}}
-                h=shared.lock().unwrap_or_else(|e|e.into_inner());
-            }
+            let wait=h.handoff_wait();
+            drop(h);
+            if let Err(e)=crate::lifecycle::handoff_wait(install,&instance,wait) {if reported!=e {crate::platform::log(&e);reported=e;}}
+            h=shared.lock().unwrap_or_else(|e|e.into_inner());
             if h.handoff_ready() {
                 if h.stopping&&h.stop_controller.is_some() {drop(h);std::thread::sleep(std::time::Duration::from_secs(1));continue;}
                 let stopping=h.stopping;

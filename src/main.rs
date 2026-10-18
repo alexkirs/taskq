@@ -7,8 +7,10 @@ macro_rules! log {
 
 mod admission;
 mod host;
+mod host_control;
 mod board;
 mod core;
+mod control;
 mod data;
 mod dispatch;
 mod enrollment;
@@ -20,6 +22,7 @@ mod requests;
 mod platform;
 mod policy;
 mod resources;
+mod lifecycle;
 #[cfg(target_os = "linux")]
 mod linux_sandbox;
 #[cfg(windows)]
@@ -42,7 +45,6 @@ use core::{Entry, State, Task, entry, fold};
 use dispatch::{Op, Receipt, act, answer_picks, close_checked, current, deps_open};
 use serde_json::{Value, json};
 use service::{Config, Service};
-#[cfg(unix)]
 use service::Kid;
 use snapshot::in_scope;
 use std::collections::{BTreeMap, HashMap};
@@ -65,13 +67,13 @@ const USAGE: &str = "taskq agents
  taskq close N [M..] [--text VERDICT] | taskq approve N [--sha SHA]
  taskq recipe NAME --run ID [--goal G] [--start]
  taskq status [--only L,..] [--json] | taskq inbox N
- taskq profile [guide|export|tasks|board] [--since 24h] | taskq retro | taskq add --retro K [--type T ..]
+ taskq profile [guide|export|tasks|board|actions|health|migrate] [--since 24h] | taskq retro | taskq add --retro K [--type T ..]
  taskq wait [--window MIN] [--only L,..]
  taskq cleanup [--force] | taskq update [--check]
  taskq enroll <https-url> [--headless] | taskq connection status | taskq disconnect
  taskq service install|run|pause|resume|status|restart|stop|uninstall|list
  taskq service focus [all|off|<label..>] [--request TEXT]
- taskq service capacity [--host H] [--mode auto|fixed] [--max N|none] [--claude N] [--codex N] [--codex-app N] [--load-gate on|off] [--cpu-max P] [--memory-min P]
+ taskq service capacity [--host H] [--max N|none] [--claude N] [--codex N] [--codex-app N] [--load-gate on|off] [--cpu-max P] [--memory-min P]
  taskq service permissions [--runtime R --mode restricted|workspace|full|none [--scope host|project]]
  taskq service resources [--grant ID --actor ID --hours N [--project P].. [--runtime R].. [--host-policy] | --revoke ID]
  taskq tray [--snapshot DIR [--route R,..]] [--icon FILE] | taskq selftest
@@ -93,7 +95,7 @@ impl Args {
         while let Some(x) = it.next() {
             match x.strip_prefix("--") {
                 Some(k) => {
-                    let val = if matches!(k, "later" | "hold" | "start" | "check" | "force" | "help" | "json" | "apply" | "headless" | "host-policy") { String::new() } else { it.next().cloned().ok_or(format!("--{k} needs a value"))? };
+                    let val = if matches!(k, "later" | "hold" | "start" | "check" | "force" | "help" | "json" | "apply" | "headless" | "host-policy") || k=="host"&&a.pos==["service","uninstall"] { String::new() } else { it.next().cloned().ok_or(format!("--{k} needs a value"))? };
                     a.flags.entry(k.to_string()).or_default().push(val);
                 }
                 None => a.pos.push(x.clone()),
@@ -165,10 +167,16 @@ fn root_for(env: Option<PathBuf>, cwd: PathBuf) -> Res<PathBuf> {
 }
 
 fn hostname() -> String {
-    platform::quiet(&mut std::process::Command::new("hostname")).output().ok().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default()
+    coreq::process::output("host.identity", &mut std::process::Command::new("hostname"), std::time::Duration::from_secs(10)).ok().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default()
 }
 
 fn load(root: &Path) -> Res<(Config, Value)> {
+    let (mut cfg,raw)=project_config(root)?;
+    if let Ok(policy)=host::Policy::read(&cfg.install) {policy.apply(&mut cfg);}
+    Ok((cfg,raw))
+}
+
+fn project_config(root:&Path)->Res<(Config,Value)> {
     let p = root.join("taskq.json");
     let v: Value = serde_json::from_str(&fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display()))?).map_err(|e| format!("{}: {e}", p.display()))?;
     let str_or = |k: &str, d: &str| v[k].as_str().unwrap_or(d).to_string();
@@ -183,7 +191,7 @@ fn load(root: &Path) -> Res<(Config, Value)> {
     };
     let board = board::kind(&str_or("board", "github"))?;
     let (publish, delivery, delivery_revision) = delivery(&v)?;
-    let mut cfg = Config {
+    let cfg = Config {
         root: root.to_path_buf(),
         install: platform::default_install(),
         board,
@@ -205,7 +213,6 @@ fn load(root: &Path) -> Res<(Config, Value)> {
     if cfg.repo.is_empty() {
         return Err("taskq.json: repo is required".into());
     }
-    if let Ok(policy) = host::Policy::read(&cfg.install) { policy.apply(&mut cfg); }
     profile::project(&cfg.repo);
     profile::host(&cfg.me);
     Ok((cfg, v))
@@ -247,9 +254,99 @@ fn dot(root: &Path) -> PathBuf {
     root.join(".taskq")
 }
 
-fn poke(root: &Path) {
-    let _ = fs::create_dir_all(dot(root));
-    touch(&dot(root).join("poke"));
+fn poke(root: &Path) -> Res<()> {
+    poke_locked(&wake_lock(root)?)
+}
+
+fn wake_lock(root: &Path) -> Res<coreq::file_lock::Lock> {
+    coreq::telemetry::capture::operation("wake.lock", || {
+        fs::create_dir_all(dot(root)).map_err(|error| ("wake-directory", error))?;
+        let file = fs::OpenOptions::new().write(true).create(true).truncate(false).open(dot(root).join("poke")).map_err(|error| ("wake-open", error))?;
+        coreq::file_lock::try_lock_file(file).map_err(|error| ("wake-lock", std::io::Error::from(error)))
+    }, |(class, _)| *class).map_err(|(class, error)| format!("service wake failed ({class}: {error}); check service status"))
+}
+
+#[tracing::instrument(name="poke",skip_all)]
+fn poke_locked(locked: &coreq::file_lock::Lock) -> Res<()> {
+    use std::io::Write;
+    coreq::telemetry::capture::operation("wake.write", || {
+        let context = coreq::telemetry::capture::TraceContext::current().map(|c| c.encode()).unwrap_or_else(|| ".".into());
+        let mut file = locked.file();
+        file.set_len(0).map_err(|error| ("wake-truncate", error))?;
+        file.write_all(context.as_bytes()).map_err(|error| ("wake-write", error))
+    }, |(class, _)| *class).map_err(|(class, error)| format!("service wake failed ({class}: {error}); state may already be saved; check service status"))
+}
+
+#[tracing::instrument(name="control.read",skip_all)]
+fn wake_read<T>(path: &Path, seen: &mut Option<String>, read: impl FnOnce() -> Res<T>) -> Res<(Option<coreq::telemetry::capture::TraceContext>, T)> {
+    use std::io::Read;
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => { *seen = None; return read().map(|state| (None, state)); }
+        Err(_) => return Err("wakeup context unreadable".into()),
+    };
+    let locked = coreq::file_lock::try_lock_shared_file(file).map_err(|_| "wakeup context busy")?;
+    let mut text = String::new();
+    locked.file().take(129).read_to_string(&mut text).map_err(|_| "wakeup context unreadable")?;
+    let link = if seen.as_ref() == Some(&text) || matches!(text.as_str(), "" | ".") { None } else { Some(coreq::telemetry::capture::TraceContext::decode(&text)?) };
+    let state = read()?;
+    *seen = Some(text);
+    Ok((link, state))
+}
+
+#[cfg(test)]
+fn wake_context(path: &Path, seen: &mut Option<String>) -> Res<Option<coreq::telemetry::capture::TraceContext>> {
+    wake_read(path, seen, || Ok(())).map(|(link, ())| link)
+}
+
+fn change_focus<T>(root: &Path, restrictive: bool, initialize: bool, change: impl FnOnce(&Path) -> Res<T>) -> Res<(T,String)> {
+    let receipt = coreq::telemetry::capture::CommandReceipt::current();
+    let received = receipt.as_ref().map_err(Clone::clone).and_then(|r| r.checkpoint("received"));
+    if !restrictive { if let Err(error) = &received { return Err(format!("command not applied: receipt unavailable ({error}); check service status")); } }
+    // Retain the settings lock through terminal commit, including partial failures.
+    let mut locked = None;
+    let mut tracking = None;
+    let mut tracking_error = None;
+    let result = (|| {
+        if initialize { fs::create_dir_all(dot(root)).map_err(|e| e.to_string())?; }
+        fs::metadata(dot(root)).map_err(|e| format!("focus unchanged: state directory unavailable: {e}"))?;
+        locked = Some(wake_lock(root)?);
+        let lock = locked.as_ref().unwrap();
+        let prepared=received.as_ref().map_err(Clone::clone)
+            .and_then(|_|receipt.as_ref().map_err(Clone::clone)).and_then(|r|control::begin(root,r));
+        match prepared {
+            Ok(pending)=>tracking=Some(pending),
+            Err(error) if restrictive=>tracking_error=Some(error),
+            Err(error)=>return Err(format!("command not applied: service tracking unavailable ({error})")),
+        }
+        // A failed mutation must never leave its new state attributed to the preceding signal.
+        lock.file().set_len(0).map_err(|e| format!("focus unchanged: cannot invalidate previous signal: {e}"))?;
+        let result = change(&dot(root));
+        let notified = poke_locked(lock);
+        match (result, notified) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), Ok(())) => Err(format!("{error}; focus may be partially saved; check service status")),
+            (Ok(_), Err(error)) => Err(error),
+            (Err(error), Err(wake)) => Err(format!("{error}; {wake}")),
+        }
+    })();
+    let terminal = receipt.and_then(|r| r.checkpoint(if result.is_ok() { "applied" } else { "failed" }));
+    if terminal.is_ok() {if let Some(pending)=tracking {
+        if let Err(error)=control::finish(root,pending,result.is_ok()) {tracking_error=Some(error);}
+    }}
+    let uncertain = received.err().or_else(|| terminal.as_ref().err().cloned()).map(|e|format!("durable receipt unknown ({e})"))
+        .into_iter().chain(tracking_error.map(|e|format!("service tracking unknown ({e})"))).collect::<Vec<_>>().join("; ");
+    let uncertain=(!uncertain.is_empty()).then_some(uncertain);
+    match (result, uncertain) {
+        (Ok(value), None) => {
+            let applied=terminal.unwrap();
+            println!("Command applied locally; service observation pending; receipt {applied}");
+            Ok((value,applied))
+        }
+        (Ok(_), Some(error)) => Err(format!("command applied locally; {error}; check service status before retry")),
+        (Err(error), None) => Err(format!("{error}; failure receipt {}", terminal.unwrap())),
+        (Err(error), Some(receipt)) => Err(format!("{error}; {receipt}; check service status before retry")),
+    }
 }
 
 /// Bump `p`'s mtime. Not `fs::write(p, "")`: on Windows rewriting an empty file keeps its mtime.
@@ -407,7 +504,10 @@ fn result_text(n: u64, text: &str, checks: &[String], opts: &[String], recommend
 fn shots_gate(git_bin: &str, root: &Path, sha: &str) -> Res<()> {
     let unknown = |e: String| format!("shots check unknown: {e}");
     let git = |args: &[&str]| {
-        let o = std::process::Command::new(git_bin).arg("-C").arg(root).args(args).output().map_err(|e| unknown(format!("{git_bin}: {e}")))?;
+        let o = match coreq::process::output("shots.git", std::process::Command::new(git_bin).arg("-C").arg(root).args(args), std::time::Duration::from_secs(30)) {
+            Ok(o) | Err(coreq::process::Failure::Exit(o)) => o,
+            Err(e) => return Err(unknown(format!("{git_bin}: {e}"))),
+        };
         if o.status.success() { Ok(String::from_utf8_lossy(&o.stdout).trim().to_string()) } else { Err(unknown(String::from_utf8_lossy(&o.stderr).trim().to_string())) }
     };
     // `ls-tree` succeeds with empty output for an absent path and fails for an unreadable tree-ish.
@@ -488,10 +588,12 @@ fn report(b: &dyn Board, cfg: &Config, raw: &Value, only: &[String]) -> Res<Stri
 }
 
 fn inbox(b: &dyn Board, n: u64) -> Res<String> {
-    let (issue, t, _) = current(b, n)?;
-    let mut out = vec![format!("#{n} {}\n{}", issue.title, b.url(n)), issue.body.trim().to_string(), format!("Folded: {}", serde_json::to_string(&t).unwrap_or_default())];
+    let issue = b.issue(n)?;
     let log = entries(b, n)?;
-    out.extend([format!("Revision: {}", core::revision(n, &log)), "Log:".into()]);
+    let projection = core::project(n, &log, deps_open(b, &issue.body));
+    let t = &projection.task;
+    let mut out = vec![format!("#{n} {}\n{}", issue.title, b.url(n)), issue.body.trim().to_string(), format!("Folded: {}", serde_json::to_string(&t).unwrap_or_default())];
+    out.extend([format!("Revision: {}", projection.revision), "Log:".into()]);
     for e in log {
         out.push(format!("[{}{}] {}", e.id, if e.edited { " edited, ignored" } else { "" }, e.body.trim()));
     }
@@ -555,54 +657,100 @@ fn launcher(install: &Path) -> PathBuf {
     if l.is_file() { l } else { std::env::current_exe().unwrap_or_else(|_| PathBuf::from("taskq")) }
 }
 
-/// Sleep until a poke or `secs`; `tick` runs every second (the load gate's sampling, § 3).
-fn sleep_until_poke(poke: &Path, secs: u64, tick: &mut dyn FnMut()) {
-    let mtime = |p: &Path| fs::metadata(p).and_then(|m| m.modified()).ok();
-    let start = mtime(poke);
-    let host_poke = platform::default_install().join("poke");
-    let host_start = mtime(&host_poke);
-    for _ in 0..secs {
-        std::thread::sleep(Duration::from_secs(1));
-        tick();
-        if mtime(poke) != start || mtime(&host_poke) != host_start {
+fn poke_times(paths: &[PathBuf; 2]) -> [Option<SystemTime>; 2] {
+    paths.each_ref().map(|p| fs::metadata(p).and_then(|m| m.modified()).ok())
+}
+
+/// Compare with the pre-pass snapshot: a command arriving during work must not become the sleep baseline.
+fn sleep_until_poke(paths: &[PathBuf; 2], start: [Option<SystemTime>; 2], until: Instant, tick: &mut dyn FnMut()) {
+    loop {
+        let left=until.saturating_duration_since(Instant::now());
+        if left.is_zero() || poke_times(paths) != start {
             return;
         }
+        std::thread::sleep(Duration::from_secs(1).min(left));
+        tick();
     }
 }
 
-/// The kids file carries live children across the update re-exec (unix). It names the PID that wrote it: a file from
-/// a crashed process is ignored and its attempts go `gone` (§ 4 restart). A malformed file is unknown: nothing is
-/// adopted and the file stays (§ 4 Data).
-fn kids_file(root: &Path) -> Vec<data::KidLine> {
-    let path = dot(root).join("kids");
-    let parsed = match fs::read_to_string(&path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return vec![],
-        Err(e) => Err(format!("kids: unreadable ({e}); file kept")),
-        Ok(t) => data::kids(&t),
+/// Read-only recovery evidence; failed identity reads and a still-live foreign owner prevent takeover.
+fn kids_path(install:&Path,root:&Path)->Res<PathBuf> {
+    let root=root.canonicalize().map_err(|e|format!("native recovery root unavailable: {e}"))?;
+    let root=root.to_str().ok_or("native recovery root is not UTF-8")?;
+    let hash:String=ring::digest::digest(&ring::digest::SHA256,root.as_bytes()).as_ref().iter().map(|b|format!("{b:02x}")).collect();
+    Ok(install.join("native").join(format!("{hash}.kids")))
+}
+
+fn kids_file(install:&Path,root: &Path) -> Res<Vec<data::KidLine>> {
+    use std::io::Read;
+    let path = kids_path(install,root)?;
+    let file = match fs::File::open(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return match fs::symlink_metadata(dot(root).join("kids")) {
+                Err(e) if e.kind()==std::io::ErrorKind::NotFound=>Ok(vec![]),
+                _=>Err("legacy project kids record requires native reconciliation; file kept".into()),
+            };
+        },
+        Err(e) => return Err(format!("kids: unreadable ({e}); file kept")),
+        Ok(file) => file,
     };
-    match parsed {
-        Err(e) => {
-            log!("{e}; its attempts go gone");
-            vec![]
-        }
-        Ok((pid, kids)) => {
-            let _ = fs::remove_file(&path);
-            if pid == std::process::id() { kids } else { vec![] }
-        }
+    let mut text=String::new();
+    file.take(data::KIDS_MAX+1).read_to_string(&mut text).map_err(|e|format!("kids: unreadable ({e}); file kept"))?;
+    let (owner,kids)=data::kids(&text)?;
+    let current=coreq::process::identity(std::process::id()).map_err(|e|format!("service identity unknown: {e}"))?;
+    if current.as_ref()!=Some(&owner) && coreq::process::identity(owner.pid).map_err(|e|format!("kids: previous service identity unknown: {e}; file kept"))?.as_ref()==Some(&owner) {
+        return Err("kids: previous service still alive; file kept, native reconciliation required".into());
     }
+    Ok(kids)
 }
 
-fn adopt(s: &mut Service, root: &Path) {
-    let kids = kids_file(root);
-    #[cfg(unix)]
-    for (task, attempt, rt, pid, delivered) in kids {
-        s.adopt(Kid { task, attempt, rt, proc: Box::new(runtime::Adopted(pid)) }, delivered);
+fn adopt(s: &mut Service, install:&Path, root: &Path) -> Res<()> {
+    let kids = kids_file(install,root)?;
+    for k in kids {
+        if let Some(owned)=s.kids.iter().find(|owned|owned.task==k.task||owned.execution==k.execution) {
+            if owned.task==k.task&&owned.attempt==k.attempt&&owned.execution==k.execution&&owned.rt==k.runtime
+                &&owned.proc.native_identity()?==k.process {continue;}
+            return Err("native recovery differs from the retained handle; file kept".into());
+        }
+        let history=board::entries(s.board,k.task)?;
+        let execution=core::executions(k.task,&history).into_iter().find(|x|x.id==k.execution && x.attempt==k.attempt && x.host==s.cfg.me && x.runtime==k.runtime)
+            .ok_or("native recovery identity does not match board ownership; file kept")?;
+        match execution.release {
+            Some(core::Release::Exit)=>{
+                if runtime::released_execution_live(&k).map_err(|e|format!("released native scope unknown: {e}"))? {
+                    return Err("board exit contradicts a live native identity; file kept for reconciliation".into());
+                }
+                retire_kid(&s.cfg,k.task,k.attempt,k.execution)?;
+                continue;
+            },
+            Some(core::Release::NoStart)=>return Err("board no-start contradicts a recorded native process; file kept".into()),
+            None=>{},
+        }
+        if k.runtime=="claude" {
+            let proc=runtime::recover(root,install,k.task,&execution)?;
+            s.adopt(Kid { unknown:None, stopping:false, session_url:None,execution:k.execution,task:k.task,attempt:k.attempt,rt:k.runtime,proc})?;
+            continue;
+        }
+        #[cfg(windows)]
+        let native:Box<dyn runtime::Proc>=Box::new(runtime::windows_process::Execution::recover(k.process.clone(),k.job.as_deref().ok_or("legacy Windows execution has no native job scope; file kept")?)?);
+        #[cfg(unix)]
+        let native:Box<dyn runtime::Proc>={
+            if k.job.is_some() {return Err("Windows native scope cannot be adopted on Unix; file kept".into());}
+            Box::new(runtime::Adopted::new(k.process.clone()))
+        };
+        let worker=runtime::attempt_log(root,"worker",k.task,k.attempt);
+        let reviewer=runtime::attempt_log(root,"reviewer",k.task,k.attempt);
+        let log=match (worker.is_file(),reviewer.is_file()) {
+            (true,false)=>worker,(false,true)=>reviewer,
+            _=>return Err("kids: native attempt log missing or ambiguous; file kept".into()),
+        };
+        let proc=runtime::CliTurn {proc:native,log,pos:k.offset,start:k.offset,stopping:false,accepted:false,read_error:None,native:Some(k.process),recovery:None};
+        s.adopt(Kid { unknown:None, stopping:false, session_url:None, execution:k.execution,task:k.task,attempt:k.attempt,rt:k.runtime,proc:Box::new(proc) })?;
     }
-    #[cfg(not(unix))]
-    let _ = (s, kids);
+    Ok(())
 }
 
-fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
+fn service_run(c: &Ctx, host: Option<host::Shared>,legacy:Option<&host_control::LegacyOwner>) -> Res<()> {
     let cfg = &c.cfg;
     let exe = launcher(&cfg.install);
     let board_env = cfg.board.worker_env(&platform::tool(&cfg.install), &cfg.web_host)?;
@@ -616,6 +764,8 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
         } else { runtime::spawn(&env, l) }
     };
     let mut s = Service::new(c.board.as_ref(), cfg, platform::VERSION, Box::new(start));
+    s.legacy_handoff=legacy.is_some();
+    s.recover = Some(Box::new(|task, execution| runtime::recover(&cfg.root, &cfg.install, task, execution)));
     s.host = host.clone();
     s.instance = enrollment::installation_id(&cfg.install).map(|id| service_id(&id))?;
     // § 4 machine line: agentq's `host.name` is the same `hostname` output; WSL as agentq detects it
@@ -633,7 +783,8 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
         }
         std::thread::sleep(Duration::from_secs(cfg.poll.max(1)));
     }
-    adopt(&mut s, &cfg.root);
+    let mut adoption=adopt(&mut s, &cfg.install, &cfg.root);
+    if legacy.is_none() {adoption.as_ref().map_err(Clone::clone)?;}
     let is_installed = installed(&cfg.install);
     let began = Instant::now();
     log!("{}", incident::disclosure(Some(&cfg.root)));
@@ -641,8 +792,8 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
     let mut update: Option<String> = None;
     let mut restart_empty: Option<u64> = None;
     let mut waits_logged = String::new();
-    let _ = fs::remove_file(d.join("restart"));
-    operator::recover(&cfg.root);
+    if legacy.is_none() {let _ = fs::remove_file(d.join("restart"));}
+    if legacy.is_none() {operator::recover(&cfg.root);}
     // ponytail: the operator takes no slot of `limits`; count it when operators crowd out workers
     let mut tray = None;
     let project = project_name(&cfg.root);
@@ -663,9 +814,30 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
     let mut dashq = enrollment::Sender::default();
     let mut policy_exchange = resources::Exchanger::default();
     let mut panics = host::Panics::default();
+    let mut legacy_installation:Option<std::thread::JoinHandle<Res<String>>>=None;
+    let mut legacy_controller:Option<host_control::Control>=None;
+    let mut legacy_retry:Option<Instant>=None;
+    let mut legacy_error:Option<String>=None;
+    let pokes = [d.join("poke"), cfg.install.join("poke")];
+    let mut observed_poke = None;
+    let mut observed_command = None;
     loop {
+        if let Some(host)=&host {
+            let proceed=host.lock().map_err(|_|"host handover unknown")?.begin_pass(&cfg.root);
+            if !proceed {std::thread::sleep(Duration::from_secs(1));continue;}
+        }
+        let pass_began=Instant::now();
+        let poke_start = poke_times(&pokes);
+        telemetry::diagnostic::poll(&cfg.install);
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Res<()> {
-        let reduced = panics.quarantined() || began.elapsed().as_secs() < panics.until;
+        if legacy.is_some()&&adoption.is_err() {adoption=adopt(&mut s,&cfg.install,&cfg.root);}
+        let latch=legacy.map(|owner|host::legacy_latched(&cfg.install,owner)).transpose();
+        if matches!(latch,Ok(Some(true))) {s.legacy_prepared=true;}
+        let handoff_error=adoption.as_ref().err().cloned().or_else(||legacy.and_then(|owner|owner.verify(&platform::tool(&cfg.install)).err())).or_else(||latch.err());
+        let control = control::snapshot(&cfg.root,&mut observed_poke,&mut observed_command);
+        let command=match &control {Ok(snapshot)=>snapshot.command.clone(),Err(e)=>json!({"state":"unknown","reason":e})};
+        let wakeup = control.as_ref().ok().and_then(|s|s.link.as_ref()).map(|link| link.span().entered());
+        let reduced = panics.quarantined() || began.elapsed().as_secs() < panics.until||handoff_error.is_some()||s.legacy_prepared;
         // § 3: capacity reloads before each admission decision; children are untouched
         let cap = fs::read_to_string(cfg.root.join("taskq.json")).map_err(|e| e.to_string())
             .and_then(|t| serde_json::from_str::<Value>(&t).map_err(|e| format!("taskq.json: {e}")))
@@ -674,7 +846,9 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
                     let h = h.lock().map_err(|_| "host admission poisoned; launches held")?;
                     let p = h.policy.as_ref().map_err(Clone::clone)?;
                     p.apply(&mut s.cfg);
-                    p.project(&v)
+                    let cap=p.project(&v)?;
+                    s.cfg.limits=v["limits"].as_object().into_iter().flatten().map(|(rt,n)|(rt.clone(),n.as_u64().unwrap() as u32)).collect();
+                    Ok(cap)
                 }
                 None => service::capacity(&v, &cfg.me),
             });
@@ -691,7 +865,7 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
         s.mono = host.as_ref().and_then(|h| h.lock().ok().map(|h| h.elapsed())).unwrap_or_else(|| began.elapsed().as_secs());
         s.wall = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
         // § 4 Data: an unreadable focus admits nothing and reads unknown with its reason
-        let focus = data::focus(&cfg.root);
+        let focus = control.map(|snapshot|snapshot.focus);
         if focus.as_ref().err() != focus_error.as_ref() {
             if let Err(e) = &focus { log!("{e}; nothing admitted"); }
             focus_error = focus.as_ref().err().cloned();
@@ -701,7 +875,7 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
             if let Ok(h) = host.lock() { if h.draining.contains(&cfg.root) { s.focus.clear(); } }
         }
         s.focus_error = focus_error.clone();
-        let r = if reduced { s.reduced().and_then(|_| Err(panics.reason.clone().unwrap_or_default())) } else { s.pass() };
+        let r = if s.legacy_prepared {s.reduced()}else if reduced { s.reduced().and_then(|_| Err(handoff_error.clone().or_else(||panics.reason.clone()).unwrap_or_default())) } else { s.pass() };
         s.sync_host();
         for l in s.log.drain(..) {
             log!("{l}");
@@ -741,7 +915,7 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
         }
         let at = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let kids: Vec<Value> = s.kids.iter().map(|k| {
-            let unknown = s.unknown.get(&k.attempt);
+            let unknown = k.unknown.as_ref();
             json!({"task": k.task, "attempt": k.attempt, "rt": k.rt, "pid": k.proc.id(), "live": if unknown.is_some() { "unknown" } else { "running" }, "reason": unknown})
         }).collect();
         let request = fs::read_to_string(d.join("focus.request")).ok();
@@ -761,28 +935,33 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
             Some(snap) => for (k, v) in snap.status_keys(error.as_deref()) { status[k] = v; },
             None => { status["complete"] = json!(false); status["reason"] = json!(error.as_deref().unwrap_or("no board read yet")); status["tasks"] = json!([]); }
         }
-        for (k, v) in [("focus", if focus_error.is_some() { Value::Null } else { json!(s.focus) }), ("focus_error", json!(focus_error)), ("kids", json!(kids)), ("issues", json!(issues)), ("log", json!(log)),
+        for (k, v) in [("focus", if focus_error.is_some() { Value::Null } else { json!(s.focus) }), ("focus_error", json!(focus_error)), ("focus_command",command), ("kids", json!(kids)), ("issues", json!(issues)), ("log", json!(log)),
             ("tasks_age_seconds", json!(s.tasks_read.map(|t| t.elapsed().as_secs()))), ("request", json!(request)), ("events_since", json!(s.events_since)),
-            ("capacity", s.capacity_json()), ("hold", json!(s.hold)), ("access", json!(access.iter().map(|e| e.json()).collect::<Vec<_>>())), ("agents", json!(agents.as_ref().map(|a| &a.1))),
-            ("restart_waits", json!(d.join("restart").exists().then(|| restart_waits(&s, &cfg.root)))),
+            ("execution_waits", json!(s.execution_waits)), ("capacity", s.capacity_json()), ("hold", json!(s.hold)), ("access", json!(access.iter().map(|e| e.json()).collect::<Vec<_>>())), ("agents", json!(agents.as_ref().map(|a| &a.1))),
+            ("restart_waits", json!((d.join("restart").exists()||host.as_ref().is_some_and(|h|h.lock().is_ok_and(|h|h.restart))).then(|| lifecycle_waits(&s, &cfg.root, host.as_ref().is_some_and(|h|h.lock().is_ok_and(|h|h.stopping)))))),
             ("incident", incident::status(&cfg.root)), ("incident_notice", json!(incident::notice(&cfg.root))),
-            ("requests", requests_json), ("connection", json!(dashq.outcome))]
+            ("requests", requests_json), ("connection", json!(dashq.outcome)), ("telemetry",telemetry::diagnostic::health())]
         {
             status[k] = v;
         }
-        let _ = coreq::status::write(&tool, &cfg.root, &status);
-        if host.is_none() && is_installed && began.elapsed().as_secs() >= cfg.rollback_after {
+        if let Some(owner)=legacy {
+            status["handoff"]=json!({"state":if handoff_error.is_some()||legacy_error.is_some() {"unknown"}else if s.legacy_prepared {"prepared"}else{"draining"},"owner":owner,
+                "reason":handoff_error.as_ref().or(legacy_error.as_ref()),"waits":lifecycle_waits(&s,&cfg.root,true)});
+        }
+        let published = publish_status(&tool, &cfg.root, &status, host.as_ref());
+        drop(wakeup);
+        if host.is_none() && legacy.is_none() && is_installed && published && began.elapsed().as_secs() >= cfg.rollback_after {
             let h = cfg.install.join("releases").join(platform::VERSION).join("healthy");
             if !h.exists() {
-                let _ = fs::write(h, "");
+                if let Err(e) = fs::write(h, "") { log!("release health unknown: {e}"); }
             }
         }
         // § 4 step 7: a not installed service only reports a newer version; `<root>/.taskq/update` checks at once
-        let asked = fs::remove_file(d.join("update")).is_ok();
+        let asked = legacy.is_none()&&fs::remove_file(d.join("update")).is_ok();
         // § 8 step 3: a pending restart already goes to `current`; repeating the check would only repeat its log line
         let pending = is_installed && d.join("restart").exists();
         if host.is_some() && (asked || pending) { touch(&cfg.install.join(if asked { "update" } else { "restart" })); }
-        if host.is_none() && !pending && (asked || checked.is_none_or(|t| t.elapsed().as_secs() >= cfg.update_every)) {
+        if host.is_none() && legacy.is_none() && !pending && (asked || checked.is_none_or(|t| t.elapsed().as_secs() >= cfg.update_every)) {
             checked = Some(Instant::now());
             if is_installed {
                 match platform::service_update(&cfg.install) {
@@ -804,9 +983,9 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
             }
         }
         restart_watch(&mut restart_empty, cfg!(windows) && d.join("restart").exists() && s.kids.is_empty(), began.elapsed().as_secs(), cfg.update_every);
-        if host.is_none() && is_installed && d.join("restart").exists() {
+        if host.is_none() && legacy.is_none() && is_installed && d.join("restart").exists() {
             // Windows re-exec waits for the live children; the request stays until it can go
-            let waits = restart_waits(&s, &cfg.root).join(", ");
+            let waits = lifecycle_waits(&s, &cfg.root, false).join(", ");
             if waits.is_empty() {
                 let _ = fs::remove_file(d.join("restart"));
                 log!("restart requested");
@@ -819,30 +998,53 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
         // § 4 Data: the pruners run hourly
         if !reduced && pruned.is_none_or(|t| t.elapsed().as_secs() >= 3600) {
             pruned = Some(Instant::now());
-            let live: Vec<u64> = s.kids.iter().map(|k| k.attempt).collect();
+            let live = s.retained_attempts();
             for l in data::prune(&cfg.root, &cfg.install, &project, &live) {
                 log!("{l}");
             }
         }
-        if !reduced && host.as_ref().is_none_or(|h| h.lock().is_ok_and(|h| !h.restart && !h.draining.contains(&cfg.root))) {
+        if legacy.is_none() && !reduced && host.as_ref().is_none_or(|h| h.lock().is_ok_and(|h| !h.restart && !h.draining.contains(&cfg.root))) {
             operator::owner_comments(&cfg.root, &project, &issues, &s.owner_comments);
             operator::step(&cfg.root, &cfg.install, &exe, op_rt);
         }
-        if host.is_none() && is_installed {
+        if host.is_none() && legacy.is_none() && is_installed {
             keep_tray(&cfg.install, &mut tray);
         }
         if let Some(host) = &host {
             if let Ok(mut h) = host.lock() {
             let registered = !h.draining.contains(&cfg.root);
-            let drained = s.kids.is_empty() && !operator::running(&cfg.root);
+            let drained = s.idle() && !operator::running(&cfg.root);
             if !registered && drained { h.sync(&cfg.root, vec![]); h.ready(&cfg.root, false); return Err("project drained".into()); }
             if registered { h.busy.insert(cfg.root.clone(), !drained); }
-            if h.restart && restart_waits(&s, &cfg.root).is_empty() {
+            if h.restart && (if h.stopping {drained}else{lifecycle_waits(&s, &cfg.root, false).is_empty()}) {
                 match save_kids(&s, &cfg.root) {
                     Ok(()) => { h.prepared.insert(cfg.root.clone()); }
                     Err(e) => { h.prepared.remove(&cfg.root); log!("handoff unknown: {e}"); }
                 }
             } else { h.prepared.remove(&cfg.root); }
+            }
+        }
+        if let Some(owner)=legacy {
+            if legacy_installation.as_ref().is_some_and(|job|job.is_finished()) {
+                let outcome=legacy_installation.take().unwrap().join().unwrap_or_else(|_|Err("legacy installation owner panicked; original transition retained".into()));
+                if let Err(reason)=outcome {if legacy_error.as_ref()!=Some(&reason) {log!("legacy installation: {reason}");}legacy_error=Some(reason);}
+            }
+            if !s.legacy_prepared&&legacy_installation.is_none()&&legacy_retry.is_none_or(|at|at.elapsed().as_secs()>=5) {
+                legacy_retry=Some(Instant::now());let install=cfg.install.clone();let owner=owner.clone();
+                match std::thread::Builder::new().name("taskq-legacy-install".into()).spawn(coreq::telemetry::capture::bind(move ||host::legacy_install(&install,&owner))) {
+                    Ok(job)=>legacy_installation=Some(job),Err(e)=>legacy_error=Some(format!("legacy installation not started: {e}")),
+                }
+            }
+            if (!reduced||s.legacy_prepared)&&handoff_error.is_none()&&error.is_none()&&s.idle()&&!operator::running(&cfg.root) {
+                match host::prepare_legacy(&cfg.install,owner) {
+                    Ok(true)=>{s.legacy_prepared=true;legacy_error=None;},Ok(false)=>{},Err(e)=>legacy_error=Some(e),
+                }
+            }
+            if let Some(outcome)=legacy_controller.as_mut().and_then(host_control::Control::poll) {
+                legacy_controller=None;if let Err(e)=outcome {legacy_error=Some(e);}
+            }
+            if s.legacy_prepared&&legacy_controller.is_none() {
+                match host::dispatch_legacy(&cfg.install) {Ok(control)=>legacy_controller=Some(control),Err(e)=>legacy_error=Some(e)}
             }
         }
         // every 30 s, also between board polls: a gate sample (when enabled) and a fresh capacity in status.json (§ 4)
@@ -864,22 +1066,23 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
             status["tasks_age_seconds"] = json!(s.tasks_read.map(|t| t.elapsed().as_secs()));
             status["capacity"] = s.capacity_json();
             status["at"] = json!(wall);
-            let _ = coreq::status::write(&tool, &cfg.root, &status);
+            publish_status(&tool, &cfg.root, &status, host.as_ref());
         };
         tick();
-        sleep_until_poke(&d.join("poke"), if reduced { 1 } else { cfg.poll }, &mut tick);
+        sleep_until_poke(&pokes, poke_start, pass_began+Duration::from_secs(if reduced {1} else {cfg.poll}), &mut tick);
         Ok(())
         }));
         match outcome {
             Ok(Ok(())) => {}
+            Ok(Err(e)) if legacy.is_some()=>{log!("legacy supervision: {e}; ownership retained");std::thread::sleep(Duration::from_secs(1));},
             Ok(Err(e)) => return Err(e),
             Err(payload) => {
-                if host.is_none() { std::panic::resume_unwind(payload); }
-                if panics.quarantined() {
+                if host.is_none()&&legacy.is_none() { std::panic::resume_unwind(payload); }
+                if panics.quarantined()&&let Some(host)=&host {
                     // Stop the board loop, retaining its handles solely for safe exit/update monitoring (R11).
                     s.unready();
                     loop {
-                        let monitored = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| stopped_handoff(&mut s, host.as_ref().unwrap(), cfg)));
+                        let monitored = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| stopped_handoff(&mut s, host, cfg)));
                         if matches!(monitored, Ok(Ok(true))) { return Err("project drained".into()); }
                         std::thread::sleep(Duration::from_secs(1));
                     }
@@ -892,26 +1095,107 @@ fn service_run(c: &Ctx, host: Option<host::Shared>) -> Res<()> {
                     SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs()), panics.reason.clone(), None);
                 status["complete"] = json!(false);
                 status["kids"] = json!(s.kids.iter().map(|k| json!({"task": k.task, "attempt": k.attempt, "rt": k.rt, "pid": k.proc.id()})).collect::<Vec<_>>());
-                let _ = coreq::status::write(&platform::tool(&cfg.install), &cfg.root, &status);
+                publish_status(&platform::tool(&cfg.install), &cfg.root, &status, host.as_ref());
             }
         }
     }
 }
 
-fn save_kids(s: &Service, root: &Path) -> Res<()> {
-    let mut text = format!("pid {}\n", std::process::id());
-    for k in &s.kids { text += &format!("{} {} {} {} {}\n", k.task, k.attempt, k.rt, k.proc.id(), s.delivered(k.attempt)); }
-    platform::write_atomic(&dot(root).join("kids"), &text)
+fn legacy_service(install:&Path,owner:&host_control::LegacyOwner)->Res<()> {
+    PROJECT_ROOT.set(Some(owner.root.clone()));
+    platform::project_log(install.join(format!("{}.log",owner.project)));
+    let mut reported=String::new();
+    loop {
+        let outcome=(|| {
+            owner.verify(&platform::tool(install))?;
+            // The host policy cannot change the permissions/capacity of an owner still draining its old unit.
+            let (cfg,raw)=project_config(&owner.root)?;
+            if cfg.install.canonicalize().ok()!=Some(install.canonicalize().map_err(|e|e.to_string())?) {
+                return Err("legacy installation scope differs; ownership retained".into());
+            }
+            let board=cfg.board.open(&cfg.web_host,&cfg.repo,raw["label_schema"].as_str(),&platform::tool(install))?;
+            service_run(&Ctx {cfg,raw,board},None,Some(owner))
+        })();
+        let error=outcome.err().unwrap_or_else(||"legacy supervision ended; ownership retained".into());
+        if reported!=error {log!("{error}; legacy handoff waiting");reported=error;}
+        std::thread::sleep(Duration::from_secs(1));
+    }
 }
 
-/// A failed reduced loop no longer beats or touches the board. Its exact handles still fence an image switch.
+fn publish_status(tool: &coreq::Tool, root: &Path, status: &Value, host: Option<&host::Shared>) -> bool {
+    let mut status=status.clone();
+    if let Some(host)=host {
+        status["host_instance"]=host.lock().map(|h|json!(h.instance)).unwrap_or(Value::Null);
+        status["host_install"]=status["host_instance"].as_str().and_then(|instance|host::install_acknowledgement(&tool.install,root,instance)).map_or(Value::Null,|id|json!(id));
+    }
+    let written = coreq::status::write(tool, root, &status);
+    if let Err(e) = &written { log!("status publication failed: {e}; observed state unknown"); }
+    let qualified = written.is_ok() && snapshot::complete(&status) && status["error"].is_null() && status["focus_error"].is_null();
+    if let Some(host) = host { if let Ok(mut h) = host.lock() { h.publication(root, qualified); } }
+    qualified
+}
+
+fn write_kids(install:&Path,root:&Path,kids:&[data::KidLine])->Res<()> {
+    let owner=coreq::process::identity(std::process::id()).map_err(|e|e.to_string())?.ok_or("service native identity missing")?;
+    let mut text=format!("pid {} {} executor-v1\n",owner.pid,owner.started);
+    for k in kids {
+        text+=&format!("{} {} {} {} {} {} {}{}\n",k.task,k.attempt,k.runtime,k.process.pid,k.process.started,k.execution,k.offset,k.job.as_ref().map(|key|format!(" job-global:{key}")).unwrap_or_default());
+    }
+    data::kids(&text)?;
+    let path=kids_path(install,root)?;
+    fs::create_dir_all(path.parent().unwrap()).map_err(|e|e.to_string())?;
+    coreq::write_durable(&path, &text)
+}
+
+fn checkpoint_kid(install:&Path,root:&Path,kid:data::KidLine)->Res<()> {
+    let mut kids=kids_file(install,root)?;
+    if let Some(old)=kids.iter_mut().find(|k|k.task==kid.task) {
+        if *old==kid { return Ok(()) }
+        if old.execution>=kid.execution { return Err("execution already has different or newer native recovery identity; file kept".into()); }
+        if runtime::execution_live(old)? {
+            return Err("previous native execution still present; recovery identity kept".into());
+        }
+        *old=kid;
+    } else { kids.push(kid); }
+    write_kids(install,root,&kids)
+}
+
+/// Called only after the exact execution's native Exit has been read back from the board.
+fn retire_kid(cfg:&Config,task:u64,attempt:u64,execution:u64)->Res<()> {
+    let mut kids=kids_file(&cfg.install,&cfg.root)?;
+    let before=kids.len();
+    kids.retain(|k|!(k.task==task && k.attempt==attempt && k.execution==execution));
+    if kids.len()==before { return Ok(()) }
+    write_kids(&cfg.install,&cfg.root,&kids)
+}
+
+fn save_kids(s: &Service, root: &Path) -> Res<()> {
+    let mut kids=vec![];
+    for k in &s.kids {
+        let process=k.proc.native_identity()?;
+        if coreq::process::identity(process.pid).map_err(|e|e.to_string())?.as_ref()!=Some(&process) { return Err("child identity changed during handover; reconcile before retry".into()); }
+        kids.push(data::KidLine {task:k.task,attempt:k.attempt,runtime:k.rt.clone(),process,execution:k.execution,offset:k.proc.input_offset()?,job:k.proc.job()});
+    }
+    for old in kids_file(&s.cfg.install,root)? {
+        if kids.contains(&old) { continue; }
+        let log=board::entries(s.board,old.task)?;
+        if !core::executions(old.task,&log).iter().any(|x|x.id==old.execution && x.attempt==old.attempt && x.host==s.cfg.me && x.runtime==old.runtime && x.release==Some(core::Release::Exit)) {
+            return Err("unresolved native recovery record cannot be discarded during handover".into());
+        }
+    }
+    write_kids(&s.cfg.install,root,&kids)
+}
+
+/// A failed reduced loop retains its handles; an image switch also needs recovery evidence.
 fn stopped_handoff(s: &mut Service, host: &host::Shared, cfg: &Config) -> Res<bool> {
+    if !host.lock().map_err(|_|"stopped project admission unknown")?.begin_pass(&cfg.root) {return Ok(false);}
     s.reap_owned();
+    s.reconcile_ownership()?;
     s.sync_host();
     let mut h = host.lock().map_err(|_| "stopped project admission unknown")?;
-    let idle = s.kids.is_empty() && !operator::running(&cfg.root);
+    let idle = s.idle() && !operator::running(&cfg.root);
     h.busy.insert(cfg.root.clone(), !idle);
-    if h.restart && restart_waits(s, &cfg.root).is_empty() {
+    if h.restart && (if h.stopping {idle}else{lifecycle_waits(s, &cfg.root, false).is_empty()}) {
         save_kids(s, &cfg.root)?;
         h.prepared.insert(cfg.root.clone());
     }
@@ -944,12 +1228,7 @@ impl CapEdit {
                 e.limits.insert(rt.into(), n);
             }
         }
-        e.mode = match a.one("mode") {
-            None => None,
-            Some("auto") => Some(true),
-            Some("fixed") => Some(false),
-            Some(x) => return Err(format!("--mode: auto or fixed, not {x}")),
-        };
+        if a.one("mode").is_some() {return Err("host policy has no mode selector; use optional limits and the load gate".into());}
         e.max = match a.one("max") {
             None => None,
             Some("none") => Some(None),
@@ -1019,25 +1298,6 @@ fn edit_capacity(text: &str, host: &str, me: &str, e: &CapEdit, expect: Option<&
     let mut ser = serde_json::Serializer::with_formatter(&mut out, serde_json::ser::PrettyFormatter::with_indent(pad.as_bytes()));
     serde::Serialize::serialize(&v, &mut ser).map_err(|e| e.to_string())?;
     Ok(String::from_utf8_lossy(&out).into_owned() + if text.ends_with('\n') { "\n" } else { "" })
-}
-
-/// Validate, refuse a concurrent edit, replace `taskq.json` atomically, read back: the saved capacity of `host`.
-fn write_capacity(root: &Path, host: &str, e: &CapEdit, expect: Option<&Value>) -> Res<(service::Capacity, service::Capacity)> {
-    let p = root.join("taskq.json");
-    let read = || fs::read_to_string(&p).map_err(|e| format!("taskq.json: {e}"));
-    let text = read()?;
-    let (cfg, v) = load(root)?;
-    let old = service::capacity(&v, host)?;
-    let out = edit_capacity(&text, host, &cfg.me, e, expect)?;
-    if read()? != text {
-        return Err("taskq.json changed while saving; nothing written".into());
-    }
-    platform::write_atomic(&p, &out)?;
-    let saved = service::capacity(&serde_json::from_str(&read()?).map_err(|e| e.to_string())?, host)?;
-    if host == cfg.me {
-        poke(root);
-    }
-    Ok((old, saved))
 }
 
 fn cap_changes(old: &service::Capacity, new: &service::Capacity) -> String {
@@ -1153,27 +1413,40 @@ fn resources_cmd(root: &Path, a: &Args) -> Res<()> {
 }
 
 /// `taskq service capacity` (§ 5).
-fn capacity_cmd(root: &Path, a: &Args) -> Res<()> {
-    let (cfg, v) = load(root)?;
-    let host = a.one("host").unwrap_or(&cfg.me).to_string();
-    let project = project_name(root);
-    let status = || -> Option<Value> {
-        let st: Value = fs::read_to_string(dot(root).join("status.json")).ok().and_then(|t| serde_json::from_str(&t).ok())?;
-        (st["host"] == cfg.me.as_str() && file_age(&dot(root).join("status.json")).is_some_and(|x| x <= 60)).then_some(st)
+fn capacity_cmd(a: &Args) -> Res<()> {
+    let install=platform::default_install();
+    let policy=host::Policy::read(&install);
+    let me=policy.as_ref().map(|p|p.me.clone()).unwrap_or_else(|_|std::env::var("TASKQ_HOST").unwrap_or_else(|_|hostname()));
+    let host=a.one("host").unwrap_or(&me).to_string();
+    let roots=host::projects(&install)?;
+    let status=|| -> Option<Value> {
+        let now=SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).ok()?.as_secs();
+        roots.iter().find_map(|root| {
+            let path=dot(root).join("status.json");
+            let st:Value=serde_json::from_slice(&fs::read(&path).ok()?).ok()?;
+            (st["host"]==me && st["at"].as_u64().is_some_and(|at|at<=now && now-at<=60)
+                && file_age(&path).is_some_and(|age|age<=60)).then_some(st)
+        })
     };
     let e = CapEdit::from_args(a)?;
     if e.is_empty() {
-        let saved = service::capacity(&v, &host);
-        println!("Capacity: {project} on {host}");
-        let c = status().map(|st| st["capacity"].clone()).filter(|c| !c.is_null() && host == cfg.me);
+        let saved = policy.and_then(|policy| {
+            if policy.me!=host {return Err("no local policy for remote host".into());}
+            Ok(policy.cap)
+        });
+        if let Err(reason)=&saved {println!("Saved host policy: unknown ({reason})");}
+        println!("Capacity on {host}");
+        let c = status().and_then(|st|service::host_capacity(&st["capacity"])).filter(|_|host==me);
         let limits = c.as_ref().map(|c| c["limits"].clone()).or_else(|| saved.as_ref().ok().map(|s| s.json()["limits"].clone())).unwrap_or_default();
-        let mut rts: Vec<&String> = limits.as_object().into_iter().flatten().map(|(k, _)| k).collect();
+        let mut rts: std::collections::BTreeSet<String> = RUNTIMES.iter().map(|rt|rt.to_string()).collect();
+        rts.extend(limits.as_object().into_iter().flatten().map(|(k,_)|k.clone()));
         if let Some(c) = &c {
-            rts.extend(c["used"].as_object().into_iter().flatten().map(|(k, _)| k).filter(|k| !limits.get(k.as_str()).is_some()));
+            rts.extend(c["used"].as_object().into_iter().flatten().map(|(k,_)|k.clone()));
         }
         for rt in rts {
-            let used = c.as_ref().and_then(|c| c["used"][rt].as_u64()).map_or("?".into(), |n| n.to_string());
-            println!("{} {used}/{}", runtime_name(rt), limits[rt].as_u64().unwrap_or(0));
+            let used = c.as_ref().and_then(|c| c["used"][&rt].as_u64()).map_or("?".into(), |n| n.to_string());
+            let limit=limits[&rt].as_u64().map(|n|n.to_string()).unwrap_or_else(||if c.is_some()||saved.is_ok(){"no cap".into()}else{"?".into()});
+            println!("{} {used}/{limit}",runtime_name(&rt));
         }
         match (&c, &saved) {
             (Some(c), _) => {
@@ -1181,7 +1454,7 @@ fn capacity_cmd(root: &Path, a: &Args) -> Res<()> {
                 println!("{}", admission_text(c));
             }
             (None, Err(e)) => println!("Unknown: {e}"),
-            (None, Ok(_)) if host != cfg.me => println!("Unknown: no local snapshot of {host}"),
+            (None, Ok(_)) if host != me => println!("Unknown: no local snapshot of {host}"),
             (None, Ok(_)) => println!("Unknown: service has no fresh capacity status"),
         }
         if let (Some(c), Ok(s)) = (&c, &saved)
@@ -1193,32 +1466,20 @@ fn capacity_cmd(root: &Path, a: &Args) -> Res<()> {
     }
     // a write names its host explicitly (§ 5)
     let host = a.need("host")?.to_string();
-    let wrote = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    let (old, saved) = write_capacity(root, &host, &e, None)?;
-    let changes = cap_changes(&old, &saved);
-    if host == cfg.me
-        && let Err(e) = resources::revised(&cfg.install, root, wrote)
-    {
-        println!("Resource revision unknown: {e}");
-    }
-    if host != cfg.me {
-        println!("Saved for {host} in {project}: {changes}; applies when {host}'s service reads this config");
-        return Ok(());
-    }
-    // `Applied` only after a fresh service readback of the same values (R12)
+    let (old,saved,command)=host::write_capacity(&install,&host,&e,None)?;
+    println!("Receipt: {}",command.event_id("observed")?);
+    let changes=cap_changes(&old,&saved);
+    let mut unknown=None;
     for _ in 0..20 {
-        if let Some(st) = status()
-            && st["at"].as_u64().is_some_and(|t| t >= wrote)
-            && st["capacity"]["limits"] == saved.json()["limits"]
-            && st["capacity"]["load_gate"] == saved.json()["load_gate"]
-            && st["capacity"]["admission"] == saved.json()["admission"]
-        {
-            println!("Applied in {project} on {host}: {changes}; running tasks continue");
-            return Ok(());
+        match host::capacity_observed(&install,&command) {
+            Ok(true)=> {println!("Applied on {host}: {changes}; running tasks continue");return Ok(());}
+            Ok(false)=>{},
+            Err(e)=> {unknown=Some(e);break;}
         }
         std::thread::sleep(Duration::from_secs(1));
     }
-    println!("Saved; waiting for service in {project} on {host}: {changes}; running tasks continue");
+    println!("Saved; waiting for host service on {host}: {changes}; running tasks continue");
+    if let Some(reason)=unknown {eprintln!("Capacity observation unknown: {reason}");}
     Ok(())
 }
 
@@ -1286,7 +1547,7 @@ fn tray_app(install: &Path, exe: &Path) -> Option<PathBuf> {
         Ok(true) => true,
         r => {
             if let Err(e) = r { platform::log(&format!("signing failed, TaskQ.app stays ad-hoc: {e}")) }
-            std::process::Command::new("codesign").args(["-f", "-s", "-"]).arg(&app).output().is_ok_and(|o| o.status.success())
+            coreq::process::output("signing.adhoc", std::process::Command::new("codesign").args(["-f", "-s", "-"]).arg(&app), std::time::Duration::from_secs(30)).is_ok()
         }
     };
     signed.then_some(app)
@@ -1295,15 +1556,14 @@ fn tray_app(install: &Path, exe: &Path) -> Option<PathBuf> {
 /// The tray `open` started (`keep_tray`): `<install>/TaskQ.app/Contents/MacOS/taskq` with no args runs the tray of
 /// `<install>`, its stderr appended to `<install>/tray.log`.
 #[cfg(target_os = "macos")]
-fn bundled_tray(exe: &Path) -> Option<PathBuf> {
+fn bundled_tray(exe: &Path, install:&Path) -> bool {
     use std::os::fd::AsRawFd;
-    let app = exe.ancestors().nth(3).filter(|a| exe.ends_with("TaskQ.app/Contents/MacOS/taskq") && a.ends_with("TaskQ.app"))?;
-    let install = app.parent()?.to_path_buf();
+    if !exe.ends_with("TaskQ.app/Contents/MacOS/taskq") {return false;}
     if let Ok(f) = fs::OpenOptions::new().create(true).append(true).open(install.join("tray.log")) {
         // SAFETY: both descriptors are open; fd 2 now refers to the log for the life of the process
         unsafe { libc::dup2(f.as_raw_fd(), 2) };
     }
-    Some(install)
+    true
 }
 
 /// Labels of the open tasks in the last `status.json`, for a resume that has no focus to restore (§ 4).
@@ -1317,74 +1577,52 @@ fn status_labels(root: &Path) -> Vec<String> {
 }
 
 /// Focus (§ 4): `f` admits; `request` keeps the owner's words, none removes them.
-fn set_focus(root: &Path, f: &str, request: Option<&str>) -> Res<()> {
-    let d = dot(root);
-    fs::create_dir_all(&d).map_err(|e| e.to_string())?;
-    fs::write(d.join("focus"), f).map_err(|e| e.to_string())?;
-    match request {
-        Some(r) => fs::write(d.join("focus.request"), r).map_err(|e| e.to_string())?,
-        None => {
-            let _ = fs::remove_file(d.join("focus.request"));
+#[tracing::instrument(name="set_focus",skip_all)]
+fn set_focus(root: &Path, f: &str, request: Option<&str>) -> Res<String> {
+    change_focus(root, f.trim() == "off", true, |d| {
+        platform::write_atomic(&d.join("focus"), f)?;
+        match request {
+            Some(r) => platform::write_atomic(&d.join("focus.request"), r)?,
+            None => {
+                fs::remove_file(d.join("focus.request")).or_else(|e| if e.kind()==std::io::ErrorKind::NotFound {Ok(())} else {Err(e)}).map_err(|e| e.to_string())?;
+            }
         }
-    }
-    poke(root);
-    Ok(())
+        Ok(())
+    }).map(|(_,receipt)|receipt)
 }
 
 /// Install (§ 4 Focus): a missing focus becomes the explicit default `off`; any other stays. True when it reads off.
 fn install_focus(root: &Path) -> Res<bool> {
+    let _signal = wake_lock(root)?;
     let d = dot(root);
     if !d.join("focus").exists() {
-        fs::create_dir_all(&d).map_err(|e| e.to_string())?;
-        fs::write(d.join("focus"), "off").map_err(|e| e.to_string())?;
+        platform::write_atomic(&d.join("focus"), "off")?;
     }
     Ok(data::focus(root).is_ok_and(|f| f.is_empty()))
 }
 
 /// Pause (§ 4): keep the focus in `focus.paused`, admit nothing.
-fn pause(root: &Path) -> Res<()> {
-    let d = dot(root);
-    let f = data::focus(root)?.join(" ");
-    if !f.is_empty() {
-        fs::write(d.join("focus.paused"), f).map_err(|e| e.to_string())?;
-    }
-    fs::write(d.join("focus"), "off").map_err(|e| e.to_string())?;
-    poke(root);
-    Ok(())
+#[tracing::instrument(name="pause",skip_all)]
+fn pause(root: &Path, initialize: bool) -> Res<String> {
+    change_focus(root, true, initialize, |d| {
+        let f = data::focus(root)?.join(" ");
+        if !f.is_empty() { platform::write_atomic(&d.join("focus.paused"), &f)?; }
+        platform::write_atomic(&d.join("focus"), "off")
+    }).map(|(_,receipt)|receipt)
 }
 
 /// Resume (§ 4): restore the saved focus; never `all` by default.
-fn resume(root: &Path) -> Res<String> {
-    let d = dot(root);
-    let f = fs::read_to_string(d.join("focus.paused")).unwrap_or_default();
-    if matches!(f.trim(), "" | "off") {
-        return Err(format!("no saved focus: choose with `taskq service focus all|<label..>`; labels of open tasks: {}", status_labels(root).join(", ")));
-    }
-    fs::write(d.join("focus"), &f).map_err(|e| e.to_string())?;
-    poke(root);
-    Ok(f.trim().to_string())
-}
-
-/// `service install` hands over instead of reloading the unit (§ 8 step 5) while this project's fresh `status.json` lists
-/// live children or is unreadable (unknown keeps them, § 4 Data).
-fn handover(root: &Path) -> bool {
-    if operator::running(root) { return true; }
-    let p = dot(root).join("status.json");
-    file_age(&p).is_some_and(|a| a <= 60) && data::json(&p).map_or(true, |s| s.is_some_and(|s| s["kids"].as_array().is_some_and(|k| !k.is_empty())))
-}
-
-/// § 8 step 5: live children pass to the new image through the step 3 re-exec; a unit reload would end them. True
-/// when the running service was asked to re-exec instead of the unit being reloaded.
-fn load_unit(u: &platform::Unit, root: &Path) -> Res<bool> {
-    if handover(root) {
-        fs::write(dot(root).join("restart"), "").map_err(|e| e.to_string())?;
-        poke(root);
-        return Ok(true);
-    }
-    platform::run_all(&u.unload, true)?;
-    kill_service(root); // Windows: `/End` left the old service running beside the new one (#933)
-    platform::run_all(&u.load, false)?;
-    Ok(false)
+#[tracing::instrument(name="resume",skip_all)]
+fn resume(root: &Path) -> Res<(String,String)> {
+    change_focus(root, false, false, |d| {
+        let f = fs::read_to_string(d.join("focus.paused")).or_else(|e| if e.kind()==std::io::ErrorKind::NotFound {Ok(String::new())} else {Err(e)})
+            .map_err(|e| format!("saved focus unreadable: {e}"))?;
+        if matches!(f.trim(), "" | "off") {
+            return Err(format!("no saved focus: choose with `taskq service focus all|<label..>`; labels of open tasks: {}", status_labels(root).join(", ")));
+        }
+        platform::write_atomic(&d.join("focus"), &f)?;
+        Ok(f.trim().to_string())
+    })
 }
 
 /// The heartbeat's `service <id>` (§ 4): public, so a hash of the installation id, never the id itself.
@@ -1403,33 +1641,18 @@ fn other_service(root: &Path) -> Option<u32> {
     (pid != std::process::id() && runtime::alive(pid)).then_some(pid)
 }
 
-/// Windows: `schtasks /End` ends only the launcher; the service, its children and the tray go with this (§ 8).
-fn kill_service(root: &Path) {
-    let status = dot(root).join("status.json");
-    if !cfg!(windows) || file_age(&status).is_none_or(|a| a > 600) {
-        return;
-    }
-    let pid = fs::read_to_string(&status).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()).and_then(|v| v["pid"].as_u64());
-    if let Some(pid) = pid.filter(|p| *p != std::process::id() as u64) {
-        // the image filter guards against a reused pid
-        let cmd = ["taskkill", "/F", "/T", "/FI", &format!("PID eq {pid}"), "/FI", "IMAGENAME eq taskq.exe"].map(String::from).to_vec();
-        let _ = platform::run_all(&[cmd], true);
-    }
-}
-
 #[cfg(unix)]
 fn reexec(s: &Service, cfg: &Config) -> Res<()> {
     use std::os::unix::process::CommandExt;
     // App turns have no adoptable child; keep their lease until completion.
-    if !restart_waits(s, &cfg.root).is_empty() {
+    if !lifecycle_waits(s, &cfg.root, false).is_empty() {
         return fs::write(dot(&cfg.root).join("restart"), "").map_err(|e| e.to_string());
     }
-    let mut text = format!("pid {}\n", std::process::id());
-    for k in &s.kids {
-        text += &format!("{} {} {} {} {}\n", k.task, k.attempt, k.rt, k.proc.id(), s.delivered(k.attempt));
-    }
-    platform::write_atomic(&dot(&cfg.root).join("kids"), &text)?;
-    let e = std::process::Command::new(cfg.install.join(platform::tool(&cfg.install).exe_name())).args(["service", "run"]).exec();
+    save_kids(s, &cfg.root)?;
+    let mut command = std::process::Command::new(cfg.install.join(platform::tool(&cfg.install).exe_name()));
+    command.args(["service", "run"]);
+    coreq::telemetry::capture::before_exec();
+    let e = command.exec();
     incident::detect("dispatch.reexec", concat!("src/main.rs:", line!()), "none", &[], &["reexec:failed"]);
     Err(format!("re-exec: {e}"))
 }
@@ -1438,7 +1661,7 @@ fn reexec(s: &Service, cfg: &Config) -> Res<()> {
 fn reexec(s: &Service, cfg: &Config) -> Res<()> {
     // ponytail: Windows cannot hand children to a new image; exit once no child is live and the unit restarts us.
     // The new `current` is already written, so the update waits only for the running attempts.
-    if restart_waits(s, &cfg.root).is_empty() {
+    if lifecycle_waits(s, &cfg.root, false).is_empty() {
         std::process::exit(75);
     }
     // update checks pause while the restart request carries the re-exec until the children end
@@ -1446,16 +1669,19 @@ fn reexec(s: &Service, cfg: &Config) -> Res<()> {
 }
 
 /// § 8 step 3: what a pending re-exec waits for. Windows waits for every live child; elsewhere CLI children pass over.
-fn restart_waits(s: &Service, root: &Path) -> Vec<String> {
-    let mut w: Vec<String> = s.kids.iter().filter(|k| cfg!(windows) || matches!(k.rt.as_str(), "codex-app" | "claude")).map(|k| format!("#{}", k.task)).collect();
+fn lifecycle_waits(s: &Service, root: &Path, stopping:bool) -> Vec<String> {
+    let mut w: Vec<String> = s.kids.iter().filter(|k| stopping || cfg!(windows) || matches!(k.rt.as_str(), "codex-app" | "claude")).map(|k| format!("#{}", k.task)).collect();
     w.dedup();
-    if operator::running(root) {
-        w.push("operator".into());
-    }
+    w.extend(s.handoff_waits());
+    if let Some(reason)=operator::wait(root) {w.push(reason);}
     w
 }
 
 fn service_fields(root: &Path) -> String {
+    service_project_fields(root,data::json(&dot(root).join("status.json")))
+}
+
+fn service_project_fields(root:&Path,status:Res<Option<Value>>)->String {
     let d = dot(root);
     let mut out = vec![format!("Project: `{}`", root.display())];
     match data::focus(root) {
@@ -1464,7 +1690,6 @@ fn service_fields(root: &Path) -> String {
         Ok(f) => out.extend(f.iter().map(|l| format!("Focus: {l}"))),
         Err(e) => out.push(format!("Focus: unknown ({e})")),
     }
-    let status = data::json(&d.join("status.json"));
     if let Err(e) = &status {
         out.push(format!("Status: unknown ({e})"));
     }
@@ -1486,33 +1711,127 @@ fn service_fields(root: &Path) -> String {
         (Some(s), Some(a)) if snapshot::complete(&s) => {
             out.push(snapshot::counts_line(&snapshot::status_totals(&s).unwrap()));
             out.push(format!("Freshness: {} (cached status)", age(a as i64)));
-            out.push("Service: unknown (process not checked)".into());
         }
-        _ => out.push("Service: unknown (status missing, stale or failed)\nFreshness: unknown (no fresh successful status)\nCounts: unknown (no fresh successful read)".into()),
+        _ => out.push("Snapshot: unknown (status missing, stale or failed)\nFreshness: unknown (no fresh successful status)\nCounts: unknown (no fresh successful read)".into()),
     }
     out.extend(requests);
     out.join("\n")
 }
 
+fn service_report(a:&Args)->Res<()> {
+    let install=platform::default_install();
+    let service=host::service_status(&install);
+    let registry=host::project_paths(&install);
+    let rows:Vec<_>=registry.as_ref().ok().into_iter().flatten().map(|root|(root,data::json(&dot(root).join("status.json")))).collect();
+    let binding=|status:&Res<Option<Value>>| {
+        let Some(s)=status.as_ref().ok().and_then(Option::as_ref) else {return "unknown";};
+        if service["state"]!="running"||s["pid"].as_u64().is_none_or(|pid|pid==0||pid>i32::MAX as u64)
+            ||s["host_instance"].as_str().is_none_or(|id|!resources::id(id)) {return "unknown";}
+        if s["pid"]==service["pid"]&&s["host_instance"]==service["instance"] {"current"}else{"other"}
+    };
+    let installation=host::installation_status(&install,a.one("request"));
+    let lifecycle=if a.one("request").is_some()&&installation["id"].is_string() {installation.clone()}else{lifecycle::status(&install,a.one("request"))};
+    if a.flags.contains_key("json") {
+        let projects:Vec<_>=rows.into_iter().map(|(root,status)|json!({"root":root,"host_binding":binding(&status),
+            "status":status.as_ref().ok().and_then(Option::as_ref),"error":status.as_ref().err()})).collect();
+        println!("{}",json!({"schema":"taskq.service/1","service":service,"projects":projects,"registry_error":registry.as_ref().err(),"restart":if lifecycle["action"].as_str().is_some_and(|action|action!="restart") {Value::Null}else{lifecycle.clone()},"lifecycle":lifecycle,"installation":installation}));
+    } else {
+        println!("{}",host::service_line(&service));
+        let restart=lifecycle;let title=match restart["action"].as_str() {Some("stop")=>"Stop",Some("uninstall")=>"Uninstall",Some("install")=>"Install",_=>"Restart"};
+        if let Some(id)=restart["id"].as_str() {println!("{title}: {id} {}",restart["state"].as_str().unwrap_or("unknown"));}
+        if let Some(reason)=restart["reason"].as_str() {println!("{title}: unknown ({reason})");}
+        if a.one("request").is_none()&&let Some(id)=installation["id"].as_str() {println!("Install: {id} {}",installation["state"].as_str().unwrap_or("unknown"));}
+        if a.one("request").is_none()&&let Some(reason)=installation["reason"].as_str() {println!("Install: unknown ({reason})");}
+        if let Err(error)=&registry {println!("Projects: unknown ({error})");}
+        for (root,status) in rows {
+            let owner=binding(&status);
+            let notice=status.as_ref().ok().and_then(Option::as_ref).is_some_and(|s|s["incident_notice"]==true);
+            let update=status.as_ref().ok().and_then(Option::as_ref).and_then(|s|s["update"].as_str()).unwrap_or("unknown");
+            println!("Update: {update}");
+            println!("{}\nProject owner: {owner}",service_project_fields(root,status));
+            println!("{}",incident::line(&incident::status(root)));
+            if notice||incident::notice(root) {println!("Incident reports: notice");}
+        }
+    }
+    Ok(())
+}
+
+#[tracing::instrument(name="service.command",skip_all,fields(coreq_operation=match args.pos.get(1).map(String::as_str).unwrap_or("") {
+    sub @ ("install"|"run"|"focus"|"pause"|"resume"|"capacity"|"permissions"|"resources"|"hold"|"release"|"recover"|"status"|"restart"|"stop"|"complete-stop"|"complete-legacy"|"uninstall"|"list")=>sub,
+    _=>"invalid",
+}))]
 fn service(args: &Args) -> Res<()> {
     let sub = args.pos.get(1).map(String::as_str).unwrap_or("");
     if sub == "run" {
         // before root and config load: their errors reach the unit log stamped too (§ 4)
         platform::service_log();
     }
-    let projects = platform::default_install().join("projects");
-    if sub == "list" {
-        // one project root per line, written by `service install` (§ 5); a PM or ARM covers several projects from it
-        for r in fs::read_to_string(&projects).map_err(|e| format!("{}: {e}", projects.display()))?.lines().filter(|l| !l.is_empty()) {
-            println!("{}", service_fields(Path::new(r)));
+    if matches!(sub,"status"|"list") {return service_report(args);}
+    if sub == "capacity" {return capacity_cmd(args);}
+    if matches!(sub,"complete-stop"|"complete-legacy") {
+        platform::service_log();
+        if args.pos.len()!=2||args.all("request").len()!=1||args.flags.keys().any(|key|!["request","json"].contains(&key.as_str())) {return Err("usage: taskq service complete-stop --request ID [--json]".into());}
+        let result=if sub=="complete-legacy" {host::complete_legacy(&platform::default_install(),args.need("request")?)?;json!({"id":args.need("request")?,"state":"legacy-retired"})}
+            else{lifecycle::complete_stop(&platform::default_install(),args.need("request")?)?};
+        if args.flags.contains_key("json") {println!("{result}");}return Ok(());
+    }
+    if matches!(sub,"restart"|"stop"|"uninstall") {
+        if std::env::var_os("TASKQ_ATTEMPT").is_some() {return Err("a worker cannot restart the host service or request Stop".into());}
+        if args.pos.len()!=2||args.all("request").len()>1||args.flags.keys().any(|key|!["request","json","host","diagnose","diagnose-ms","diagnose-limit"].contains(&key.as_str()))||sub!="uninstall"&&args.flags.contains_key("host") {
+            return Err("usage: taskq service restart|stop|uninstall [--host] [--request ID] [--json]".into());
         }
+        let install=platform::default_install();
+        let id=args.one("request").map(str::to_owned).unwrap_or_else(runtime::uuid);
+        let mut result=if let Some(receipt)=lifecycle::receipt(&install,&id)? {receipt} else {
+            let reviewed=match sub {
+                "stop"=>lifecycle::stop_review(&install,&id)?,
+                "uninstall"=>{let root=if args.flags.contains_key("host") {None}else{Some(find_root()?)};lifecycle::uninstall_review(&install,&id,root.as_deref())?},
+                _=>lifecycle::review(&install,&id)?,
+            };
+            if !args.flags.contains_key("json") {
+                println!("Scope: host service; all registered projects");
+                for root in reviewed["roots"].as_array().into_iter().flatten() {println!("Project: {}",root.as_str().unwrap_or("unknown"));}
+            }
+            lifecycle::submit(&install,&reviewed)?
+        };
+        if result["action"].as_str().unwrap_or("restart")!=sub {return Err("request ID belongs to another lifecycle action".into());}
+        if args.flags.contains_key("host")&&result["scope"]!="host" {return Err("request ID belongs to a project Uninstall; payload unchanged".into());}
+        if matches!(sub,"stop"|"uninstall")&&result["state"]=="applied"&&let Some(p)=lifecycle::pending(&install)?.filter(|p|p.stops()) {
+            if p.id()!=id {return Err("Stop replay binding changed; reconcile service status".into());}
+            host_control::dispatch(&install,&p)?.wait()?;
+            result=lifecycle::receipt(&install,&id)?.ok_or("Stop result no longer retained; outcome unknown")?;
+        }
+        if args.flags.contains_key("json") {println!("{result}");}else {println!("{}: {id} {}",match sub {"stop"=>lifecycle::Action::Stop,"uninstall"=>lifecycle::Action::Uninstall,_=>lifecycle::Action::Restart}.title(),result["state"].as_str().unwrap_or("unknown"));if let Some(condition)=result["restart_condition"].as_str() {println!("Restart condition: {condition}");}}
         return Ok(());
     }
-    if sub == "run" && find_root().is_err() { return host::run(&platform::default_install()); }
+    if sub == "run" {
+        if std::env::var_os("TASKQ_ATTEMPT").is_some() {return Err("a worker cannot run the host service".into());}
+        let install=platform::default_install();
+        let mut reported=String::new();
+        loop {
+            match host_control::legacy_owner(&platform::tool(&install)) {
+                Ok(Some(owner))=>return legacy_service(&install,&owner),
+                Ok(None)=>break,
+                Err(error)=>if reported!=error {log!("{error}; native service scope unknown, launches held");reported=error;},
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        let in_install=std::env::current_dir().and_then(|p|p.canonicalize()).ok()
+            .zip(install.canonicalize().ok()).is_some_and(|(cwd,install)|cwd==install);
+        if !in_install {
+            match find_root() {
+                Ok(root)=>{
+                    let root=root.canonicalize().map_err(|e|format!("service root unknown: {e}"))?;
+                    if !host::projects(&install)?.contains(&root) {return Err("service root is not registered; install it explicitly before running".into());}
+                },
+                Err(error) if std::env::var_os("TASKQ_ROOT").is_some()=>return Err(error),
+                Err(_)=>{},
+            }
+        }
+        return host::run(&install);
+    }
     let root = find_root()?;
-    let d = dot(&root);
     match sub {
-        "run" => service_run(&ctx()?, None),
         "focus" => {
             let f = args.pos[2..].join(" ");
             if f.is_empty() {
@@ -1534,8 +1853,7 @@ fn service(args: &Args) -> Res<()> {
             Ok(())
         }
         "pause" => {
-            fs::create_dir_all(&d).map_err(|e| e.to_string())?;
-            pause(&root)?;
+            pause(&root,true)?;
             println!("Paused {}", project_name(&root));
             Ok(())
         }
@@ -1544,56 +1862,13 @@ fn service(args: &Args) -> Res<()> {
             println!("{}", service_fields(&root));
             Ok(())
         }
-        "capacity" => capacity_cmd(&root, args),
         "permissions" => permissions_cmd(&root, args),
         "resources" => resources_cmd(&root, args),
         "hold" | "release" => hold_cmd(sub == "hold", args.one("text")),
         "recover" => recover_cmd(&root, args.flags.contains_key("apply"), args.flags.contains_key("json")),
-        "restart" => {
-            fs::create_dir_all(&d).map_err(|e| e.to_string())?;
-            fs::write(d.join("restart"), "").map_err(|e| e.to_string())?;
-            poke(&root);
-            println!("Restart requested for {}", project_name(&root));
-            Ok(())
-        }
-        "status" => {
-            let text = fs::read_to_string(d.join("status.json")).map_err(|_| "no service status: is `taskq service run` running here?".to_string())?;
-            println!("{text}");
-            let status = data::json(&d.join("status.json"))?.unwrap_or_default();
-            println!("Update: {}", status["update"].as_str().unwrap_or("unknown"));
-            println!("{}", incident::line(&incident::status(&root)));
-            if status["incident_notice"] == true || incident::notice(&root) { println!("Incident reports: notice"); }
-            for l in requests::lines(&status) { println!("{l}"); }
-            Ok(())
-        }
-        "install" | "uninstall" | "stop" => {
+        "install" => {
             let (cfg, _) = load(&root)?;
-            let u = platform::unit(&platform::tool(&cfg.install), &root, &project_name(&root));
-            if sub == "stop" {
-                platform::run_all(&u.stop, false)?;
-                kill_service(&root);
-                println!("Stop requested for {}; starts again at the next logon", project_name(&root));
-                return Ok(());
-            }
-            if sub == "install" {
-                let off = install_focus(&root)?;
-                platform::install_self(&platform::tool(&cfg.install))?;
-                platform::write_unit(&u)?;
-                let handover = load_unit(&u, &root)?;
-                let mut all: Vec<String> = fs::read_to_string(&projects).unwrap_or_default().lines().map(String::from).collect();
-                if !all.contains(&root.display().to_string()) {
-                    all.push(root.display().to_string());
-                    fs::write(&projects, all.join("\n") + "\n").map_err(|e| e.to_string())?;
-                }
-                println!("installed {}{}", u.path.display(), if handover { "; live children kept: the running service re-execs" } else { "" });
-                if off {
-                    println!("Focus: off; nothing admitted until `taskq service focus all|<label..>`");
-                }
-            } else {
-                uninstall_unit(&u, &root, &projects)?;
-                println!("removed {}", u.path.display());
-                kill_service(&root);
-            }
+            println!("{}",host::install_project(&cfg.install,&root)?);
             Ok(())
         }
         _ => Err("usage: taskq service install|run|focus|pause|resume|capacity|permissions|hold|release|recover|status|restart|stop|uninstall|list".into()),
@@ -1601,6 +1876,7 @@ fn service(args: &Args) -> Res<()> {
 }
 
 /// § 4 emergency hold: write or remove `<install>/hold`, then poke every registered project so its service reads it.
+#[tracing::instrument(name="hold",skip_all,fields(coreq_operation=if on {"set"} else {"release"}))]
 fn hold_cmd(on: bool, reason: Option<&str>) -> Res<()> {
     let install = platform::default_install();
     let path = install.join("hold");
@@ -1611,18 +1887,23 @@ fn hold_cmd(on: bool, reason: Option<&str>) -> Res<()> {
     } else if let Err(e) = fs::remove_file(&path).or_else(|e| if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) }) {
         return Err(format!("hold file: {e}; still held"));
     }
-    for r in fs::read_to_string(install.join("projects")).unwrap_or_default().lines().filter(|l| !l.is_empty()) {
-        poke(Path::new(r));
+    let projects = coreq::telemetry::capture::operation("wake.projects", || {
+        fs::read_to_string(install.join("projects")).or_else(|e| if e.kind() == std::io::ErrorKind::NotFound { Ok(String::new()) } else { Err(e) })
+    }, |_| "registry-unreadable").map_err(|_| "Hold state saved; project registry unreadable; service notification unknown")?;
+    let mut failed = 0;
+    for r in projects.lines().filter(|l| !l.is_empty()) {
+        if poke(Path::new(r)).is_err() { failed += 1; }
     }
+    let notification = if failed == 0 { Ok(()) } else { Err(format!("Hold state saved; {failed} service wake(s) failed; check service status")) };
     if !on {
         println!("Hold released on {}; launches follow each project's focus", hostname());
-        return Ok(());
+        return notification;
     }
     println!("Hold on {}: new launches refused until `taskq service release`; live children continue", hostname());
     for o in admission::old_services(&install) {
         println!("Not enforced: {o} is older than {}", admission::MIN_SERVICE);
     }
-    Ok(())
+    notification
 }
 
 /// § 4 recovery: list this host's interrupted attempts and their fencing ops; `--apply` writes them through the
@@ -1760,8 +2041,7 @@ fn add_task(b: &dyn Board, root: &Path, raw: &Value, t: &NewTask, op: &Op) -> Re
         (_, Some(text)) => act(b, root, n, "later", &[], text, &Op::default()),
         _ => Receipt::accepted(n, op, fold(n, &[], blocked).state, 0),
     };
-    poke(root);
-    Ok(Receipt { op_id: op.id.clone(), ..r })
+    Ok(Receipt { op_id: op.id.clone(), ..r }.wake(root))
 }
 
 /// § 7 recipe run: every task is added held with op id `recipe.<name>.<version>.<run>.<k>` and read back; only then,
@@ -1812,15 +2092,6 @@ fn logged(root: &Path, source: &str, text: &str, r: Receipt, json: bool) -> Res<
     emit(&[r], json)
 }
 
-fn uninstall_unit(u: &platform::Unit, root: &Path, projects: &Path) -> Res<()> {
-    let registered = fs::read_to_string(projects).map_err(|e| format!("{}: {e}", projects.display()))?;
-    let all: Vec<String> = registered.lines().filter(|l| *l != root.display().to_string()).map(|l| format!("{l}\n")).collect();
-    platform::run_all(&u.unload, false)?;
-    if let Err(e) = fs::remove_file(&u.path) && e.kind() != std::io::ErrorKind::NotFound { return Err(e.to_string()); }
-    let install = projects.parent().unwrap_or(Path::new("."));
-    resources::unregister(install, root, || fs::write(projects, all.concat()).map_err(|e| e.to_string()))
-}
-
 fn golden_selftest(traces: &str, published: bool) -> Res<usize> {
     let result = core::golden(traces);
     if published && result.is_err() {
@@ -1838,8 +2109,15 @@ fn restart_watch(since: &mut Option<u64>, empty_restart: bool, elapsed: u64, int
     }
 }
 
+#[tracing::instrument(name="run",skip_all)]
 fn run(argv: &[String]) -> Res<()> {
     let a = Args::parse(argv)?;
+    telemetry::diagnostic::poll(&platform::default_install());
+    if let Some(selector)=a.one("diagnose") {
+        let milliseconds=a.one("diagnose-ms").unwrap_or("60000").parse::<u64>().map_err(|_|"invalid --diagnose-ms")?;
+        let limit=a.one("diagnose-limit").unwrap_or("256").parse::<u64>().map_err(|_|"invalid --diagnose-limit")?;
+        telemetry::diagnostic::select(selector,Duration::from_millis(milliseconds),limit)?;
+    } else if a.one("diagnose-ms").is_some() || a.one("diagnose-limit").is_some() {return Err("diagnostic limits require --diagnose".into());}
     if a.pos.is_empty() || a.pos.first().is_some_and(|s| s == "help") || a.pos.iter().any(|s| s == "-h") || a.flags.contains_key("help") {
         println!("{USAGE}");
         return Ok(());
@@ -1850,6 +2128,17 @@ fn run(argv: &[String]) -> Res<()> {
     }
     match cmd {
         "profile" => match a.pos.get(1) {
+            Some(v) if v=="migrate" => {
+                let count=telemetry::migrate(&platform::default_install())?;
+                println!("Migrated {count} legacy records; original receipt clocks and source archive preserved");Ok(())
+            }
+            Some(v) if v=="diagnose" => {
+                let pid=a.need("pid")?.parse().map_err(|_|"invalid --pid")?;
+                let period=a.one("duration-ms").unwrap_or("60000").parse().map_err(|_|"invalid --duration-ms")?;
+                let limit=a.one("limit").unwrap_or("256").parse().map_err(|_|"invalid --limit")?;
+                let request=telemetry::diagnostic::request(&platform::default_install(),pid,a.need("selector")?,period,limit)?;
+                println!("Diagnostic selection requested: {request}; verify target status/export; no application acknowledgment yet");Ok(())
+            }
             None if a.one("since").is_some() => Err("--since needs a view: taskq profile export|tasks|board --since 24h".into()),
             None => { print!("{}", profile::report(&platform::default_install())); Ok(()) }
             Some(v) => { print!("{}", profile::view(&platform::default_install(), v, a.one("since"))?); Ok(()) }
@@ -1879,8 +2168,8 @@ fn run(argv: &[String]) -> Res<()> {
                 let (views, hosts) = service::views(c.board.as_ref(), &mut Default::default(), &mut Default::default())?;
                 let now = c.board.now()?;
                 let live = views.iter().filter_map(|v| {
-                    let a = v.task.attempt?;
-                    let h = service::host_of(&v.task)?;
+                    let a = v.projection.task.attempt?;
+                    let h = service::host_of(&v.projection.task)?;
                     (hosts.iter().any(|hb| hb.title == format!("taskq host {h}")
                         && now - hb.updated <= c.cfg.ttl && hb.body.lines().any(|l| l == format!("#{} {a}", v.issue.number))))
                         .then(|| (c.cfg.repo.clone(), a))
@@ -1894,6 +2183,8 @@ fn run(argv: &[String]) -> Res<()> {
             } else {
                 println!("board: unknown (no project config found; no board read)");
             }
+            let capture=coreq::telemetry::capture::qualify().map_err(|e|format!("telemetry: FAIL {e}"))?;
+            println!("telemetry: local capture committed {} observations",capture["committed"]);
             Ok(())
         }
         "update" => {
@@ -1924,7 +2215,7 @@ fn run(argv: &[String]) -> Res<()> {
         // § 5: the operator over the request log; no board
         "retro" => {
             let (cfg, raw) = load(&find_root()?)?;
-            let cap = service::capacity(&raw, &cfg.me)?;
+            let cap = host::Policy::read(&cfg.install)?.project(&raw)?;
             let rt = ["claude", "codex"].into_iter().find(|rt| cap.limits.get(*rt).copied().unwrap_or(if cap.auto { u32::MAX } else { 0 }) > 0);
             print!("{}", retro::run(&cfg.root, rt)?);
             Ok(())
@@ -1967,8 +2258,9 @@ fn claimed_create(b: &dyn Board, raw: &Value, title: &str, body: &str, labels: &
             return Err(unknown(i.number, "created issue conflicts with the immutable request".into()));
         }
         let log = entries(b, i.number).map_err(read)?;
-        let state = if !i.open { State::Closed } else if service::is_held(&i) { State::Held } else { fold(i.number, &log, deps_open(b, &i.body)).state };
-        Ok(Receipt::accepted(i.number, op, state, core::revision(i.number, &log)))
+        let projection = core::project(i.number, &log, deps_open(b, &i.body));
+        let state = if !i.open { State::Closed } else if service::is_held(&i) { State::Held } else { projection.task.state };
+        Ok(Receipt::accepted(i.number, op, state, projection.revision))
     };
     if let Some(first) = first().map_err(read)? {
         if first.body != claim {
@@ -2018,9 +2310,10 @@ fn start_one(b: &dyn Board, root: &Path, n: u64, op: &Op) -> Receipt {
     let initialize = || -> Res<Option<Receipt>> {
         let issue = b.issue(n)?;
         let log = entries(b, n)?;
-        if op.revision.is_some_and(|r| r != core::revision(n, &log)) { return Ok(None) }
-        if issue.open && service::is_held(&issue) && core::revision(n, &log) == 0 {
-            let hold = Op { id: op.id.as_ref().map(|id| format!("{id}.hold")), revision: Some(core::revision(n, &log)) };
+        let revision = core::project(n, &log, false).revision;
+        if op.revision.is_some_and(|r| r != revision) { return Ok(None) }
+        if issue.open && service::is_held(&issue) && revision == 0 {
+            let hold = Op { id: op.id.as_ref().map(|id| format!("{id}.hold")), revision: Some(revision) };
             let r = act(b, root, n, "hold", &[], "", &hold);
             return Ok(Some(Receipt { op_id: op.id.clone(), ..r }));
         }
@@ -2150,7 +2443,7 @@ fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
                 finding_request = json!({"board": identity, "start": a.flags.contains_key("start")}).to_string();
                 body += &format!("\nop-id: {}\n", op.id.as_deref().unwrap());
                 let (create, start) = finding_submit(b, &c.raw, root, title, &body, &labels, &finding_request, &op, a.flags.contains_key("start"));
-                if create.ok() { poke(root); }
+                let create = if create.ok() { create.wake(root) } else { create };
                 return emit_finding(create, start, json);
             } else if ["start", "source", "board", "evidence"].iter().any(|f| a.flags.contains_key(*f)) {
                 return Err("--start/--source/--board/--evidence require finding".into());
@@ -2295,7 +2588,8 @@ fn command(c: &Ctx, cmd: &str, a: &Args) -> Res<()> {
     }
 }
 
-fn main() {
+#[tracing::instrument(name="application",skip_all)]
+fn application() {
     #[cfg(windows)]
     if std::env::args().nth(1).as_deref() == Some("__windows-codex") {
         if let Err(e) = windows_sandbox::run(&std::env::args().skip(2).collect::<Vec<_>>()) { eprintln!("{e}"); std::process::exit(1); }
@@ -2317,9 +2611,9 @@ fn main() {
         coreq::launcher::launch(&t, &args);
     }
     #[cfg(target_os = "macos")]
-    if let Some(i) = args.is_empty().then(|| exe.as_deref().and_then(bundled_tray)).flatten() {
-        profile::init(&i);
-        if let Err(e) = tray(i, None, &[], None) {
+    if args.is_empty()&&exe.as_deref().is_some_and(|exe|bundled_tray(exe,&install)) {
+        profile::init(&install);
+        if let Err(e) = tray(install, None, &[], None) {
             platform::die(&e);
         }
         return;
@@ -2339,10 +2633,59 @@ fn main() {
 }
 
 #[cfg(test)]
+fn with_test_capture<T>(run: impl FnOnce(&coreq::telemetry::Store, &Path) -> T) -> T {
+    use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+    use tracing_subscriber::prelude::*;
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let dir=std::env::temp_dir().join(format!("taskq-command-test-{}-{}",std::process::id(),NEXT.fetch_add(1,Ordering::Relaxed)));
+    fs::create_dir_all(&dir).unwrap();
+    let store=Arc::new(coreq::telemetry::Store::open(&dir.join("db")).unwrap());
+    let capture=coreq::telemetry::capture::Capture::new(store.clone(),"taskq","fixture").unwrap();
+    let result=tracing::subscriber::with_default(tracing_subscriber::registry().with(capture.clone()),||run(&store, &dir));
+    capture.flush().unwrap();
+    drop(capture);drop(store);fs::remove_dir_all(dir).unwrap();
+    result
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use board::Fake;
     use dispatch::close_one;
+
+    // Chain: shared wakeup metadata -> bounded, locked read -> link or explicit unknown.
+    #[test]
+    fn wakeup_context_refuses_partial_or_busy_input() {
+        let root = std::env::temp_dir().join(format!("qw-link-{}", std::process::id()));
+        fs::create_dir_all(dot(&root)).unwrap();
+        let path = dot(&root).join("poke"); let mut seen = None;
+        assert!(wake_context(&path, &mut seen).unwrap().is_none());
+        for text in [Vec::new(), b".".to_vec()] {
+            fs::write(&path, text).unwrap();
+            assert!(wake_context(&path, &mut seen).unwrap().is_none());
+        }
+        for text in [b"1 incomplete".to_vec(), vec![b'x'; 129], vec![255]] {
+            fs::write(&path, text).unwrap();
+            assert!(wake_context(&path, &mut seen).is_err());
+        }
+        let context = format!("1 {}.1 {}.2", "a".repeat(32), "a".repeat(32));
+        fs::write(&path, &context).unwrap();
+        let writer = fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        writer.try_lock().unwrap();
+        assert_eq!(wake_context(&path, &mut seen).unwrap_err(), "wakeup context busy");
+        writer.unlock().unwrap();
+        writer.try_lock_shared().unwrap();
+        assert!(poke(&root).unwrap_err().contains("wake-lock"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), context, "busy reader allowed a partial overwrite");
+        assert_eq!(wake_context(&path, &mut seen).unwrap().unwrap().encode(), context);
+        assert!(wake_context(&path, &mut seen).unwrap().is_none());
+        // Parallel subprocess tests may inherit this fixture's descriptor before exec.
+        writer.unlock().unwrap();
+        drop(writer);
+        poke(&root).unwrap();
+        assert!(wake_context(&path, &mut seen).unwrap().is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     // Chain: § 5 stale TASKQ_ROOT (#1072). Risk: a reused session's command writes into another project.
     #[test]
@@ -2426,7 +2769,8 @@ mod tests {
 
     pub(crate) fn cfg() -> Config {
         Config {
-            root: std::env::temp_dir().join("taskq-main-test"),
+            // Independent command fixtures must not contend for the same project wake lock.
+            root: std::env::temp_dir().join(format!("taskq-main-test-{}",crate::runtime::uuid())),
             install: PathBuf::from("/nonexistent"),
             board: &board::github::KIND,
             web_host: String::new(),
@@ -2446,7 +2790,7 @@ mod tests {
         }
     }
 
-    // Chain: § 5 CLI arguments. Risk: stray words silently dropped from a command.
+    // Chain: § 5 CLI arguments. Risk: stray words or a consumed scope/JSON flag change the requested command.
     #[test]
     fn unused_positionals_are_rejected() {
         let parse = |v: &[&str]| Args::parse(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
@@ -2459,6 +2803,16 @@ mod tests {
         assert_eq!(parse(&["add", "T", "--goal", "G", "--acceptance", "A", "--acceptance", "B"]).unwrap().all("acceptance"), vec!["A", "B"]);
         for v in [vec!["close", "1", "2"], vec!["answer", "1.1", "2.1"], vec!["service", "focus", "code", "docs"]] {
             assert!(parse(&v).is_ok());
+        }
+        for flags in [vec!["--host"],vec!["--host","--json"],vec!["--json","--host","--request","original-id"]] {
+            let mut v=vec!["service","uninstall"];v.extend_from_slice(&flags);
+            let parsed=parse(&v).unwrap();
+            assert_eq!(parsed.one("host"),Some(""),"host uninstall scope consumed another option");
+            assert_eq!(parsed.flags.contains_key("json"),flags.contains(&"--json"));
+            if flags.contains(&"--request") {assert_eq!(parsed.one("request"),Some("original-id"));}
+        }
+        for v in [vec!["service","capacity","--host","fixture-host"],vec!["add","T","--host","fixture-host"]] {
+            assert_eq!(parse(&v).unwrap().one("host"),Some("fixture-host"),"host-name option lost its value");
         }
     }
 
@@ -2762,7 +3116,7 @@ mod tests {
         assert_eq!(issues[0].labels, vec!["q-held"]);
         assert!(!service::is_task(&issues[0]) && service::is_held(&issues[0]));
         let (views, _) = service::views(b, &mut HashMap::new(), &mut HashMap::new()).unwrap();
-        assert_eq!(views[0].task.state, State::Held);
+        assert_eq!(views[0].projection.task.state, State::Held);
         assert_eq!(fold(n, &entries(b, n).unwrap(), false).state, State::Held);
         run(&["add", "U", "--goal", "G", "--acceptance", "a", "--op-id", "req.1.1"]).unwrap();
         assert_eq!(b.issues(None).unwrap().len(), 3, "each item has its own receipt, plus the claim issue");
@@ -2896,6 +3250,40 @@ mod tests {
         assert_eq!(width("see [#12](https://very/long/url) and `cargo test --locked` https://x/y"), 15, "link targets and code are exempt; outside whitespace counts");
     }
 
+    // H-A5: one registry owner covers preflight/effects/commit; a later remover reads the preceding writer's roots.
+    #[test]
+    fn registry_owner_preserves_parallel_changes_before_uninstall() {
+        let base=std::env::temp_dir().join(format!("taskq-registry-owner-{}",std::process::id()));
+        let install=base.join("install");let a=base.join("a");let b=base.join("b");let c=base.join("c");
+        for path in [&install,&a,&b,&c] {fs::create_dir_all(path).unwrap();}
+        let before=format!("{}\n{}\n",a.display(),b.display());
+        fs::write(install.join("projects"),&before).unwrap();fs::write(install.join("fixture.unit"),"unit").unwrap();
+        let held=coreq::file_lock::lock(&install.join("projects.lock")).unwrap();
+        let run=||coreq::process::output("test.registry-owner",std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact","tests::registry_uninstall_fixture","--ignored"]).env("TASKQ_REGISTRY_FIXTURE",&base),Duration::from_secs(5)).unwrap();
+        run();
+        let busy:Value=serde_json::from_slice(&fs::read(base.join("result.json")).unwrap()).unwrap();
+        let unchanged=fs::read_to_string(install.join("projects")).unwrap()==before && install.join("fixture.unit").is_file();
+        // This is the first owner's acknowledged change while the second one has been refused.
+        fs::write(install.join("projects"),format!("{before}{}\n",c.display())).unwrap();
+        drop(held);fs::write(install.join("fixture.unit"),"unit").unwrap();run();
+        let done:Value=serde_json::from_slice(&fs::read(base.join("result.json")).unwrap()).unwrap();
+        let after=fs::read_to_string(install.join("projects")).unwrap();
+        fs::remove_dir_all(&base).unwrap();
+        assert_eq!(busy["ok"],false,"uninstall crossed another registry owner's boundary: {busy}");
+        assert!(unchanged,"registry or unit changed while the preceding owner held projects.lock");
+        assert_eq!(done["ok"],true,"{done}");
+        assert_eq!(after,format!("{}\n{}\n",b.display(),c.display()),"a stale snapshot lost the preceding writer's project");
+    }
+
+    #[test]
+    #[ignore="owned process for registry_owner_preserves_parallel_changes_before_uninstall"]
+    fn registry_uninstall_fixture() {
+        let base=PathBuf::from(std::env::var_os("TASKQ_REGISTRY_FIXTURE").unwrap());let install=base.join("install");
+        let result=host::ProjectEdit::new(&install,&base.join("a"),false).and_then(|edit|edit.commit());
+        platform::write_atomic(&base.join("result.json"),&json!({"ok":result.is_ok(),"error":result.err()}).to_string()).unwrap();
+    }
+
     // Chain: § 4 service uninstall. Risk: an unreadable registry loses the unit.
     #[test]
     fn unreadable_registry_preserves_unit_before_unload() {
@@ -2909,38 +3297,17 @@ mod tests {
             unload: vec![vec!["taskq-must-not-run-unload".into()]],
         };
         fs::write(&u.path, "unit contents").unwrap();
-        let error = uninstall_unit(&u, &root, &projects).unwrap_err();
+        let error = host::ProjectEdit::new(&root,&root,false).err().unwrap();
         assert!(error.contains(&projects.display().to_string()));
         assert!(!error.contains("taskq-must-not-run-unload"));
         assert_eq!(fs::read_to_string(&u.path).unwrap(), "unit contents");
         assert_eq!(fs::read(&projects).unwrap(), registered);
         fs::remove_file(&projects).unwrap();
-        assert!(uninstall_unit(&u, &root, &projects).unwrap_err().contains(&projects.display().to_string()));
+        assert!(host::ProjectEdit::new(&root,&root,false).err().unwrap().contains(&projects.display().to_string()));
         assert!(u.path.is_file());
         assert!(!projects.exists());
         fs::remove_file(&u.path).unwrap();
-        fs::remove_dir(&root).unwrap();
-    }
-
-    // Chain: § 4 service uninstall failure. Risk: a failed uninstall loses registration.
-    #[test]
-    fn failed_uninstall_preserves_unit_and_project_registration() {
-        let root = std::env::temp_dir().join(format!("taskq-uninstall-{}", std::process::id()));
-        fs::create_dir_all(&root).unwrap();
-        let projects = root.join("projects");
-        let registered = format!("{}\nother\n", root.display());
-        fs::write(&projects, &registered).unwrap();
-        let u = platform::Unit {
-            path: root.join("unit"), text: String::new(), load: vec![], stop: vec![],
-            unload: vec![vec![std::env::current_exe().unwrap().display().to_string(), "--invalid-taskq-test-option".into()]],
-        };
-        fs::write(&u.path, "unit contents").unwrap();
-        assert!(uninstall_unit(&u, &root, &projects).unwrap_err().contains("failed"));
-        assert_eq!(fs::read_to_string(&u.path).unwrap(), "unit contents");
-        assert_eq!(fs::read_to_string(&projects).unwrap(), registered);
-        fs::remove_file(&u.path).unwrap();
-        fs::remove_file(&projects).unwrap();
-        fs::remove_dir(&root).unwrap();
+        fs::remove_dir_all(&root).unwrap();
     }
 
     // Chain: § 7 close verdict. Risk: a padded verdict publishes.
@@ -3093,38 +3460,188 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    // Chain: service install, § 8 step 3 kids file, adoption. Risk: an install from a project with a live child ends it
+    // Chain: native image replacement -> exact child/input recovery -> accepted input -> exit receipt.
+    // Risk: a pending acceptance loses its execution or an old turn accepts the new input.
     #[cfg(unix)]
     #[test]
-    fn install_with_a_live_child_keeps_it_through_reexec_and_adoption() {
+    fn native_image_handover_preserves_pending_input_and_terminal_receipts() {
+        let root=std::env::temp_dir().join(format!("taskq-image-{}",runtime::uuid()));
+        fs::create_dir_all(&root).unwrap();
+        let result=coreq::process::output("qualification.image-handover",std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact","tests::handover_image_child","--ignored","--nocapture"])
+            .env("TASKQ_IMAGE_ROOT",&root).env("TASKQ_IMAGE_PHASE","before"),Duration::from_secs(20));
+        assert!(result.is_ok(),"image handover failed: {result:?}");
+        assert_eq!(fs::read_to_string(root.join("verified")).unwrap(),"same process; exact execution; accepted input; native exit");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // Chain: killed service -> cold restart with a live or already-exited native child -> exact receipt.
+    // Risk: restart loses ownership, invents no-start, or replays the pending input.
+    #[cfg(unix)]
+    #[test]
+    fn native_cold_restart_reconciles_the_original_execution() {
+        let phases=if cfg!(any(target_os="macos",target_os="linux")) { & ["live","ended","cancel"][..] } else { & ["live","ended"][..] };
+        for &phase in phases {
+            let root=std::env::temp_dir().join(format!("taskq-cold-{phase}-{}",runtime::uuid()));
+            fs::create_dir_all(&root).unwrap();
+            let mut command=std::process::Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact","tests::handover_image_child","--ignored","--nocapture"])
+                .env("TASKQ_IMAGE_ROOT",&root).env("TASKQ_IMAGE_COLD",phase)
+                .stdin(std::process::Stdio::null());
+            let mut old=command.env("TASKQ_IMAGE_PHASE","before")
+                .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+            let until=Instant::now()+Duration::from_secs(5);
+            while !root.join("ready").exists() {
+                assert!(old.try_wait().unwrap().is_none(),"old service stopped before its checkpoint");
+                assert!(Instant::now()<until); std::thread::sleep(Duration::from_millis(10));
+            }
+            if phase=="ended" {
+                fs::write(root.join("observe"),"").unwrap(); fs::write(root.join("exit"),"").unwrap();
+                while !root.join("native-exited").exists() { assert!(Instant::now()<until); std::thread::sleep(Duration::from_millis(10)); }
+            }
+            old.kill().unwrap();old.wait().unwrap();
+            let output=coreq::process::output("qualification.cold-restart",command
+                .env("TASKQ_IMAGE_PHASE","after").stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()),Duration::from_secs(8));
+            assert!(output.is_ok(),"{phase} cold recovery failed: {output:?}");
+            assert_eq!(fs::read_to_string(root.join("verified")).unwrap(),"same process; exact execution; accepted input; native exit");
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore="image handover fixture"]
+    fn handover_image_child() {
+        use std::os::unix::process::CommandExt;
+        let root=PathBuf::from(std::env::var_os("TASKQ_IMAGE_ROOT").unwrap());
+        fs::create_dir_all(dot(&root)).unwrap();
+        let b=Fake::default(); let n=b.create("T","",&[service::TASK_LABEL.into()]).unwrap();
+        let a=b.comment(n,"taskq: spawn worker codex:session mac").unwrap();
+        b.comment(n,&format!("taskq: accepted {a} attempt {a}")).unwrap();
+        b.comment(n,&format!("taskq: released {a} exit attempt {a}")).unwrap();
+        let input=b.comment(n,"taskq: steer\ncontinue").unwrap();
+        let execution=b.comment(n,&format!("taskq: executing {input} attempt {a}")).unwrap();
+        let c=Config {root:root.clone(),install:root.join("install"),..cfg()};
+        let mut s=Service::new(&b,&c,"fixture",Box::new(|_|panic!("handover must not submit new work")));
+        let log=runtime::attempt_log(&root,"worker",n,a);
+        let cold=std::env::var("TASKQ_IMAGE_COLD").unwrap_or_default();
+        if std::env::var("TASKQ_IMAGE_PHASE").unwrap()=="before" {
+            let old="{\"type\":\"turn.started\"}\n{\"type\":\"turn.completed\"}\n";
+            fs::write(&log,old).unwrap();
+            let output=fs::File::options().append(true).open(&log).unwrap();
+            let child=std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","tests::handover_native_child","--ignored","--nocapture"])
+                .env("TASKQ_IMAGE_ROOT",&root).stdin(std::process::Stdio::null()).stdout(output).stderr(std::process::Stdio::null()).spawn().unwrap();
+            let native=coreq::process::identity(child.id()).unwrap();
+            s.kids.push(Kid { unknown:None, stopping:false, session_url:None,execution,task:n,attempt:a,rt:"codex".into(),proc:Box::new(runtime::CliTurn {
+                proc:Box::new(child),log,pos:old.len() as u64,start:old.len() as u64,stopping:false,accepted:false,read_error:None,native,recovery:None
+            })});
+            let launch=runtime::Launch {execution:None,task:n,title:String::new(),attempt:a,role:"worker".into(),rt:"codex".into(),session:"session".into(),url:String::new(),resume:Some("continue".into())};
+            s.kids[0].proc.checkpoint(&c,&launch,execution).unwrap();
+            assert_eq!(kids_file(&c.install,&root).unwrap().first().map(|k|k.execution),Some(execution),"successful launch must retain its exact execution before any image handover");
+            if !cold.is_empty() {
+                fs::write(root.join("ready"),"").unwrap();
+                let until=Instant::now()+Duration::from_secs(10);
+                if cold=="ended" {
+                    while s.kids[0].proc.exited().unwrap().is_none() { assert!(Instant::now()<until);std::thread::sleep(Duration::from_millis(10)); }
+                    fs::write(root.join("native-exited"),"").unwrap();
+                }
+                loop { assert!(Instant::now()<until,"fixture service was not killed");std::thread::sleep(Duration::from_millis(10)); }
+            }
+            save_kids(&s,&root).unwrap();
+            coreq::telemetry::capture::before_exec();
+            let error=std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","tests::handover_image_child","--ignored","--nocapture"])
+                .env("TASKQ_IMAGE_ROOT",&root).env("TASKQ_IMAGE_PHASE","after").exec();
+            panic!("exec failed: {error}");
+        }
+        let checkpoint=fs::read_to_string(kids_path(&c.install,&root).unwrap()).unwrap();
+        adopt(&mut s,&c.install,&root).unwrap();
+        adopt(&mut s,&c.install,&root).unwrap();
+        assert_eq!(s.kids.len(),1,"retry after partial recovery retains the same native handle");
+        assert_eq!(s.kids[0].execution,execution); assert_eq!(s.delivered(a),a);
+        let pid=s.kids[0].proc.id();
+        if cold=="live" && !cfg!(any(target_os="macos",target_os="linux")) {
+            assert!(s.kids[0].proc.kill().unwrap_err().contains("recovered process"),"non-child stop needs a stable native control handle");
+            assert!(coreq::process::identity(pid).unwrap().is_some(),"failed stop cannot signal a reused PID");
+        }
+        s.reap_owned(); if cold!="ended" { assert_eq!(s.delivered(a),a,"old log entries cannot accept this input"); }
+        fs::write(root.join("observe"),"").unwrap();
+        let until=Instant::now()+Duration::from_secs(5);
+        while s.delivered(a)!=input {
+            s.reap_owned(); assert!(Instant::now()<until,"acceptance not observed: {:?}",s.kids.iter().map(|k|&k.unknown).collect::<Vec<_>>());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if cold=="cancel" { s.kids[0].proc.kill().unwrap(); }
+        else { fs::write(root.join("exit"),"").unwrap(); }
+        if !s.kids.is_empty() {
+            while !s.kids[0].proc.exited().is_ok_and(|code|code.is_some()) { assert!(Instant::now()<until);std::thread::sleep(Duration::from_millis(10)); }
+            let saved=fs::read_to_string(kids_path(&c.install,&root).unwrap()).unwrap();
+            b.state.borrow_mut().fail_comments=1;
+            s.reap_owned();
+            assert!(!s.kids.is_empty(),"failed release readback retains the terminal handle");
+            assert_eq!(fs::read_to_string(kids_path(&c.install,&root).unwrap()).unwrap(),saved,"recovery record survives a failed terminal receipt");
+        }
+        while !s.kids.is_empty() {
+            s.reap_owned(); assert!(Instant::now()<until,"native exit not observed: {:?}",s.kids.iter().map(|k|&k.unknown).collect::<Vec<_>>());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(coreq::process::identity(pid).unwrap(),None);
+        let records=core::executions(n,&board::entries(&b,n).unwrap());
+        assert!(records.iter().find(|x|x.id==execution).is_some_and(|x|x.accepted && x.release==Some(core::Release::Exit)));
+        if !cold.is_empty() {
+            // Crash after the board receipt but before local cleanup: the stale identity must not block startup.
+            fs::write(kids_path(&c.install,&root).unwrap(),checkpoint).unwrap();
+            adopt(&mut s,&c.install,&root).unwrap();
+            assert!(s.kids.is_empty());
+        }
+        save_kids(&s,&root).unwrap(); assert!(kids_file(&c.install,&root).unwrap().is_empty());
+        fs::write(root.join("verified"),"same process; exact execution; accepted input; native exit").unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore="native process for image handover fixture"]
+    fn handover_native_child() {
+        use std::io::Write;
+        let root=PathBuf::from(std::env::var_os("TASKQ_IMAGE_ROOT").unwrap());
+        let until=Instant::now()+Duration::from_secs(10);
+        while !root.join("observe").exists() { assert!(Instant::now()<until); std::thread::sleep(Duration::from_millis(10)); }
+        println!("\n{{\"type\":\"turn.started\"}}"); std::io::stdout().flush().unwrap();
+        while !root.join("exit").exists() { assert!(Instant::now()<until); std::thread::sleep(Duration::from_millis(10)); }
+    }
+
+    // § 8 re-exec preserves native CLI identity and defers for app/operator ownership; no unit reload path remains.
+    #[cfg(unix)]
+    #[test]
+    fn live_child_survives_reexec_preparation_and_native_adoption() {
         use runtime::Proc;
         let root = std::env::temp_dir().join(format!("taskq-install-live-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(dot(&root)).unwrap();
-        let child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
         let pid = child.id();
-        // the unit reload stands for launchctl bootout: it ends the service's process tree, the child included
-        let reloaded = root.join("reloaded");
-        let u = platform::Unit { path: root.join("unit"), text: String::new(), stop: vec![],
-            unload: vec![vec!["kill".into(), "-9".into(), pid.to_string()]],
-            load: vec![vec!["touch".into(), reloaded.display().to_string()]] };
-        fs::write(dot(&root).join("status.json"), format!(r#"{{"kids": [{{"task": 7, "attempt": 41, "rt": "claude", "pid": {pid}}}]}}"#)).unwrap();
-        assert!(load_unit(&u, &root).unwrap(), "live child: hand over");
-        assert!(dot(&root).join("restart").exists() && !reloaded.exists(), "the running service re-execs; no reload");
-        let mut adopted = runtime::Adopted(pid as i32);
+        let mut adopted = runtime::Adopted::new(coreq::process::identity(pid).unwrap().unwrap());
+        let mut wrong=coreq::process::identity(pid).unwrap().unwrap(); wrong.started.push_str("-wrong");
+        let mut wrong=runtime::Adopted::new(wrong);
+        assert_eq!(wrong.exited(),Ok(Some(-1)),"a different native incarnation proves the recorded one is gone");
+        wrong.kill().unwrap(); // Terminal identity is a no-op; the current incarnation must remain untouched.
         assert_eq!(adopted.exited(), Ok(None), "the child still runs");
         // the re-exec writes the kids file; the new image adopts the child, not `gone`
-        fs::write(dot(&root).join("kids"), format!("pid {}\n7 41 claude {pid} 40\n", std::process::id())).unwrap();
-        assert_eq!(kids_file(&root), vec![(7, 41, "claude".to_string(), pid as i32, 40)]);
+        let owner=coreq::process::identity(std::process::id()).unwrap().unwrap();
+        let native=coreq::process::identity(pid).unwrap().unwrap();
+        let path=kids_path(&root,&root).unwrap();fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, format!("pid {} {} executor-v1\n7 41 codex {pid} {} 43 40\n",owner.pid,owner.started,native.started)).unwrap();
+        assert_eq!(kids_file(&root,&root).unwrap(), vec![data::KidLine {task:7,attempt:41,runtime:"codex".into(),process:native,execution:43,offset:40,job:None}]);
         assert_eq!(adopted.exited(), Ok(None), "adopted live");
         // A real process stands in for an app turn: restart must stay pending and keep its lease.
         let b = Fake::default();
         let c = Config { root: root.clone(), ..cfg() };
         let mut s = Service::new(&b, &c, "test", Box::new(|_| unreachable!()));
-        s.kids.push(Kid { task: 7, attempt: 41, rt: "codex-app".into(), proc: Box::new(runtime::Adopted(pid as i32)) });
+        s.kids.push(Kid { unknown:None, stopping:false, session_url:None, execution: 41, task: 7, attempt: 41, rt: "codex-app".into(), proc: Box::new(runtime::Adopted::new(coreq::process::identity(pid).unwrap().unwrap())) });
         reexec(&s, &c).unwrap();
         assert!(dot(&root).join("restart").exists());
-        assert_eq!(restart_waits(&s, &root), ["#7"], "status and log name the task the restart waits for");
+        assert_eq!(lifecycle_waits(&s, &root, false), ["#7","ownership unknown"], "status names the active task and missing ownership read");
         assert_eq!(s.kids[0].attempt, 41);
         assert_eq!(adopted.exited(), Ok(None));
         s.kids.clear();
@@ -3132,46 +3649,56 @@ mod tests {
         fs::write(operator::dir(&root).join("1.json"), "{}").unwrap();
         fs::write(operator::answer_path(&root, "1"), r#"{"state":"running"}"#).unwrap();
         reexec(&s, &c).unwrap();
-        assert!(dot(&root).join("restart").exists() && handover(&root));
-        assert_eq!(restart_waits(&s, &root), ["operator"]);
+        assert!(dot(&root).join("restart").exists());
+        assert_eq!(lifecycle_waits(&s, &root, false), ["ownership unknown","operator"]);
         fs::write(operator::answer_path(&root, "1"), r#"{"state":"result"}"#).unwrap();
-        // an idle service reloads the unit, which would end a child
-        fs::write(dot(&root).join("status.json"), r#"{"kids": []}"#).unwrap();
-        assert!(!load_unit(&u, &root).unwrap() && reloaded.exists());
-        std::thread::sleep(Duration::from_millis(200));
-        assert!(adopted.exited().is_ok_and(|c| c.is_some()), "a reload ends it");
+        coreq::process::terminate(&coreq::process::identity(pid).unwrap().unwrap()).unwrap();
+        child.wait().unwrap();
         let _ = fs::remove_dir_all(&root);
     }
 
-    // Chain: service install and the § 8 step 3 handover. Risk: a reinstall or a corrupt kids file ends live children
+    // § 8 recovery: corrupt/legacy identities stay unknown and preserved; no timestamp can discard them.
     #[test]
-    fn install_hands_live_children_over_and_corrupt_kids_stay() {
+    fn native_recovery_preserves_corrupt_and_legacy_evidence() {
         let root = std::env::temp_dir().join(format!("taskq-handover-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(dot(&root)).unwrap();
-        assert!(!handover(&root), "no service: reload");
         let st = dot(&root).join("status.json");
-        fs::write(&st, r#"{"kids": []}"#).unwrap();
-        assert!(!handover(&root), "idle service: reload");
-        fs::write(&st, r#"{"kids": [{"task": 7, "attempt": 41, "rt": "claude", "pid": 1}]}"#).unwrap();
-        assert!(handover(&root), "live children: re-exec");
-        fs::write(&st, "{\"kids\": [").unwrap();
-        assert!(handover(&root), "unknown keeps them");
-        fs::File::options().write(true).open(&st).unwrap().set_modified(SystemTime::now() - Duration::from_secs(120)).unwrap();
-        assert!(!handover(&root), "a stale status.json: no running service");
-        let kids = dot(&root).join("kids");
-        assert!(kids_file(&root).is_empty());
+        let kids = kids_path(&root,&root).unwrap(); fs::create_dir_all(kids.parent().unwrap()).unwrap();
+        assert!(kids_file(&root,&root).unwrap().is_empty());
+        let legacy=dot(&root).join("kids"); fs::write(&legacy,"untrusted project recovery record").unwrap();
+        assert!(kids_file(&root,&root).unwrap_err().contains("legacy"));
+        assert_eq!(fs::read_to_string(&legacy).unwrap(),"untrusted project recovery record");
         fs::write(&kids, "pid 1\n7 41 claude\n").unwrap();
-        assert!(kids_file(&root).is_empty());
+        assert!(kids_file(&root,&root).is_err());
         assert_eq!(fs::read_to_string(&kids).unwrap(), "pid 1\n7 41 claude\n", "a malformed kids file stays");
-        fs::write(&kids, format!("pid {}\n7 41 claude 123 40\n", std::process::id())).unwrap();
-        assert_eq!(kids_file(&root), vec![(7, 41, "claude".to_string(), 123, 40)]);
-        assert!(!kids.exists(), "a valid one is consumed");
+        let owner=coreq::process::identity(std::process::id()).unwrap().unwrap();
+        let launcher_only=format!("pid {} {}\n7 41 codex 123 child 43 40\n",owner.pid,owner.started);
+        fs::write(&kids,&launcher_only).unwrap();
+        assert!(kids_file(&root,&root).unwrap_err().contains("legacy launcher"));
+        assert_eq!(fs::read_to_string(&kids).unwrap(),launcher_only,"never upgrade old launcher identity implicitly");
+        let valid=format!("pid {} {} executor-v1\n7 41 codex 123 child 43 40\n",owner.pid,owner.started);
+        fs::write(&kids,&valid).unwrap();
+        assert_eq!(kids_file(&root,&root).unwrap(),vec![data::KidLine {task:7,attempt:41,runtime:"codex".into(),process:coreq::process::Identity {pid:123,started:"child".into()},execution:43,offset:40,job:None}]);
+        assert_eq!(fs::read_to_string(&kids).unwrap(),valid,"readback never deletes recovery evidence");
+        assert!(legacy.exists(),"protected adoption does not delete the legacy artifact");
+        fs::write(&kids,format!("pid {} wrong-creation executor-v1\n",owner.pid)).unwrap();
+        assert!(kids_file(&root,&root).unwrap().is_empty(),"a different service incarnation permits reconciliation, never blind child control");
+        let mut foreign=std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact","runtime::tests::stop_child","--ignored"])
+            .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+        let foreign_id=coreq::process::identity(foreign.id()).unwrap().unwrap();
+        let foreign_record=format!("pid {} {} executor-v1\n",foreign_id.pid,foreign_id.started);
+        fs::write(&kids,&foreign_record).unwrap();
+        assert!(kids_file(&root,&root).unwrap_err().contains("still alive"));
+        foreign.kill().unwrap();foreign.wait().unwrap();
+        assert!(kids_file(&root,&root).unwrap().is_empty());
+        assert_eq!(fs::read_to_string(&kids).unwrap(),foreign_record,"native reads never erase the prior owner's record");
         fs::write(&kids, "pid 1\n7 41 claude 123 40\n").unwrap();
-        assert!(kids_file(&root).is_empty() && !kids.exists(), "another process's file: its attempts go gone");
+        assert!(kids_file(&root,&root).is_err() && kids.exists(), "previous service metadata survives for reconciliation");
         // a corrupt focus pauses nothing away and names its reason
         fs::write(dot(&root).join("focus"), b"\xff").unwrap();
-        assert!(pause(&root).unwrap_err().contains("not UTF-8"));
+        assert!(pause(&root,false).unwrap_err().contains("not UTF-8"));
         assert_eq!(fs::read(dot(&root).join("focus")).unwrap(), b"\xff");
         assert!(service_fields(&root).contains("Focus: unknown (focus: not UTF-8 text; file kept)"));
         fs::write(&st, "{").unwrap();
@@ -3193,23 +3720,172 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    // Chain: direct shared commands -> receipt refusal -> preserved focus, with safe Pause fallback.
+    #[test]
+    fn direct_focus_commands_cannot_bypass_required_receipts() {
+        let root=std::env::temp_dir().join(format!("taskq-direct-receipt-{}",std::process::id()));
+        fs::create_dir_all(dot(&root)).unwrap();
+        fs::write(dot(&root).join("focus"),"off").unwrap();
+        fs::write(dot(&root).join("focus.paused"),"area-maps").unwrap();
+        assert!(resume(&root).unwrap_err().contains("receipt unavailable"));
+        assert_eq!(data::focus(&root).unwrap(),Vec::<String>::new());
+        assert!(set_focus(&root,"all",None).unwrap_err().contains("receipt unavailable"));
+        assert_eq!(data::focus(&root).unwrap(),Vec::<String>::new());
+        fs::write(dot(&root).join("focus"),"area-maps").unwrap();
+        assert!(pause(&root,false).unwrap_err().contains("applied locally; durable receipt unknown"));
+        assert_eq!(data::focus(&root).unwrap(),Vec::<String>::new());
+        assert_eq!(fs::read_to_string(dot(&root).join("focus.paused")).unwrap(),"area-maps");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // Chain: initialization refusal -> original error and durable command failure, before any setting write.
+    #[test]
+    fn focus_initialization_failures_keep_required_receipts() {
+        crate::with_test_capture(|store,dir| {
+            let root=dir.join("project");fs::create_dir(&root).unwrap();
+            fs::write(dot(&root),"preserve this obstacle").unwrap();
+            assert!(set_focus(&root,"all",None).unwrap_err().contains("failure receipt"));
+            assert!(pause(&root,true).unwrap_err().contains("failure receipt"));
+            assert_eq!(fs::read_to_string(dot(&root)).unwrap(),"preserve this obstacle");
+            let page=store.export(0,0,1024).unwrap();
+            let receipts:Vec<_>=page["events"].as_array().unwrap().iter().map(|r|&r["observation"])
+                .filter(|r|r["source"]=="command").collect();
+            assert_eq!(receipts.iter().map(|r|r["kind"].as_str().unwrap()).collect::<Vec<_>>(),
+                ["command.received","command.failed","command.received","command.failed"]);
+            assert_ne!(receipts[0]["span"],receipts[2]["span"]);
+        });
+    }
+
+    // Chain: settings change -> blocked terminal commit -> competing reader/writer refused -> committed readback.
+    #[test]
+    fn focus_lock_outlives_terminal_receipt_commit() {
+        use std::sync::Arc;
+        use tracing_subscriber::prelude::*;
+        let dir=std::env::temp_dir().join(format!("taskq-commit-lock-{}",std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let store=Arc::new(coreq::telemetry::Store::open(&dir.join("db")).unwrap());
+        let capture=coreq::telemetry::capture::Capture::new(store.clone(),"taskq","fixture").unwrap();
+        // Only the action and required receipts enter this collector; its next accepted row is the terminal receipt.
+        let layer=capture.clone().with_filter(tracing_subscriber::filter::Targets::new()
+            .with_target("taskq::receipt_lock_fixture",tracing::Level::INFO));
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(layer),|| {
+            let root=dir.join("project");fs::create_dir_all(dot(&root)).unwrap();
+            fs::write(dot(&root).join("focus"),"off").unwrap();
+            #[cfg(windows)]
+            {
+                let path=dir.join("raw-read");fs::write(&path,"signal").unwrap();
+                let locked=coreq::file_lock::try_lock(&path).unwrap();
+                assert!(fs::read_to_string(&path).is_err(),"raw reads bypassed the Windows byte-range lock");
+                drop(locked);assert_eq!(fs::read_to_string(path).unwrap(),"signal");
+            }
+            let (start_tx,start_rx)=std::sync::mpsc::channel::<u64>();
+            let (ready_tx,ready_rx)=std::sync::mpsc::channel();
+            std::thread::scope(|scope| {
+                let root=&root;let capture=&capture;let dir=&dir;
+                let blocker=scope.spawn(move || {
+                    let db=rusqlite::Connection::open(dir.join("db")).unwrap();
+                    db.busy_timeout(Duration::from_secs(3)).unwrap();
+                    let baseline=start_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+                    db.execute_batch("BEGIN IMMEDIATE").unwrap();
+                    ready_tx.send(()).unwrap();
+                    let until=Instant::now()+Duration::from_secs(3);
+                    while capture.health()["accepted"].as_u64().unwrap()==baseline {
+                        assert!(Instant::now()<until,"terminal receipt was never submitted");
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    let file=fs::OpenOptions::new().read(true).write(true).open(dot(root).join("poke")).unwrap();
+                    assert!(coreq::file_lock::try_lock_shared_file(file).is_err(),"service read settings before terminal receipt commit");
+                    assert!(wake_lock(root).is_err(),"next command overtook terminal receipt commit");
+                    db.execute_batch("ROLLBACK").unwrap();
+                });
+                let _action=tracing::info_span!(target:"taskq::receipt_lock_fixture","fixture.focus").entered();
+                change_focus(root,false,false,|d| {
+                    start_tx.send(capture.health()["accepted"].as_u64().unwrap()).unwrap();
+                    ready_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+                    platform::write_atomic(&d.join("focus"),"all")
+                }).unwrap();
+                blocker.join().unwrap();
+            });
+            let _released=wake_lock(&root).unwrap();
+            let page=store.export(0,0,1024).unwrap();
+            let receipts:Vec<_>=page["events"].as_array().unwrap().iter().map(|r|&r["observation"])
+                .filter(|r|r["source"]=="command").collect();
+            assert_eq!(receipts.len(),2);assert_eq!(receipts[1]["kind"],"command.applied");
+            assert_eq!(receipts[0]["span"],receipts[1]["span"]);
+            assert_eq!(data::focus(&root).unwrap(),["all"]);
+        });
+        capture.flush().unwrap();drop(capture);drop(store);fs::remove_dir_all(dir).unwrap();
+    }
+
     // Chain: § 4 pause and resume focus. Risk: resume widens focus to all.
     #[test]
+    fn focus_commands_do_not_mutate_while_another_command_or_reader_owns_the_signal() {
+        crate::with_test_capture(|_, _| {
+            let root=std::env::temp_dir().join(format!("taskq-focus-lock-{}",std::process::id()));
+            fs::create_dir_all(dot(&root)).unwrap();
+            let d=dot(&root);
+            fs::write(d.join("focus"),"off").unwrap();
+            fs::write(d.join("focus.paused"),"area-maps").unwrap();
+            fs::write(d.join("focus.request"),"owner intent").unwrap();
+            fs::write(d.join("poke"),".").unwrap();
+            for shared in [false,true] {
+                let file=fs::OpenOptions::new().read(true).write(true).open(d.join("poke")).unwrap();
+                let _owner=if shared {coreq::file_lock::try_lock_shared_file(file)} else {coreq::file_lock::try_lock_file(file)}.unwrap();
+                assert!(resume(&root).is_err());
+                assert_eq!(fs::read_to_string(d.join("focus")).unwrap(),"off","Resume changed state before owning its command boundary");
+                assert!(set_focus(&root,"all",Some("new intent")).is_err());
+                assert_eq!(fs::read_to_string(d.join("focus.request")).unwrap(),"owner intent");
+                assert_eq!(fs::read_to_string(d.join("focus")).unwrap(),"off");
+                assert!(pause(&root,false).is_err());
+                assert_eq!(fs::read_to_string(d.join("focus.paused")).unwrap(),"area-maps");
+                assert!(install_focus(&root).is_err());
+            }
+            assert_eq!(resume(&root).unwrap().0,"area-maps");
+            pause(&root,false).unwrap();
+            assert_eq!(resume(&root).unwrap().0,"area-maps");
+            let context=format!("1 {}.1 {}.2","a".repeat(32),"a".repeat(32));
+            fs::write(d.join("poke"),&context).unwrap();
+            let mut seen=None;
+            let (link,focus)=wake_read(&d.join("poke"),&mut seen,|| {
+                assert!(pause(&root,false).is_err(),"writer entered a reader's snapshot");
+                data::focus(&root)
+            }).unwrap();
+            assert_eq!(link.unwrap().encode(),context);assert_eq!(focus,["area-maps"]);
+            seen=None;
+            fs::write(d.join("focus"),b"\xff").unwrap();
+            assert!(wake_read(&d.join("poke"),&mut seen,||data::focus(&root)).is_err());
+            assert!(seen.is_none(),"failed state read consumed the command identity");
+            fs::write(d.join("focus"),"area-maps").unwrap();
+            assert!(wake_read(&d.join("poke"),&mut seen,||data::focus(&root)).unwrap().0.is_some());
+            fs::remove_file(d.join("focus.request")).unwrap();fs::create_dir(d.join("focus.request")).unwrap();
+            assert!(set_focus(&root,"area-other",None).unwrap_err().contains("partially saved"));
+            assert_eq!(data::focus(&root).unwrap(),["area-other"]);
+            let signal=fs::read_to_string(d.join("poke")).unwrap();
+            assert_ne!(signal,context,"partial state retained the previous command's link");
+            assert!(coreq::telemetry::capture::TraceContext::decode(&signal).is_ok());
+            fs::remove_dir_all(root).unwrap();
+        });
+    }
+
+    // Chain: repeated Pause -> Resume preserves the owner's saved scope.
+    #[test]
     fn resume_restores_the_saved_focus_and_never_defaults_to_all() {
-        let root = std::env::temp_dir().join(format!("taskq-resume-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(dot(&root)).unwrap();
-        fs::write(dot(&root).join("status.json"), r#"{"tasks": [{"n": 1, "labels": ["taskq", "q-ready", "area-maps"]}]}"#).unwrap();
-        fs::write(dot(&root).join("focus"), "off").unwrap();
-        let e = resume(&root).unwrap_err();
-        assert!(e.contains("labels of open tasks: area-maps"), "{e}");
-        assert_eq!(fs::read_to_string(dot(&root).join("focus")).unwrap(), "off");
-        fs::write(dot(&root).join("focus"), "area-maps").unwrap();
-        pause(&root).unwrap();
-        pause(&root).unwrap();
-        assert_eq!(fs::read_to_string(dot(&root).join("focus")).unwrap(), "off");
-        assert_eq!(resume(&root).unwrap(), "area-maps", "a second pause keeps the saved focus");
-        let _ = fs::remove_dir_all(&root);
+        crate::with_test_capture(|_, _| {
+            let root = std::env::temp_dir().join(format!("taskq-resume-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(dot(&root)).unwrap();
+            fs::write(dot(&root).join("status.json"), r#"{"tasks": [{"n": 1, "labels": ["taskq", "q-ready", "area-maps"]}]}"#).unwrap();
+            fs::write(dot(&root).join("focus"), "off").unwrap();
+            let e = resume(&root).unwrap_err();
+            assert!(e.contains("labels of open tasks: area-maps"), "{e}");
+            assert_eq!(fs::read_to_string(dot(&root).join("focus")).unwrap(), "off");
+            fs::write(dot(&root).join("focus"), "area-maps").unwrap();
+            pause(&root,false).unwrap();
+            pause(&root,false).unwrap();
+            assert_eq!(fs::read_to_string(dot(&root).join("focus")).unwrap(), "off");
+            assert_eq!(resume(&root).unwrap().0, "area-maps", "a second pause keeps the saved focus");
+            let _ = fs::remove_dir_all(&root);
+        });
     }
 
     // Chain: R6 human report. Risk: report breaks the R6 format.
@@ -3400,7 +4076,7 @@ mod tests {
         run(&["close".into(), "12".into(), "--help".into()]).unwrap();
         assert!(USAGE.contains("--recommend K"));
         assert!(USAGE.contains("--snapshot DIR"));
-        assert!(USAGE.contains("taskq service capacity [--host H] [--mode auto|fixed] [--max N|none] [--claude N] [--codex N] [--codex-app N] [--load-gate on|off] [--cpu-max P] [--memory-min P]"));
+        assert!(USAGE.contains("taskq service capacity [--host H] [--max N|none] [--claude N] [--codex N] [--codex-app N] [--load-gate on|off] [--cpu-max P] [--memory-min P]"));
         run(&["service".into(), "capacity".into(), "--help".into()]).unwrap();
         let e = platform::error_text("#7 is ready", None);
         assert!(e.starts_with("Error: #7 is ready\nNext: "));
@@ -3463,7 +4139,7 @@ mod tests {
         assert!(s.contains("Counts: unknown"));
         assert!(s.contains("Freshness: unknown"));
         assert!(!s.contains("Ready 0"));
-        assert!(pause(&root).is_err(), "missing state folder cannot acknowledge pause");
+        assert!(pause(&root,false).is_err(), "missing state folder cannot acknowledge pause");
         fs::create_dir_all(dot(&root)).unwrap();
         fs::write(dot(&root).join("focus"), "one two").unwrap();
         let mut status = json!({"error": null, "at": SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs(), "tasks_age_seconds": 0, "tasks": [{"state":"doing"},{"state":"review"},{"state":"ask"},{"state":"ready"}]});
@@ -3472,7 +4148,7 @@ mod tests {
         assert!(s.contains("Focus: one\nFocus: two"));
         assert!(s.contains("In work 2 · Waiting for answer 1 · Ready 1"));
         assert!(s.contains("cached status"));
-        assert!(s.contains("Service: unknown (process not checked)"));
+        assert!(!s.contains("Service:"),"project cache cannot claim native host health");
         // Capacity-only publication keeps the file fresh without refreshing the board counts.
         status["tasks_age_seconds"] = json!(301);
         status["capacity"] = json!({"gate": "off"});
@@ -3488,6 +4164,18 @@ mod tests {
     }
 
     // Chain: § 5 error diagnostics. Risk: a compact error loses its full diagnostic.
+    // Risk: adding a full poll after native work drifts heartbeat cadence; a pre-pass poke must still wake it.
+    #[test]
+    fn completed_pass_does_not_add_another_poll_interval() {
+        let dir=std::env::temp_dir().join(format!("taskq-poll-{}",runtime::uuid()));fs::create_dir(&dir).unwrap();
+        let paths=[dir.join("project"),dir.join("host")];let before=poke_times(&paths);
+        let mut ticks=0;let began=Instant::now();
+        sleep_until_poke(&paths,before,began-Duration::from_secs(1),&mut ||ticks+=1);
+        fs::write(&paths[0],"wake").unwrap();
+        sleep_until_poke(&paths,before,began+Duration::from_secs(60),&mut ||ticks+=1);
+        assert_eq!(ticks,0);assert!(began.elapsed()<Duration::from_secs(1));fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn compact_errors_retain_complete_diagnostics() {
         let root = std::env::temp_dir().join(format!("taskq-error-{}", std::process::id()));

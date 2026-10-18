@@ -78,10 +78,20 @@ impl Receipt {
     pub fn ok(&self) -> bool {
         self.outcome == "accepted"
     }
+    /// Notification failure cannot undo a confirmed board mutation or invite a duplicate write.
+    pub fn wake(mut self, root: &Path) -> Self {
+        if let Err(error) = poke(root) {
+            if self.ok() {
+                self.reason = error;
+                self.next = "Board change accepted; check service status; do not repeat the board write.".into();
+            }
+        }
+        self
+    }
     /// The § 5 text: `#N <state>` (plus extra lines), else `Error:` and `Next:`.
     pub fn text(&self) -> String {
         if self.ok() {
-            join(&[&format!("#{} {}", self.task, self.state.unwrap_or("unknown")), &self.extra]).replace("\n\n", "\n")
+            join(&[&format!("#{} {}", self.task, self.state.unwrap_or("unknown")), &self.extra, &self.reason, &self.next]).replace("\n\n", "\n")
         } else {
             let why = if self.reason.starts_with('#') { self.reason.clone() } else { format!("#{}: {}", self.task, self.reason) };
             format!("Error: {}\nNext: {}", crate::compact(&why, 153), crate::compact(&self.next, 154))
@@ -122,14 +132,14 @@ fn act_as(b: &dyn Board, root: &Path, n: u64, kind: &str, args: &[&str], text: &
         Ok(x) => x,
         Err(e) => return Receipt { outcome: "unknown", ..Receipt::rejected(n, op, e) },
     };
-    let before = fold(n, &log, deps);
-    let rev = core::revision(n, &log);
+    let projection = core::project(n, &log, deps);
+    let (before, rev) = (projection.task, projection.revision);
     let accepted = |s: State, rev: u64| Receipt::accepted(n, op, s, rev);
     if let Some(id) = &op.id
         && log.iter().any(|e| !e.edited && core::op_id(n, &e.body) == Some(id.as_str()))
     {
-        // a retry: the first write stands, nothing more is written (even after it cleared the attempt)
-        return accepted(if issue.open { before.state } else { State::Closed }, rev);
+        // a retry: the first write stands, no further board write (even after it cleared the attempt)
+        return accepted(if issue.open { before.state } else { State::Closed }, rev).wake(root);
     }
     if let Some(why) = child.and_then(|env| stale_child(n, kind, before.attempt, env)) {
         return Receipt { state: Some(before.state.name()), revision: Some(rev), next: "Run taskq from a fresh session of the live attempt, or unset TASKQ_TASK and TASKQ_ATTEMPT.".into(), ..Receipt::rejected(n, op, why) };
@@ -164,21 +174,23 @@ fn act_as(b: &dyn Board, root: &Path, n: u64, kind: &str, args: &[&str], text: &
     log.sort_by_key(|e| e.id);
     let Some(i) = log.iter().position(|e| e.id == id) else { return unknown(format!("comment {id} not read back")) };
     // lost: an earlier entry moved the revision, or `fold` ignores this one (a raced op id included)
-    if op.revision.is_some_and(|r| r != core::revision(n, &log[..i])) || fold(n, &log[..i], deps) == fold(n, &log[..=i], deps) {
+    let before_write = core::project(n, &log[..i], deps);
+    if op.revision.is_some_and(|r| r != before_write.revision) || before_write.task == fold(n, &log[..=i], deps) {
         // the losing entry edits itself: an edited entry is ignored by this and older versions alike (§ 2, § 8)
         if let Err(e) = b.edit_comment(n, id, &format!("{body}\n\nignored: another write won")) {
             return unknown(e);
         }
         log[i].edited = true;
-        let (t, rev) = (fold(n, &log, deps), core::revision(n, &log));
+        let projection = core::project(n, &log, deps);
+        let (t, rev) = (projection.task, projection.revision);
         return Receipt { state: Some(t.state.name()), revision: Some(rev), ..Receipt::new(n, op, "stale", "another write won; this entry is ignored", format!("Read `taskq inbox {n}`; current revision is {rev}.")) };
     }
-    let (t, rev) = (fold(n, &log, deps), core::revision(n, &log));
+    let projection = core::project(n, &log, deps);
+    let (t, rev) = (projection.task, projection.revision);
     if let Err(e) = service::project(b, &issue, &t) {
         return unknown(e);
     }
-    poke(root);
-    accepted(t.state, rev)
+    accepted(t.state, rev).wake(root)
 }
 
 /// § 7: publish a reviewed result, then `close`; later and failed tasks close without publication.
@@ -370,7 +382,8 @@ pub fn proposal(b: &dyn Board, me: &str, kids: &Result<Vec<serde_json::Value>, S
     for i in b.issues(None)?.iter().filter(|i| service::is_task(i)) {
         let n = i.number;
         let log = entries(b, n)?;
-        let t = fold(n, &log, false);
+        let projection = core::project(n, &log, false);
+        let t = &projection.task;
         let (Some(a), Some(h)) = (t.attempt, service::host_of(&t)) else { continue };
         if h != me || !matches!(t.state, State::Doing | State::Review) {
             continue;
@@ -383,7 +396,7 @@ pub fn proposal(b: &dyn Board, me: &str, kids: &Result<Vec<serde_json::Value>, S
             Ok(Some(k)) => Ok(format!("running pid {}", k["pid"])),
         };
         let (live, revision) = match live {
-            Ok(l) => (l, Some(core::revision(n, &log))),
+            Ok(l) => (l, Some(projection.revision)),
             Err(e) => (format!("unknown ({e})"), None),
         };
         rows.push(Row { task: n, state: t.state.name(), attempt: a, live, revision });
@@ -404,6 +417,30 @@ pub fn recover(b: &dyn Board, root: &Path, rows: &[Row]) -> Vec<Receipt> {
 mod tests {
     use super::*;
     use crate::board::Fake;
+
+    // Chain: committed board mutation -> failed wake -> same op retry; never duplicate the board write.
+    #[test]
+    fn wake_failure_preserves_acceptance_and_retry_only_notifies() {
+        let b = Fake::default();
+        let root = std::env::temp_dir().join(format!("taskq-wake-receipt-{}", std::process::id()));
+        let path = crate::dot(&root).join("poke");
+        std::fs::create_dir_all(&path).unwrap();
+        let n = b.create("Wake fixture", "## Goal\ng", &["taskq".into()]).unwrap();
+        let op = Op { id: Some("hold-once".into()), revision: None };
+        let first = act(&b, &root, n, "hold", &[], "", &op);
+        assert!(first.ok(), "{}", first.text());
+        assert!(first.text().contains("service wake failed"));
+        assert!(first.json().contains("wake-open"));
+        let before = entries(&b, n).unwrap();
+        assert_eq!(first.state, Some("held"));
+        std::fs::remove_dir(&path).unwrap();
+        let retry = act(&b, &root, n, "hold", &[], "", &op);
+        assert!(retry.ok()); assert!(retry.reason.is_empty());
+        assert_eq!(retry.revision, first.revision);
+        assert_eq!(entries(&b, n).unwrap().len(), before.len());
+        assert!(path.is_file());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     // Chain: § 5 stale child environment (#1072). Risk: a reused session's TASKQ_TASK/TASKQ_ATTEMPT writes unfenced or ignored.
     #[test]

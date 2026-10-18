@@ -1,5 +1,5 @@
 //! Windows §8: one inherited native token; control state never lives in the writable runtime home.
-use std::{fs, io::Read, path::{Path, PathBuf}, process::{Command, Stdio}};
+use std::{fs, io::Read, path::{Path, PathBuf}, process::Command};
 use serde_json::Value;
 
 // Exact privately qualified dependency; a stock or changed CLI is not this enforcement path.
@@ -86,9 +86,12 @@ fn prepare(root: &Path, install: &Path, home: &Path, p: &Paths) -> Result<(), St
     let config = format!("[permissions.taskq.filesystem]\n{}\n[permissions.taskq.network]\nenabled=true\n", entries.iter()
         .map(|(p, mode)| format!("{} = \"{mode}\"", serde_json::to_string(&p.replace('\\', "/")).unwrap())).collect::<Vec<_>>().join("\n"));
     fs::write(p.state.join("config.toml"), config).map_err(|e| e.to_string())?;
-    let out = crate::platform::quiet(Command::new(&p.bin).args(["-c", "windows.sandbox=unelevated", "sandbox", "-P", "taskq", "--include-managed-config", "--", "cmd.exe", "/d", "/c", "exit 0"])
+    let out = match coreq::process::output("sandbox.preflight", Command::new(&p.bin).args(["-c", "windows.sandbox=unelevated", "sandbox", "-P", "taskq", "--include-managed-config", "--", "cmd.exe", "/d", "/c", "exit 0"])
         .current_dir(root).env("CODEX_HOME", &p.state).env("TASKQ_WINDOWS_SANDBOX_HOME", &p.state)
-        .env("TEMP", &p.temp).env("TMP", &p.temp).stdin(Stdio::null())).output().map_err(|e| e.to_string())?;
+        .env("TEMP", &p.temp).env("TMP", &p.temp), std::time::Duration::from_secs(30)) {
+        Ok(out) | Err(coreq::process::Failure::Exit(out)) => out,
+        Err(e) => return Err(format!("Windows native preflight: {e}")),
+    };
     if !out.status.success() { return Err(format!("Windows native preflight: {}", String::from_utf8_lossy(&out.stderr))); }
     let sid_file = p.state.join("cap_sid");
     let mut caps: Value = serde_json::from_slice(&fs::read(&sid_file).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
@@ -177,7 +180,7 @@ mod tests {
         let attempt = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() * 2;
         let rules = [false, true].map(|resume| crate::runtime::instructions(&root, "", resume).unwrap());
         for (i, role) in ["worker", "reviewer"].iter().enumerate() {
-            let mut l = Launch { task: 1, title: "Owner-authorized isolated Windows boundary qualification; follow fixture taskq.md, no board or publication.".into(), attempt: attempt + i as u64,
+            let mut l = Launch { execution: None, task: 1, title: "Owner-authorized isolated Windows boundary qualification; follow fixture taskq.md, no board or publication.".into(), attempt: attempt + i as u64,
                 role: role.to_string(), rt: "codex".into(), session: crate::runtime::uuid(), url: "https://github.com/taskqorg/taskq".into(), resume: None };
             for turn in 0..2 {
                 fs::write(root.join("stage"), turn.to_string()).unwrap();
@@ -187,7 +190,7 @@ mod tests {
                 let began = std::time::Instant::now();
                 let code = loop {
                     if let Some(code) = child.exited().unwrap() { break code; }
-                    if began.elapsed().as_secs() > 180 { child.kill(); panic!("owned qualification deadline"); }
+                    if began.elapsed().as_secs() > 180 { crate::runtime::stop(child.as_mut()).expect("owned qualification cleanup"); panic!("owned qualification deadline"); }
                     std::thread::sleep(std::time::Duration::from_millis(200));
                 };
                 let log = fs::read_to_string(crate::runtime::log_path(&root, &l)).unwrap();

@@ -41,7 +41,7 @@ fn report_golden_and_unknown_values() {
     let mut f = fault_at("src/main.rs:7"); f.fields = &["src/main.rs:7"];
     let r = coreq::incident::build(&tool(), &f, "11111111-1111-4111-8111-111111111111");
     let os = coreq::update::target();
-    let fp = match os.as_str() { "windows-x86_64"=>"f4de2ee79f530c01", "linux-x86_64"=>"077b5e1ee230f2c8", "macos-aarch64"=>"f713507b0d71cab5", _=>panic!("add golden for {os}") };
+    let fp = match os.as_str() { "windows-x86_64"=>"f4de2ee79f530c01", "linux-x86_64"=>"077b5e1ee230f2c8", "linux-aarch64"=>"da800e0c84ff8044", "macos-aarch64"=>"f713507b0d71cab5", _=>panic!("add golden for {os}") };
     assert_eq!(r, json!({"schema":"taskq-incident/1","fault":"dispatch.panic","fingerprint":fp,"report_id":"11111111-1111-4111-8111-111111111111","release":"1.2.3","revision":"0000000000000000000000000000000000000000","contract":"0123456789ab","board":"github","runtime":"none","os":os,"site":"src/main.rs:7","evidence":["exit:101"],"observed":["exit:101"],"inferred":["dispatch.panic"]}));
     assert!(r.to_string().len()<=4096); assert!(coreq::incident::check(&r).is_ok());
     let mut extra=r.clone(); extra["project"]=json!("private"); assert!(coreq::incident::check(&extra).is_err());

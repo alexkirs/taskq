@@ -1,18 +1,20 @@
 # One service process per host
 
-Status: proposal for owner approval (#1220). The owner chose option B: one OS unit per host runs every registered project in one `taskq service run` process. This page holds the proposed `taskq.md` diff, the migration and rollback plan, the isolation model and the implementation split. Nothing here is shipped behavior; `taskq.md` stays authoritative until the implementation tasks land the diff together with the code (R8, R13).
+Status: design detail for the adopted host model in [taskq.md](../../taskq.md). Runtime recovery follows [execution ownership](../runtime-qualification.md#execution-ownership); remaining migration and native qualification are not implied by this document.
 
 ## Decision
 
 - One unit per host: `com.taskq.service` (launchd), `TaskQ` (Task Scheduler), `taskq.service` (systemd user). It runs `<install>/taskq service run` with `<install>` as working directory.
+- Startup owns the existing CoreQ native lock at `<install>/service.lock` for the whole run. PID publication is a projection; it cannot serialize simultaneous startup. Keep the lock through cleanup and every project thread; restart reconciliation never treats record age as exit.
 - The process serves every root listed in `<install>/projects`, one project thread each.
 - Host-wide parts run once, in process: admission, the GitHub request budget and rate-limit pause, the update check and re-exec, the tray spawner, the profile appender, hourly request records and bounded log pruning.
-- Per-project parts stay per project: `taskq.json`, `<root>/.taskq/` (`status.json`, `events`, `focus`, `focus.paused`, `kids`, `poke`, `update`, `requests/`, `requests.log`, `incidents/`, attempt logs, `cli-errors.log`, `pm-cursor`, specq cache), worktrees, the project log `<install>/<project>.log` and one heartbeat issue per board.
+- Per-project parts stay per project: `taskq.json`, `<root>/.taskq/` (`status.json`, `events`, `focus`, `focus.paused`, legacy `kids`, `poke`, `update`, `requests/`, `requests.log`, `incidents/`, attempt logs, `cli-errors.log`, `pm-cursor`, specq cache), worktrees, the project log `<install>/<project>.log` and one heartbeat issue per board.
+- Native recovery records stay under protected `<install>/native/`, keyed only by canonical registered project roots; [handover contract](../runtime-qualification.md#adapter-recovery-matrix).
 - `service install` and `service uninstall` in a project edit `<install>/projects` and poke the process; they install or remove the host unit only when it is missing or no project remains.
 
-## Proposed taskq.md diff
+## Historical design map
 
-These are proposed replacements, not active rules. Apply by section and quoted text, not line number; retain the 300-line/60 KiB limit (R8). The proposal amends R3 (service ownership), R9 (host configuration ownership) and R10 (explicit registration), with details in sections 3-5 and 8-9. No board fold or golden trace changes are proposed.
+Original old-to-target proposal, retained as design rationale. The adopted taskq.md contract, current linked owner pages and H-A1–H-A5 below govern implementation; these historical quotations are not independent active rules and include superseded telemetry wording. R8 retains the 300-line/60 KiB root bound. No board fold or golden trace change belongs to this transition.
 
 ### § 3 Host admission (line 144)
 
@@ -58,21 +60,21 @@ With:
 
 Replace:
 
-> - One service per root and host name: `service run` waits while a `status.json` under 60 s old names another live pid; a pass that finds this host's heartbeat under `ttl` naming another `service <id>` writes nothing and fails with `another service <id> runs as host <name>`. Restart: rebuild from the board; former children are not adopted (except the § 8 re-exec), their attempts are `gone`. `service restart` writes `<root>/.taskq/restart`: the next pass re-execs (§ 8 step 3).
+> - One service per root and host name: `service run` waits while a `status.json` under 60 s old names another live pid; a pass that finds this host's heartbeat under `ttl` naming another `service <id>` writes nothing and fails with `another service <id> runs as host <name>`. Restart: rebuild from the board and reconcile original native executions; missing handles stay unknown and never imply `gone` or release. `service restart` writes `<root>/.taskq/restart`: the next pass re-execs (§ 8 step 3).
 
 With:
 
-> - One service per host: `service run` waits while `<install>/service` (the service's pid) is under 60 s old and names another live pid; a project thread waits while its `status.json` under 60 s old names another live pid; a pass that finds this host's heartbeat under `ttl` naming another `service <id>` writes nothing and fails with `another service <id> runs as host <name>`. Restart: rebuild from the board; former children are not adopted (except the § 8 re-exec), their attempts are `gone`. `service restart` writes `<install>/restart` (a project's `<root>/.taskq/restart` counts the same): the process re-execs (§ 8 step 3).
+> - One service per host: `service run` waits while `<install>/service` (the service's pid) is under 60 s old and names another live pid; a project thread waits while its `status.json` under 60 s old names another live pid; a pass that finds this host's heartbeat under `ttl` naming another `service <id>` writes nothing and fails with `another service <id> runs as host <name>`. Restart: rebuild from the board and reconcile original native executions; missing handles stay unknown and never imply `gone` or release. `service restart` writes `<install>/restart` (a project's `<root>/.taskq/restart` counts the same): the process re-execs (§ 8 step 3).
 
 ### § 4 Tray (line 168, first sentence)
 
 Replace:
 
-> - Tray (macOS, Windows; [menu](docs/design/menu.md#contract-detail) M1–M14): one per host, started by any installed service when `<install>/tray` (its pid) is older than 30 s.
+> - Tray (macOS, Windows; [menu](menu.md#contract-detail) M1–M14): one per host, started by any installed service when `<install>/tray` (its pid) is older than 30 s.
 
 With:
 
-> - Tray (macOS, Windows; [menu](docs/design/menu.md#contract-detail) M1–M14): one per host, started by the installed service when `<install>/tray` (its pid) is older than 30 s; restart and stop act on the host service and name every project first; pause, resume and uninstall stay per project.
+> - Tray (macOS, Windows; [menu](menu.md#contract-detail) M1–M14): one per host, started by the installed service when `<install>/tray` (its pid) is older than 30 s; restart and stop act on the host service and name every project first; pause, resume and uninstall stay per project.
 
 ### § 4 Profiling (line 177, first sentence)
 
@@ -88,11 +90,11 @@ With:
 
 Replace the `Does` cell:
 
-> § 4, § 8; `permissions`: § 8 Access read, or one grant write with readback; `hold`/`release`/`recover`: § 3, § 4 emergency; `stop`: until the next logon, the unit stays; `list`: this host's projects and their focus; `tray --snapshot DIR [--route R,..]`: § 4; `tray --icon FILE`: [custom icon](docs/design/custom-icon.md#contract-detail)
+> § 4, § 8; `permissions`: § 8 Access read, or one grant write with readback; `hold`/`release`/`recover`: § 3, § 4 emergency; `stop`: until the next logon, the unit stays; `list`: this host's projects and their focus; `tray --snapshot DIR [--route R,..]`: § 4; `tray --icon FILE`: [custom icon](custom-icon.md#contract-detail)
 
 With:
 
-> § 4, § 8; `install`/`uninstall [--host]`: register or drop this project in `<install>/projects` and poke the host service (`--host`: drain, verify exit, then remove only the host unit, § 8 rollback); `permissions`: § 8 Access read, or one grant write with readback; `hold`/`release`/`recover`: § 3, § 4 emergency; `stop`/`restart`: the host service, every project (`stop` until the next logon, the unit stays); `status`: the process, then one block per project; `list`: this host's projects and their focus; `tray --snapshot DIR [--route R,..]`: § 4; `tray --icon FILE`: [custom icon](docs/design/custom-icon.md#contract-detail)
+> § 4, § 8; `install`/`uninstall [--host]`: register or drop this project in `<install>/projects` and poke the host service (`--host`: drain, verify exit, then remove only the host unit, § 8 rollback); `permissions`: § 8 Access read, or one grant write with readback; `hold`/`release`/`recover`: § 3, § 4 emergency; `stop`/`restart`: the host service, every project (`stop` until the next logon, the unit stays); `status`: the process, then one block per project; `list`: this host's projects and their focus; `tray --snapshot DIR [--route R,..]`: § 4; `tray --icon FILE`: [custom icon](custom-icon.md#contract-detail)
 
 ### § 8 Shared core (line 266, unit names)
 
@@ -102,17 +104,17 @@ Replace:
 
 With:
 
-> one host unit `com.taskq.service`, `TaskQ`, `taskq.service` ([host service](docs/design/host-service.md#migration) removes the legacy `com.taskq.<project>`, `TaskQ-<project>`, `taskq-<project>.service`).
+> one host unit `com.taskq.service`, `TaskQ`, `taskq.service` ([host service](host-service.md#migration) removes the legacy `com.taskq.<project>`, `TaskQ-<project>`, `taskq-<project>.service`).
 
 ### § 8 step 3 (line 269)
 
 Replace:
 
-> 3. At step 7 an installed service older than `current` re-execs through the launcher; live CLI children pass over through `<root>/.taskq/kids`; an active Claude, codex-app or operator turn defers it. Detail: [runtime qualification](docs/runtime-qualification.md#contract-detail).
+> 3. At step 7 an installed service older than `current` re-execs through the launcher; live CLI children pass over through the protected native handover record; an active Claude, codex-app or operator turn defers it. Detail: [runtime qualification](../runtime-qualification.md#contract-detail).
 
 With:
 
-> 3. At step 7 an installed service older than `current` re-execs through the launcher, once for all projects; on Unix, live CLI children pass over through each `<root>/.taskq/kids` with the same pid; an active Claude, codex-app or operator turn of any project defers it. On Windows, all projects must have no live child or active turn before exit 75; the unit restarts with a new pid, with no child adoption. Detail: [runtime qualification](docs/runtime-qualification.md#contract-detail).
+> 3. At step 7 an installed service older than `current` re-execs through the launcher, once for all projects; on Unix, live CLI children pass over through each project's protected native handover record with the same pid; an active Claude, codex-app or operator turn of any project defers it. On Windows, all projects must have no live child or active turn before exit 75; the unit restarts with a new pid, with no child adoption. Detail: [runtime qualification](../runtime-qualification.md#contract-detail).
 
 ### § 8 step 5 (line 271)
 
@@ -144,9 +146,9 @@ Replace `Load gate (opt-in, § 9)` with `Load gate (host policy, § 9)`; retain 
 
 ### § 5 capacity command replacement
 
-> `taskq service capacity [--max N|none] [--claude N] [--codex N] [--codex-app N] [--load-gate on|off] [--cpu-max P] [--memory-min P] [--project P]`
+> Use the canonical `taskq service capacity` syntax in taskq.md section5; `--host` is explicit and local for writes. No --mode or remote-host edit. Optional project limits remain narrowing project configuration; this target adds no unimplemented --project command.
 
-> Without a project root, read or edit this host's host.json; `--project P` selects exactly one registered project's optional runtime limits only. Reject admission/load-gate edits with --project; reject a cap that raises the host ceiling. Show host limits/use and project cap separately, write atomically on explicit owner instruction (R9), poke and report applied only after daemon readback. Remove --mode and remote --host edits; host identity is local. Preserve existing resource-grant checks and revision/receipt guards; no new authority for workers.
+> Read or edit this host's host.json through the same policy operation regardless of invocation directory. Show host limits/use and narrowing project caps separately, write atomically on explicit owner instruction (R9), poke and report applied only after daemon readback. Preserve resource-grant checks and revision/receipt guards; no new authority for workers. Legacy per-project edits remain a qualified compatibility path only until retirement.
 
 ### § 9 host and project configuration replacement
 
@@ -165,13 +167,13 @@ The six existing project `capacity_hosts` copies are input, not six independent 
 
 Compare the resolved policies before writing anything. Identical values collapse to one host.json. Differences, missing/unreadable inputs, Fixed-to-Auto changes, and policies that cannot be represented as host limits plus lowering project caps are owner choices: show values and affected projects, recommend a conservative policy, and stop migration until answered. Never infer that a zero in one copy is a host-wide owner decision. This design does not assert those six live copies were inspected in this task.
 
-After approval, save byte-for-byte originals and the chosen mapping in a bounded migration backup under install; preserve unknown keys and original file ownership. Stage host.json and project edits, validate all, then atomically replace each file with restart-safe progress/readback. Keep every affected service admission-held until the whole set reads back; interruption resumes or restores originals, never enables partial policy. Remove only migrated keys, including capacity_hosts, admission/mode, load_gate, hosts, has, codex and permission_mode; keep optional lowering limits and unrelated keys. Preserve per-host backups: project files may contain remote-host copies needed by another host's migration. Re-run is idempotent. Do not commit local paths or secrets. Rollback restores these originals before legacy services start.
+After approval, save byte-for-byte originals and the chosen mapping in a bounded migration backup under install; preserve unknown keys and original file ownership. Stage host.json and project edits, validate all, then atomically replace each file with restart-safe progress/readback. Keep every affected service admission-held until the whole set reads back; interruption resumes or restores originals, never enables partial policy. Remove only migrated keys, including capacity_hosts, admission/mode, load_gate, hosts, has, codex and permission_mode; keep optional lowering limits and unrelated keys. Preserve per-host backups: project files may contain remote-host copies needed by another host's migration. Re-run is idempotent. Do not commit local paths or secrets. Rollback restores these originals only within a qualified compatible protocol version; legacy services that expire attempts cannot restart against unresolved executions.
 
 ## Migration
 
 Owner approval of this drain handoff is required before implementation (R13); it replaces the no-drain promise only for the topology migration and its reverse. The first host-service release is N. Legacy services run N-1 or older. After approval of the design and resolved configuration mapping, migration needs no additional owner step on an automatically updating host; it runs once per host, idempotent, in any order across hosts.
 
-1. **Update.** A legacy service applies N through the existing update (§ 8 step 2) and re-execs at step 7 (§ 8 step 3). On Unix, eligible live CLI children pass over through `<root>/.taskq/kids` with the same pid; active Claude, codex-app and operator turns defer it. Windows waits for every child and active turn to finish, exits 75, and the legacy unit starts N with a new pid; Windows does not adopt children.
+1. **Update.** A legacy service applies N through the existing update (§ 8 step 2) and re-execs at step 7 (§ 8 step 3). On Unix, eligible live CLI children pass over through the protected native handover record with the same pid; active Claude, codex-app and operator turns defer it. Windows waits for every child and active turn to finish, exits 75, and the legacy unit starts N with a new pid; Windows does not adopt children.
 2. **Legacy mode.** N started by a per-project unit (working directory is a project root, unit name `com.taskq.<project>`, `TaskQ-<project>` or `taskq-<project>.service`) runs that project in legacy mode:
    - It adds the root to `<install>/projects` if missing, then writes and loads the host unit if missing.
    - It admits nothing new: capacity reason `handoff`. It keeps reaping, resuming answers of its own live attempts, beating and writing `status.json`, so no lease expires.
@@ -196,9 +198,9 @@ Why drain instead of cross-process adoption: removing a legacy unit kills its pr
 - **Project panic.** Each project runs in its own thread. A pass runs inside `catch_unwind`. On a panic:
   - The project's `status.json` reads `state` `error`, `reason` `panic:<class>; restarting in <s> s` (class as in the incident catalog `stdio|unwrap|index|other`); the project log keeps the panic text; an incident report follows § 4.
   - Child handles live in a table owned by the project thread, outside the panicking state; the rebuilt state re-attaches them, so live children keep running and their leases stay listed in the heartbeat.
-  - Backoff 1 s, 10 s, 60 s. Three panics in 10 minutes quarantine the project: a reduced loop only reaps, beats and writes `status.json`, reason `quarantined: panic:<class>`; no claim, reviewer or resume. `service restart` or an update clears it. If the reduced loop also panics, the thread stops; its attempts expire through § 3 on other hosts.
+  - Backoff 1 s, 10 s, 60 s. Three panics in 10 minutes quarantine the project: a reduced loop only reaps, beats and writes `status.json`, reason `quarantined: panic:<class>`; no claim, reviewer or resume. `service restart` or an update clears it. If the reduced loop also panics, the thread stops; other hosts report its executions unknown and wait for attributable termination evidence (§ 3).
   - Other projects never pause: they share no lock with the panicking pass except host state (budget, admission, profile writer). Poisoned admission state holds launches until rebuilt from verified child handles; never grant from potentially inconsistent counters. Budget/profile errors report unknown without blocking other project loops.
-- **Process fault.** An abort, stack overflow, OOM kill or a panic outside a project thread stops every project. The launcher restarts the unit; former children are not adopted and their attempts go `gone` (§ 4 restart). This blast radius is the cost of option B; today it is one project.
+- **Process fault.** An abort, stack overflow, OOM kill or a panic outside a project thread stops every project. The launcher restarts the unit and reconciles original native identities (§ 4 restart); unresolved executions retain their fence and occupied capacity. Neither restart nor a missing handle implies `gone` or release. This blast radius is the cost of option B; today it is one project.
 - **Config.** An unreadable `taskq.json` holds that project only (reason in its `status.json`); a malformed `<install>/projects` keeps the last good list and reads unknown in `service status`.
 
 ## Defects this removes
@@ -223,16 +225,98 @@ Each task is one reviewable diff. Lines `Depends on` go into the task body as wr
    `Depends on #<task 2>`
 4. **Legacy mode and migration.** Apply the § 8 shared core and step 3 diff blocks. Legacy-mode detection, `handoff` reason, own unit removal with readback, host-wide admission hold until all legacy entries have verified exit, rollback floor. Chain check: legacy root with a live child admits nothing, keeps the child, then removes its unit and the host thread takes over.
    `Depends on #<task 3>`
-5. **Release and host qualification.** Release N; on mac, Windows and FRA record per host: legacy units gone, every root served by the host pid, no `gone` from migration, rollback drills to N-1 on macOS, Windows and Linux using isolated units and children; verify drain, exit, unit removal order, restored config and update hold before any live rollout.
+5. **Release and host qualification.** Release N; on mac, Windows and FRA record per host: legacy units gone, every root served by the host pid, no `gone` from migration, rollback drills within the qualified execution-protocol floor, plus refusal below that floor, on macOS, Windows and Linux using isolated units and children; verify drain, exit, unit removal order, restored config and update hold before any live rollout.
    `Depends on #<task 4>`
 
 ## Open
 
-- Owner approval of this diff and of the drain-based handoff (no admission during handoff).
+- Host topology and drain-based handoff are accepted design decisions; implementation and installed qualification remain subject to H-A1–H-A5.
 - The macOS `launchctl bootout` child-survival probe decides whether macOS may adopt instead of drain later; not needed for N.
 
 ## Contract detail
 
-Host runtime detail for taskq.md sections 3, 4 and 9. Install, capacity CLI, multi-project status and legacy-unit handoff remain separate implementation targets.
+Host runtime detail for taskq.md sections 3, 4 and 9. Implementation and installed acceptance are tracked separately by H-A1–H-A5.
 
 - Data ([specq data](https://github.com/taskqorg/specq/blob/main/engineering/data.md#files)): telemetry uses [SQLite/WAL bounds and migration](standalone-telemetry.md#sqlite-implementation-and-transition), pruned each host/project pass under the profile lock. Text-log bounds live in `src/data.rs`; legacy `taskq.log` is checked each host pass (each project pass on legacy services), under `taskq-profile.lock`, and keeps its newest half past the collection threshold of 4 MiB − 512 bytes. A busy lock or failed read/write leaves collection unknown and retries next pass. Other files are pruned hourly: `<project>.log` past 4 MiB and `.taskq/cli-errors.log` past 256 KiB keep their newest half; attempt logs the newest 50 plus live attempts; `.taskq/inputs/*.txt` the newest 50 plus files locked by live Claude turns; `incidents/` the newest 50; `requests/comments` past 1000 lines the newest half plus comments still eligible; `events`, `requests/` and `requests.log` follow [taskq.md section 4](../../taskq.md#4-service). A corrupt local state file reads unknown, admits or adopts nothing and deletes no release ([menu](menu.md#contract-detail)).
+
+## Native stop and restart conditions
+
+Stop drains owned work under R11, stops the host daemon, verifies its exact native exit and retains the autostart unit. It does not add a login observer or timer. The result states the native restart condition: macOS/Windows retain their logon trigger; Linux retains the enabled user unit, which starts with its user manager or an explicit service install. With linger, another SSH login does not restart that manager. Explicit service install can start the stopped host on every platform. Restart/stop/uninstall share command identity and observed native outcomes; none infer worker termination from the daemon's exit.
+
+## Command-surface acceptance
+
+Contract detail for R3/R8/R9 and sections3/4/5/8/9. These cases complete the accepted host transition; they are not evidence that it is implemented. Reuse the existing model/adapter tests and native qualification matrix.
+
+| Case | Required observation |
+|---|---|
+| H-A1 Service entrypoints | Invocation from the install or an explicitly registered project selects the same host owner; no cwd-dependent second scheduler. Unregistered roots cannot register themselves through run. |
+| H-A2 Policy surfaces | CLI, tray, operator and authorized remote resource edits use one canonical host-policy operation; actor/scope/grant/revision validation remains at each trust boundary. Equivalent accepted changes produce the same saved policy and effective service readback. Unsupported target/schema is refused before effects. |
+| H-A3 Failure and restriction | Missing/corrupt/newer host policy holds new admission without fallback to project settings. Owned work remains supervised; restrictive commands retain their explicit receipt-failure policy. |
+| H-A4 Shared occupancy | Two projects, pending claims, running children, reviewer/resume and unknown native execution cannot double-spend capacity; one pending-to-running transition adds no slot. |
+| H-A5 Lifecycle and retirement | Install/restart/stop/uninstall/update preserve the declared scope and owned work; legacy unit/child absence is verified before retirement. Keep original configuration and qualified rollback; an incompatible old authority cannot restart against unresolved work. |
+
+The existing <install>/service projection carries schema1, pid, native started identity, a random per-run instance, observation time and version (at most1024 bytes). Host startup retains the native lock before publication. Project status carries host_instance from that same in-process owner, including failed/reduced publications. Native identity determines whether that recorded daemon still exists; timestamp freshness is separate and cannot release ownership or workers. PID-only legacy records retain a conservative startup barrier but do not qualify the current host. Malformed/newer records stay unknown and are preserved. service status/list work from any directory; --json emits taskq.service/1 with service, projects and registry_error. Each project has host_binding current/other/unknown; absent or malformed generation stays unknown. Both renderers return host plus explicitly registered project observations; missing or stale cached counts remain unknown. This is observation, not install/stop/drain qualification.
+
+Registry mutations share one editor holding projects.lock from preflight through commit. Busy edits refuse before native effects; existing unrelated path spelling and file ownership stay intact. Only initial registration may create a missing list. A retained projects.pending holds membership unknown and preserves the last supervised roots. Resource scopes are retired durably before removal commits, under the existing resource lock; if the registry write then fails, report the partial restrictive effect. Re-registration never resurrects the retired IDs. This data transaction does not qualify native drain/unit removal.
+
+Installation uses the same bounded migration originals and command store. Before the first host activation, `<install>/host-policy-migration/install.json` binds the original launcher/current/previous, their usable releases, native definition, registry and first cohort's focus state; numbered byte copies live in `install-originals/`. The baseline is immutable and retained for qualified rollback, separate from the existing policy-migration plan. It is not execution/task authority. An interrupted unpublished snapshot can rebuild only its own fixed copy slots; unknown contents are preserved and refused.
+
+A later cold installation captures the immediate pre-activation launcher/current/previous, saved native definition and GNU loader in one fixed `activation-originals/` copy set. Its metadata is carried by the existing installation cursor and bound to the original command receipt. With no committed cursor, recapture the present files under the same locks; never reuse an older caller's snapshot as current state. Active-host attachment does not activate or capture this set. Before any automatic restore, verify every copy and every active target against its original or the exact candidate activation result; changed inputs or ownership/permissions retain the cursor and refuse the whole restore. A native definition changed after the snapshot remains uncertain; a pre-submission error alone does not authorize overwriting it. The original migration baseline remains unchanged.
+
+After restore preflight succeeds, retain the original failed command receipt before the first restoration write. A caller lost between files resumes that same failed command's restoration; it cannot reactivate the candidate or submit native startup. The cursor remains until restored readback completes; the failed command receipt alone does not prove that restoration finished.
+
+`projects.installing` carries one schema1 installation cursor; `projects.pending` remains reserved for atomic registry publication. The cursor first commits an initial intent, then the original received receipt, before preparing active effects: original command identity, baseline/candidate digests, exact root, original/next registry and native phase. Lock order is update, projects, then resources. Both CLI/service update and the current-version fast path defer while the cursor remains. A replay validates the same binding and originals; it never issues another native start after a possibly accepted submission. A definite pre-submission failure may restore originals only with native absence and the owner lock; missing native state after submission alone cannot justify restoration. A verified saved/idle definition starts without rewriting it. Once a native host owns the transition, project/receipt uncertainty cannot roll topology back.
+
+An existing live host advertises install_protocol1 before it can accept a new root. Attach changes only registry and that root's normal missing-focus default; it does not prepare/activate a candidate, rewrite/reload native configuration or change the floor. Compatible cursor readers use the protocol schema rather than equality with the installer's version. A host without that protocol refuses attachment before effects and needs the coordinated update/migration route.
+
+After native ownership, a registered cursor exposes membership only when the registry matches its committed next value; admission stays held while project recovery/status proceeds. Project `host_install` binds acknowledgement to that installation ID and exact host generation, so an old status for the same PID/root cannot complete a new registration. CoreQ received/applied/observed receipts retain their original identity in the existing resources local_install binding; `service status --request ID` reads it after caller/cursor loss. These local bindings are pinned while unresolved and never enter remote resource exchange; terminal receipts keep the existing24-hour retention. Wait/failure reasons remain readable, and later verified progress clears the old reason. Implementation and real-OS/installed acceptance remain separate H-A5 gates.
+
+Without a request ID, equal latest observation times report ambiguity and require `--request ID`; map order cannot select another command's result. A corrupt retained installation receipt keeps its installation identity and reports the missing proof as unknown.
+
+The existing single background maintenance owner reconciles a retained installation instead of checking for another update. It carries the original command context and ID; an absent or different cursor cannot create a new command. Exact candidate version and installation protocol are checked before publishing membership under another host generation. The caller releases the update lock after the applied registry commit; final acknowledgement takes update/projects locks without waiting. Competing observers read the same retained observed result after cursor removal. This recovery does not start a second permanent helper or block the host heartbeat loop.
+
+The first topology originals include the exact pre-host rollback-floor bytes/metadata or its recorded absence. The launcher floor applies to legacy service starts too; keeping N active while selecting N-1 prevents the reverse procedure from starting its units. Owner-only reverse therefore needs the original topology selection, including its qualified prior floor, after verified host removal; a missing original floor record is unknown, never permission to delete a floor. Pre-native activation recovery does not change the floor. Preserve an independently readable copy of host policy and originals outside older-version cleanup before invoking that older installer or releasing its update hold.
+
+Native legacy entry routing reads the daemon's actual manager binding, action, working directory, creation identity and saved-definition revision. The original native label remains authoritative after a directory rename. Windows also binds the launcher creation identity and Scheduler instance. A failed scope read holds startup instead of falling back to host mode. A verified legacy owner uses its original project policy, enables handoff before adoption/board processing, retains handles across partial adoption or loop failure, and admits no fresh worker/reviewer. It does not consume update/restart signals or start operators/trays while draining; existing operator state remains a wait. Its status identifies the native scope, handoff error and ownership waits. Native retirement, full transaction handoff and installed acceptance remain required; identifying a legacy owner does not authorize removing its unit.
+
+Drain/re-exec preparation uses the service's reconciled ownership, not child count alone. A failed or absent ownership read, unresolved board execution without a retained native handle, held claim, pending release or uncertain reservation prevents completion. A project with invalid configuration cannot certify idle. Reduced monitoring retains the last complete ownership read and all unresolved entries; after a failed new read it cannot certify idle. Unix re-exec may retain its qualified CLI handles under section8; removing a project or stopping its daemon requires no retained execution or active operator. Restart never drops unknown slots merely because their project thread ended.
+
+| Ownership trace | Drain | Re-exec |
+|---|---|---|
+| No successful pass, including configuration failure | Wait: ownership unknown | Wait |
+| Unresolved local execution, no child handle | Retain project and slot | Wait |
+| Terminal evidence not durably released | Retain project and slot | Wait |
+| Successful reconciliation, no owned work or operator | Ready | Ready |
+| Retained qualified CLI child | Wait | Unix handover only; Windows waits |
+
+Preparation is revoked under the host mutex before a project starts another pass. Once every project and retained slot has a prepared owner, preparation latches: no project starts further work before the image switch. Failed threads lose preparation, retaining unknown occupancy. This closes the check-to-re-exec gap without a new persistent record.
+
+Known unresolved executions stay in the existing ownership projection when a task closes or loses its task label. Read their trusted board history directly when absent from the open-task views; only the matching terminal release retires childless ownership. Failed or missing history remains unknown. This read does not submit, cancel or recreate work; native handles still require their own terminal observation.
+
+Tracked host Restart uses the existing resources/state.json operation bindings and CoreQ command receipts. Its immutable local request names the reviewed canonical registry and original service instance; only a fresh native-bound owner advertising restart_protocol1 accepts it. CLI works outside project directories; the tray reviews every affected project. A worker cannot submit this host operation. Submission expires after at most300s; an accepted pending operation stays pinned within the existing4096-binding bound, and terminal receipts retain the existing24-hour window. Remote exchange/cancellation cannot access local bindings. Registry edits wait while Restart is pending. A request is received before persistence, applied before the qualified image switch, and observed only after another service instance publishes successful recovery for every reviewed project. A crash or lost response reconciles the same request instead of requesting another switch. Failed receipt storage, changed scope, corruption or unsupported data stays unknown. These are source/installed qualification targets; legacy flags stay identified compatibility inputs until retirement.
+
+Stop shares that lifecycle reader/writer. Existing local_restart records remain valid; local_stop binds the same immutable scope/instance with action=stop. A fresh stop_protocol1 owner and a readable retained host unit are required before submission. Preparation requires no owned execution, slot, operator or update; eligible Unix CLI handover alone is insufficient. The original applied receipt binds native pid/creation identity and the retained unit's SHA-256 before dispatch. A short controller runs outside the stopped unit: macOS process_group0, a Linux transient user unit, or a Windows interactive task with a120s lifetime and no trigger. No per-execution launcher, permanent service or new store is introduced. CLI status/list adds lifecycle for either command; its restart field remains a compatibility projection for Restart only. Tray uses one lifecycle controller, with a separate immutable review for each action.
+
+The controller validates unchanged scope/definition and native unit ownership, performs native Stop, verifies exact daemon exit and exclusion of a new host owner, then commits the original observed receipt. Before the Windows native effect, the existing Stop receipt also binds the scheduler instance GUID and launcher pid/creation identity. Replays retain that scope after a lost response; an unattributable live daemon remains unknown. Windows stops the matching scheduler launcher before kernel-identity-bound termination of its idle daemon; PID/image-name tree killing is not used. Its temporary controller task explicitly permits the current user and SYSTEM to manage that task, so a limited controller can retire its own definition even when an elevated caller registered it; host/worker grants are unchanged. The host unit stays installed. The result remains queryable through service status --request after UI/service exit. Same-ID replay returns retained evidence; required storage/native failure remains applied/unknown with a bounded reason. A new host generation cannot falsely acknowledge the old Stop. Native controller/task-scope and installed-candidate acceptance remain distinct qualification gates.
+
+Uninstall uses that same retained lifecycle protocol, advertised by uninstall_protocol1. A project request names its exact canonical root and reviewed registry; the root remains registered while its thread drains, so a host restart cannot forget its work. Other projects keep running. Only a qualified drained thread may apply registry removal and resource-scope retirement; observed means readback of that removal. Removing the last project additionally stops the exact idle host, removes only its native unit and verifies absence before the original receipt completes. uninstall --host drains every project and removes the native unit while preserving the project registry and configuration for rollback. Both forms retain original receipt identity, reject workers, survive caller/UI loss and reconcile the same ID; native/storage uncertainty never becomes success. Existing Restart/Stop bindings stay compatible.
+
+Explicit Windows host installation gives the current-user SID and SYSTEM management rights to only the owned TaskQ host task, using CoreQ's host installer. Its daemon/controller remain LeastPrivilege; worker/project grants stay unchanged. Existing task ACLs are not repaired by runtime or Uninstall. A default-ACL task created by an elevated installer may permit Stop but deny removal; report that native refusal and require explicit installation repair. Qualify the installer/consumer revision before installed acceptance.
+
+Cold host startup reuses the existing slot-rebuild barrier: no project admits until every registered project has accounted for its prior occupancy. Missing configuration or board ownership keeps the barrier unknown, not empty; published host use is null during that recovery. Restart observation additionally requires every unresolved execution to have recovered its retained native ownership, separately from successful task snapshot publication.
+
+The host owns one bounded update thread. A running check defers image replacement while project heartbeat/native monitoring continues; it does not block host publication. Host/UI control observers use the same resource lock nonblockingly and report its busy state. Required receipt failures persist a bounded reason in the existing operation receipt; a later successful observation clears it. A busy lock or failed update never proves that owned work stopped.
+
+Local capacity writes reuse CoreQ command receipts. The writer commits received before the effect, then replaces policy and its `_taskq_capacity_command` descriptor together in host.json: schema1, host, normalized capacity snapshot and encoded receipt. Missing receipt storage refuses before mutation; later failure reports saved/unknown without repeating the effect. The host acknowledges applied/observed only for the exact loaded descriptor whose host and capacity still match the current file, under the existing resource lock. It can recover a writer death after replacement using that same descriptor. Equal values or a fresh status timestamp cannot acknowledge a different command. A manual capacity edit invalidates the previous command observation; malformed/newer descriptor data is preserved and holds policy unknown. No second command file, journal or database is introduced. Existing telemetry retention bounds the receipt history; absent history remains unknown.
+
+Native tray requests carry id, issued_at, expires_at and typed host-capacity ops, each with the reviewed revision. The ID binds the full request in existing resources/state.json, sharing its4096-binding and24-hour-after-expiry limits. Lifetime is at most300s and the local clock permits at most30s ahead; check again immediately before replacement. A durable writing marker precedes the effect. The host.json descriptor adds the request ID for read-only recovery after a lost result; replay returns retained evidence, never repeats an uncertain write. Without an attributable binding the outcome stays unknown. Validate registration, local installation/generation, host/runtime target, schema and field types; legacy project payloads cannot edit host policy. Local receipts never enter the DashQ exchange and remote messages cannot cancel/reuse their IDs. Tray edits use a bounded worker independent of the restrictive focus queue.
+
+Update cleanup preserves the host policy and its pending replacement, registry locks/prepares, native recovery directory, migration originals, host control signals and rollback floor. An unreadable registry or a registered root without a readable version makes release ownership unknown; preserve releases until readback resolves it. Cleanup never supplies missing termination or retirement evidence.
+
+The transition owner is the host service. Project loops and status are consumers/projections, not fallback authorities. Legacy project units, capacity_hosts/mode and admission.json expiry may remain only for identified migration/compatibility readers; after cutover no supported writer/admission path may use them. Retire them only after H-A1–H-A5 and the existing installed acceptance pass. Exact receipts and native release evidence remain required.
+
+## Shared core mapping
+
+Contract detail for taskq.md section8.
+
+**Shared core.** Release, update, launcher and rollback, service units, the `status.json` common keys and the GitLab board token follow [coreq.md](https://github.com/taskqorg/coreq/blob/8a99727d3dde12efa0e506052c804528f9122749/coreq.md) (crate `coreq`, immutable revision in Cargo.toml/Cargo.lock; JS packaging uses the same revision) as `Tool::new("taskq", "TaskQ", "taskqorg/taskq", VERSION)`: install `~/.local/share/taskq` (Windows `%LOCALAPPDATA%\taskq`), files `taskq-<ver>-<os>-<arch>`, host units `com.taskq.service`, `TaskQ`, `taskq.service`; per-project units are legacy migration inputs only.

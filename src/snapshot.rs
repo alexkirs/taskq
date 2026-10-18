@@ -15,6 +15,42 @@ pub const STATES: [&str; 8] = ["held", "ready", "waiting", "doing", "review", "a
 const BOARD_CAPS: [&str; 4] = ["tasks", "totals", "questions", "hosts"];
 const HOST_CAPS: [&str; 6] = ["tasks", "totals", "focus", "capacity", "agents", "events"];
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ExecutionStatus {
+    pub task: u64,
+    pub attempt: u64,
+    pub id: u64,
+    pub through: u64,
+    pub state: String,
+    pub reason: String,
+}
+
+/// Board identity and terminal evidence fence every advisory heartbeat observation.
+fn execution_status(task:u64, x:&crate::core::Execution, hosts:&[board::Issue], now:i64, ttl:i64)->Value {
+    let mut status=ExecutionStatus {task,attempt:x.attempt,id:x.id,through:x.through,state:"unknown".into(),reason:"termination unconfirmed; status missing or stale; restore owning service".into()};
+    let owners:Vec<_>=hosts.iter().filter(|h|h.trusted && h.title==format!("taskq host {}",x.host)).collect();
+    let mut observed=None;
+    if let [host]=owners[..] {
+        if (0..=ttl.min(60)).contains(&(now-host.updated)) {
+            let rows=host.body.lines().filter_map(|l|l.strip_prefix("execution ")).map(|text| {
+                if text.len()>4096 {return Err("oversized execution status".to_string());}
+                serde_json::from_str::<ExecutionStatus>(text).map_err(|e|e.to_string())
+            }).collect::<Result<Vec<_>,_>>();
+            if let Ok(rows)=rows {
+                let matching:Vec<_>=rows.iter().filter(|r|r.task==task && r.attempt==x.attempt && r.id==x.id && r.through==x.through).collect();
+                if let [row]=matching[..] {
+                    if matches!(row.state.as_str(),"running"|"waiting"|"unknown") && !row.reason.is_empty()
+                        && row.reason.chars().count()<=240 && !row.reason.chars().any(char::is_control) {
+                        status=row.clone();observed=Some(host.updated);
+                    }
+                }
+            }
+        }
+    }
+    let mut value=serde_json::to_value(status).unwrap();
+    value["host"]=json!(x.host);value["observed"]=json!(observed);value
+}
+
 pub struct Row {
     pub n: u64,
     pub title: String,
@@ -23,6 +59,9 @@ pub struct Row {
     pub task: Task,
     /// § 2 revision: the expected `--revision` of the next command.
     pub revision: u64,
+    /// An unresolved external execution blocks the next submission even after a task state change.
+    pub execution_wait: Option<String>,
+    pub executions: Vec<Value>,
     /// `Depends on` issues that keep it waiting (§ 1).
     pub deps: Vec<service::Blocker>,
     /// Text of the last trusted `failed` entry.
@@ -53,22 +92,32 @@ pub struct Snapshot {
 
 /// The one snapshot function: open tasks by priority then number, plus host heartbeats.
 pub fn from_views(source: &'static str, b: &dyn Board, cfg: &Config, observed: i64, views: &[View], hosts: &[board::Issue]) -> Snapshot {
-    let mut open: Vec<&View> = views.iter().filter(|v| v.task.state != State::Closed).collect();
+    let mut open: Vec<&View> = views.iter().filter(|v| v.projection.task.state != State::Closed).collect();
     open.sort_by_key(|v| (service::priority(&v.issue), v.issue.number));
     let urls = session_urls(hosts);
-    let tasks = open.into_iter().map(|v| Row {
+    let tasks = open.into_iter().map(|v| {
+        let executions:Vec<_>=v.projection.executions.iter().filter(|x|x.release.is_none())
+            .map(|x|execution_status(v.issue.number,x,hosts,observed,cfg.ttl)).collect();
+        Row {
         n: v.issue.number,
         title: v.issue.title.clone(),
         labels: v.issue.labels.clone(),
         url: b.url(v.issue.number),
-        task: v.task.clone(),
-        revision: crate::core::revision(v.issue.number, &v.log),
+        task: v.projection.task.clone(),
+        revision: v.projection.revision,
+        execution_wait: executions.iter().find(|x|x["state"]!="running" || x["attempt"].as_u64()!=v.projection.task.attempt)
+            .map(|x|format!("execution {} on {}: {}: {}",x["id"],x["host"].as_str().unwrap_or("?"),
+                x["state"].as_str().unwrap_or("unknown"),x["reason"].as_str().unwrap_or("observation unavailable")))
+            .or_else(|| v.projection.executions.iter().find(|x| Some(x.attempt) == v.projection.task.attempt && !v.projection.task.inbox.is_empty()
+                && x.release == Some(crate::core::Release::Exit) && !x.accepted)
+                .map(|x| format!("execution {} on {}: input acceptance unknown; reconcile native input", x.id, x.host))),
+        executions,
         deps: v.blockers.clone(),
-        session_url: v.task.attempt.zip(v.task.session.as_deref().and_then(|s| s.rsplit(' ').next()))
-            .filter(|_| v.task.session.as_deref().is_some_and(|s| s.starts_with("claude:")))
+        session_url: v.projection.task.attempt.zip(v.projection.task.session.as_deref().and_then(|s| s.rsplit(' ').next()))
+            .filter(|_| v.projection.task.session.as_deref().is_some_and(|s| s.starts_with("claude:")))
             .and_then(|(a, h)| urls.get(&(h.to_string(), a)).cloned()),
-        failed: (v.task.state == State::Failed).then(|| v.comments.iter().rev().find(|c| c.trusted && c.body.starts_with("taskq: failed")).and_then(|c| c.body.split_once('\n')).map(|x| x.1.to_string()).unwrap_or_default()),
-    }).collect();
+        failed: (v.projection.task.state == State::Failed).then(|| v.comments.iter().rev().find(|c| c.trusted && c.body.starts_with("taskq: failed")).and_then(|c| c.body.split_once('\n')).map(|x| x.1.to_string()).unwrap_or_default()),
+    }}).collect();
     let hosts = hosts.iter().map(|h| Host {
         name: h.title.trim_start_matches("taskq host ").to_string(),
         version: h.body.lines().find_map(|l| l.strip_prefix("version ")).unwrap_or("?").to_string(),
@@ -149,6 +198,8 @@ impl Row {
             "deps": self.deps.iter().filter(|b| b.dep.repo.is_none() && b.reason == "open").map(|b| b.dep.n).collect::<Vec<_>>(),
             "blocked": self.deps.iter().map(|b| json!({"ref": b.dep.name(), "url": b.url, "reason": b.reason})).collect::<Vec<_>>(),
             "card": self.task.card, "question": self.task.card.as_deref().map(question), "failed": self.failed});
+        if !self.executions.is_empty() { row["executions"]=json!(self.executions); }
+        if let Some(reason) = &self.execution_wait { row["execution_wait"] = json!(reason); }
         if let Some(u) = &self.session_url { row["session_url"] = json!(u); }
         row
     }
@@ -208,7 +259,9 @@ impl Snapshot {
         let rows: Vec<String> = self.tasks.iter()
             .filter(|r| !matches!(r.task.state, State::Ask | State::Later | State::Failed))
             .map(|r| {
-                let state = if r.task.state == State::Waiting {
+                let state = if let Some(reason) = &r.execution_wait {
+                    format!("{} · {}", r.task.state.name(), cell(&compact(reason, 160)))
+                } else if r.task.state == State::Waiting {
                     let deps: Vec<String> = r.deps.iter().map(|b| format!("[{}]({}) {}", b.dep.name(), b.url, cell(&compact(&b.reason, 80)))).collect();
                     format!("blocked ({})", deps.join(", "))
                 } else {
@@ -284,7 +337,7 @@ fn session_link(cfg: &Config, raw: &Value, r: &Row) -> (String, String) {
     if (id == "-" || rt == "claude") && host == cfg.me
         && let Some(a) = t.attempt
     {
-        let l = runtime::Launch { task: n, title: String::new(), attempt: a, role: t.role.clone().unwrap_or_default(), rt: rt.into(), session: id.clone(), url: String::new(), resume: None };
+        let l = runtime::Launch { execution: None, task: n, title: String::new(), attempt: a, role: t.role.clone().unwrap_or_default(), rt: rt.into(), session: id.clone(), url: String::new(), resume: None };
         id = runtime::codex_thread(&runtime::log_path(&cfg.root, &l)).unwrap_or(id);
     }
     let host = cell(host);

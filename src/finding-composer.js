@@ -1,15 +1,13 @@
-// TaskQ-owned finding composer; MIT. Serve pinned assets locally; adapters own authorization and board operations.
-(function(root){
-  'use strict';
-  const blocks = typeof module === 'object' && module.exports ? require('./project-blocks.js') : root.TaskqProjectBlocks;
-  const esc = s => String(s ?? '').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-  const copy = value => JSON.parse(JSON.stringify(value));
-  const lines = s => s.split('\n').filter(l=>l.trim());
-  function fresh(input){
+'use strict';
+const ui=require('./ui-runtime.js');
+const execution=ui.execution;
+
+const {fresh,problem,request,receipt,receiptText,mount}=execution.module("finding-composer",{
+fresh:function(input){
     return {project:input.mapping?.provenance ? input.mapping.project : '',title:input.title || '',goal:input.goal || '',acceptance:input.acceptance || '',
       evidence:input.sanitizedEvidence || '',start:false,reviewed:false,revision:input.revision,request:null,receipt:null,pending:false,cancelled:false};
-  }
-  function problem(input,draft,project,cap){
+  },
+problem:function(input,draft,project,cap){
     if(!project)return 'Choose the responsible project';
     if(input.revision!==draft.revision)return 'Source changed. Review the current source before sending';
     if(!cap?.create)return cap?.reason || 'Task creation is unavailable';
@@ -25,36 +23,30 @@
     }
     if(!draft.reviewed)return 'Review the destination, scope and sanitized evidence';
     return null;
-  }
-  function request(input,draft,project){
+  },
+request:function(input,draft,project){
     return {board:project.board.url,source:input.source,title:draft.title,goal:draft.goal,
       acceptance:lines(draft.acceptance),evidence:lines(draft.evidence),start:draft.start};
-  }
-  function receipt(value){
-    const normalize=r=>{
+  },
+receipt:function(value){
+    const {normalize}=execution.module("finding-composer.receipt",{normalize:r=>{
       if(!r || !['accepted','rejected','stale','unknown'].includes(r.outcome))return {outcome:'unknown',reason:'No authoritative receipt'};
       if(r.outcome==='accepted' && (!Number.isSafeInteger(r.task)||r.task<1))return {outcome:'unknown',reason:'Receipt has no issue identity'};
       return copy(r);
-    };
+    }});
     const result={create:normalize(value?.create),start:value?.start?normalize(value.start):null};
     if(result.start?.outcome==='accepted' && (result.create.outcome!=='accepted'||result.start.task!==result.create.task))result.start={outcome:'unknown',reason:'Start receipt does not match the created issue'};
     return result;
-  }
-  function receiptText(r,kind){
+  },
+receiptText:function(r,kind){
     if(!r)return '';
     const text=r.outcome==='accepted'?(kind==='Create'?'Task #'+r.task+' recorded on the board':'Admission accepted; worker launch is not confirmed'):
       r.outcome==='unknown'?'Outcome unknown':r.outcome==='stale'?'Stale request':'Request rejected';
     return '<p role="status">'+kind+': '+esc(text)+(r.reason?' · '+esc(r.reason):'')+(r.next?' · '+esc(r.next):'')+'</p>';
-  }
-  function mount(el,adapter){
-    const drafts=new Map();let input,projects=[],current;
-    el.innerHTML='<section class="tqf"><form data-finding-form></form><div data-finding-task></div><div data-finding-answer></div></section>';
-    const form=el.querySelector('[data-finding-form]'),task=el.querySelector('[data-finding-task]');
-    form.addEventListener('submit',e=>e.preventDefault());
-    const answer=root.TaskqAnswerCard.mount(el.querySelector('[data-finding-answer]'),adapter.answer);
-    const project=()=>projects.find(p=>p.id===current.project);
-    const cap=()=>project()?adapter.capability(project()):null;
-    function paint(){
+  },
+mount:function(el,adapter){
+const {paint,save,submit}=execution.module("finding-composer.mount",{
+paint:function(){
       const d=current,p=project(),locked=!!d.request,bad=problem(input,d,p,cap());
       const active=document.activeElement,focus=form.contains(active)?{field:active.dataset.field,start:active.selectionStart,end:active.selectionEnd}:null;
       const scroll=el.scrollTop;
@@ -83,35 +75,49 @@
       for(const area of form.querySelectorAll('textarea'))area.style.height=(area.scrollHeight+2)+'px';
       el.scrollTop=scroll;
       if(focus?.field){const target=form.querySelector('[data-field="'+focus.field+'"]');target?.focus();if(focus.start!=null)target?.setSelectionRange(focus.start,focus.end);}
-    }
-    function save(){adapter.saveDraft?.(input.source,copy(current));}
-    async function submit(reconcile){
+    },
+save:function(){adapter.saveDraft?.(input.source,copy(current));},
+submit:function(reconcile){
       const d=current,p=project();
       if(d.pending)return;
       if(reconcile){if(!d.request || !adapter.reconcile)return;}
       else {if(d.request || problem(input,d,p,cap()))return;d.request=request(input,d,p);}
       d.pending=true;save();paint();
-      try{d.receipt=receipt(await (reconcile?adapter.reconcile:adapter.send)(copy(d.request)));}
-      catch(e){d.receipt=receipt({create:d.receipt?.create?.outcome==='accepted'?d.receipt.create:{outcome:'unknown',reason:String(e?.message || e)},start:d.request.start?{outcome:'unknown',reason:String(e?.message || e)}:null});}
-      d.pending=false;
-      // A user can switch source while the adapter resolves; never replace the newly opened draft.
-      adapter.saveDraft?.(d.request.source,copy(d));if(current===d)paint();
+      execution.effect('finding.submit',()=>Promise.resolve().then(execution.bind(()=>(reconcile?adapter.reconcile:adapter.send)(copy(d.request)))),result=>{
+        if(result.ok)d.receipt=receipt(result.value);
+        else d.receipt=receipt({create:d.receipt?.create?.outcome==='accepted'?d.receipt.create:{outcome:'unknown',reason:result.unknown?'Completion unknown':String(result.value?.message||result.value)},start:d.request.start?{outcome:'unknown',reason:result.unknown?'Completion unknown':String(result.value?.message||result.value)}:null});
+        d.pending=false;
+        // Completion belongs to its original draft, even after switching the source.
+        adapter.saveDraft?.(d.request.source,copy(d));if(current===d)paint();
+      });
     }
-    form.addEventListener('input',e=>{
+});
+
+    const drafts=new Map();let input,projects=[],current;
+    el.innerHTML='<section class="tqf"><form data-finding-form></form><div data-finding-task></div><div data-finding-answer></div></section>';
+    const form=el.querySelector('[data-finding-form]'),task=el.querySelector('[data-finding-task]');
+    ui.listen(form,'submit',e=>e.preventDefault());
+    const answer=require('./answer-card.js').mount(el.querySelector('[data-finding-answer]'),adapter.answer);
+    const {project}=execution.module("finding-composer.mount",{project:()=>projects.find(p=>p.id===current.project)});
+    const {cap}=execution.module("finding-composer.mount",{cap:()=>project()?adapter.capability(project()):null});
+
+
+
+    ui.listen(form,'input',e=>{
       const f=e.target.dataset.field;if(!f || current.request)return;
       current[f]=f==='reviewed'?e.target.checked:f==='start'?e.target.value==='yes':e.target.value;
       if(f!=='reviewed')current.reviewed=false;
       save();paint();
     });
-    el.firstElementChild.addEventListener('click',e=>{
+    ui.listen(el.firstElementChild,'click',e=>{
       if(blocks.handle(e,adapter.navigation))return;
       const action=e.target.closest('[data-finding]')?.dataset.finding;
-      if(action==='send'||action==='reconcile'){void submit(action==='reconcile');return;}
+      if(action==='send'||action==='reconcile'){submit(action==='reconcile');return;}
       if(action==='cancel'){current.cancelled=true;save();paint();adapter.cancel?.();}
       if(action==='resume'){current.cancelled=false;save();paint();}
       if(action==='review-source'&&!current.request){current.revision=input.revision;current.reviewed=false;save();paint();}
     });
-    return {update(next){
+    return execution.module("finding-composer.mount.controller",{update(next){
       const previousBoard=current && project()?.board.url;
       input=copy(next.finding);projects=copy(next.projects);
       if(!drafts.has(input.source)){
@@ -126,8 +132,20 @@
       task.innerHTML=linked?blocks.task(linked.project,linked.row)+'<p>Task state does not verify source recovery.</p>':'';
       answer.update(linked?[{board:linked.project.board.url,row:linked.row}]:[]);
       if(linked){form.hidden=true;}else{form.hidden=false;paint();}
-    }};
+    }});
   }
+});
+// TaskQ-owned finding composer; MIT. Serve pinned assets locally; adapters own authorization and board operations.
+const root=globalThis;
+  const blocks = require('./project-blocks.js');
+  const {esc}=execution.module("finding-composer",{esc:s => String(s ?? '').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))});
+  const {copy}=execution.module("finding-composer",{copy:value => JSON.parse(JSON.stringify(value))});
+  const {lines}=execution.module("finding-composer",{lines:s => s.split('\n').filter(l=>l.trim())});
+
+
+
+
+
+
   const api={fresh,problem,request,receipt,mount};
-  if(typeof module==='object'&&module.exports)module.exports=api;else root.TaskqFindingComposer=api;
-})(typeof globalThis==='object'?globalThis:this);
+  module.exports=api;

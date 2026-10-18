@@ -10,14 +10,14 @@
   },
   "dependencyRevision": "38eadee8ea4e2c9db3987a8b3240eda90c7553e1",
   "files": {
-    "src/finding-composer.js": "75dd147d2f7109b7e97807e1dcfc3a2b21774bb3c71ce67a40724848a217317e",
+    "src/finding-composer.js": "4b3133df44a96935e51b8f4f907f586c42a3fecc8fccbbfb6aefa691fb6da42d",
     "src/finding-composer.css": "59429c0cf812caf40b3478cd95ab32f4f5e87b2841e9584b9480f9a0304e01c4",
-    "src/project-blocks.js": "e63affe681aad856ee785fae6bff4dbc90541c84c4aca280b7b68e6f570c5238",
+    "src/project-blocks.js": "9216e92f7e99c7021c3d3c0cc989a51d7bc1a02ce7ddb2736ee12019fbab338c",
     "src/project-blocks.css": "1a2471d13a850a66eb3f8ea9f5745ad2fa3bad1ce67305173d17ba1ae2f0ca64",
-    "src/answer-card.js": "35662bb6d71975e54345097b51aa871db7c8b81c6a137faa1c1c2d72b24b8b92",
+    "src/answer-card.js": "1ea77cc76cc93557787224b2f5d017c1ff765980c940f5ef62f3e733a9ede59c",
     "src/answer-card.css": "b33ea8d5ba6ec70931ecc2cac745bf1808181b4939019bf478f09cdd7791a796",
     "tests/fixtures/finding-composer.json": "b8fad03ef30f7d594934baf82754fb97497f661cdc942d860367e351396ffa16",
-    "docs/design/project-blocks.sources.json": "de700804254888cfa27b3ba34b6b2b95cbacb6eeed8157622a4a31915e7dd78a"
+    "docs/design/project-blocks.sources.json": "f8dac5ca151de23e05bc0831ba45ad5395524e32101b7f84c59399f5078afa3d"
   },
   "hashEncoding": "UTF-8, LF; release version is assigned by the tag workflow; before release pin the delivery commit and these hashes"
 }

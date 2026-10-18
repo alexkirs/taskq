@@ -80,7 +80,20 @@
           "chars": 240
         }
       },
-      "failed": null
+      "failed": null,
+      "execution_wait": "execution 3 on mac: unknown: termination unconfirmed; status missing or stale; restore owning service",
+      "executions": [
+        {
+          "task": 2,
+          "attempt": 3,
+          "id": 3,
+          "through": 3,
+          "state": "unknown",
+          "reason": "termination unconfirmed; status missing or stale; restore owning service",
+          "host": "mac",
+          "observed": null
+        }
+      ]
     },
     {
       "n": 4,

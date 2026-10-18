@@ -1,12 +1,6 @@
 // Chain: real tray HTML -> shared card -> existing IPC. Instrument with Playwright; not native tray/board proof.
 const fs=require('node:fs'),assert=require('node:assert/strict'),{chromium}=require('playwright');
-const html=fs.readFileSync('src/tray.html','utf8')
-  .replace('{{ANSWER_CARD_CSS}}',fs.readFileSync('src/answer-card.css','utf8'))
-  .replace('{{ANSWER_CARD_JS}}',fs.readFileSync('src/answer-card.js','utf8'))
-  .replace('{{PROJECT_BLOCKS_CSS}}',fs.readFileSync('src/project-blocks.css','utf8'))
-  .replace('{{PROJECT_BLOCKS_JS}}',fs.readFileSync('src/project-blocks.js','utf8'))
-  .replace('{{RESOURCE_CONTROLS_CSS}}',fs.readFileSync('src/resource-controls.css','utf8'))
-  .replace('{{RESOURCE_CONTROLS_JS}}',fs.readFileSync('src/resource-controls.js','utf8'));
+const html=fs.readFileSync('build/web/tray.html','utf8');
 const fx=JSON.parse(fs.readFileSync('tests/fixtures/answer-card.json','utf8'));
 (async()=>{
   const browser=await chromium.launch(require('./browser.cjs')());
@@ -39,7 +33,7 @@ const fx=JSON.parse(fs.readFileSync('tests/fixtures/answer-card.json','utf8'));
       state.projects[0].tasks=[{...rows[1],state:'doing',revision:rows[1].revision+1}];
       await page.evaluate(s=>taskq.receive(s),state);
       assert.equal(await page.locator('.qac').count(),0);
-      assert((await page.locator('[role=status]').textContent()).includes('sending'));
+      assert((await page.locator('[role=status]').allTextContents()).some(t=>t.includes('sending')));
       // The refresh past the op's revision reconciles once with the same op.
       assert.deepEqual(await page.evaluate(()=>messages.filter(m=>m.a==='answer').map(m=>m.op)),[op,op]);
       await page.evaluate(r=>taskq.receive({answerReceipt:r}),{root,id:op.id,state:'unknown',reason:'response lost'});
@@ -47,7 +41,7 @@ const fx=JSON.parse(fs.readFileSync('tests/fixtures/answer-card.json','utf8'));
       await page.waitForFunction(()=>messages.filter(m=>m.a==='answer').length===3);
       assert.deepEqual(await page.evaluate(()=>messages.filter(m=>m.a==='answer').map(m=>m.op)),[op,op,op]);
       await page.evaluate(r=>taskq.receive({answerReceipt:r}),{root,id:op.id,state:'accepted'});
-      await page.waitForFunction(()=>document.querySelector('[role=status]').textContent.includes('accepted'));
+      await page.waitForFunction(()=>[...document.querySelectorAll('[role=status]')].some(e=>e.textContent.includes('accepted')));
       assert.equal(await page.locator('.qac').count(),0);
       assert.equal(await page.locator('.qac textarea').count(),0);
       assert.equal(await page.locator('.tqp-task a[data-url]').first().getAttribute('href'),board+'/'+rows[1].n);
@@ -79,6 +73,18 @@ const fx=JSON.parse(fs.readFileSync('tests/fixtures/answer-card.json','utf8'));
       assert.equal(await page.locator('.qac').count(),0);
       assert((await page.locator('[role=status]').allTextContents()).some(t=>t.includes('Parked; close not verified')));
       assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
+      state.projects[0].tasks=[{...rows[1],n:61,state:'ask'}];await page.evaluate(s=>taskq.receive(s),state);
+      await page.locator('.qac [data-qac="choose"]').first().click();
+      await page.waitForFunction(()=>messages.filter(m=>m.a==='answer').length===6);
+      const late=await page.evaluate(()=>messages.filter(m=>m.a==='answer').at(-1).op);
+      await page.evaluate(r=>taskq.receive({answerReceipt:r}),{root,id:late.id,state:'unknown',reason:'No bridge receipt received'});
+      assert.equal(await page.locator('.qac').getAttribute('data-qac-state'),'unknown');
+      await page.evaluate(r=>taskq.receive({answerReceipt:r}),{root:'other',id:late.id,state:'accepted'});
+      assert.equal(await page.locator('.qac').getAttribute('data-qac-state'),'unknown');
+      await page.evaluate(r=>taskq.receive({answerReceipt:r}),{root,id:late.id,state:'accepted',reason:'late native receipt'});
+      assert.equal(await page.locator('.qac').getAttribute('data-qac-state'),'accepted','late native receipt must update the mounted card without retry');
+      assert.equal(await page.locator('[data-qac="retry"]').count(),0);
+      assert.equal(await page.evaluate(()=>messages.filter(m=>m.a==='answer').length),6,'late receipt writes nothing');
       assert.deepEqual(errors,[]);
       console.log('PASS tray HTML draft/focus, stale review, literal text, sending refresh, same-ID retry, accepted readback, board link;',theme,font+'px');
       await page.close();

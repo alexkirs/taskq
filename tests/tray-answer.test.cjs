@@ -1,15 +1,13 @@
 // Chain: tray shared card -> IPC -> canonical dispatcher receipt. Risk: a lost response changes operation identity,
 // a foreign receipt accepts an answer, or stale project data grants controls. Native interaction is a separate gate.
-const fs=require('node:fs'),vm=require('node:vm'),assert=require('node:assert/strict');
+const fs=require('node:fs'),assert=require('node:assert/strict');
 const card=require('../src/answer-card.js');
-const html=fs.readFileSync('src/tray.html','utf8');
-const source=html.slice(html.indexOf('// Task answers:'),html.indexOf('// one task per board'));
 const sent=[],timers=new Map();let id=0;
 const board='https://github.com/o/r/issues',project={root:'project',issues:board,alive:true,complete:true};
 const context={S:{projects:[project],font:16},send:m=>sent.push(m),fit:()=>{},render:()=>{},menu:{scrollHeight:400},esc:String,
   setTimeout:(f,ms)=>{timers.set(++id,{f,ms});return id;},clearTimeout:i=>timers.delete(i)};
-vm.createContext(context);vm.runInContext(source,context);
-const call=(name,...args)=>{context.args=args;return vm.runInContext(name+'(...args)',context);};
+require('./tray-harness.cjs').install(context);
+const call=(name,...args)=>context[name](...args);
 const plain=x=>JSON.parse(JSON.stringify(x));
 (async()=>{
   assert.equal(call('answerCapability',board).answer,true);
@@ -49,6 +47,17 @@ const plain=x=>JSON.parse(JSON.stringify(x));
   context.S.projects=[];
   assert.equal((await call('answerSend',board,op)).state,'rejected');
   assert.equal(sent.length,7,'unregistered board writes nothing');
+  context.S.projects=[project];project.tasks=[{n:841,state:'ask',revision:4}];
+  const late={...op,id:'late-native-receipt'},latePromise=call('answerSend',board,late),lateSent=sent.length;
+  [...timers.values()].find(t=>t.ms===30000).f();assert.equal((await latePromise).state,'unknown');
+  project.tasks=[];
+  call('answerReceipt',{root:'other',id:late.id,state:'accepted',reason:'foreign'});
+  call('answerReceipt',{root:'project',id:late.id,state:'accepted',reason:'late native receipt'});
+  assert(call('answerNotices').includes('late native receipt'),'late receipt must replace timeout without a retry');
+  assert(!call('answerNotices').includes('Check delivery'));
+  assert.equal((await latePromise).state,'unknown','an already settled promise stays one-shot');
+  assert.equal(sent.length,lateSent,'late receipt must not resend the answer');
+  context.S.projects=[];
   // Run the consumer's capability across shared stale/lost-response fixtures; component owns draft and op state.
   const fx=JSON.parse(fs.readFileSync('tests/fixtures/answer-card.json','utf8'));
   for(const c of fx.cases.filter(c=>/stale|lost|duplicate|sending/.test(c.name))){
@@ -83,8 +92,5 @@ const plain=x=>JSON.parse(JSON.stringify(x));
   assert.equal(card.status(row,local,cap),'stale');
   step({type:'review'});assert.equal(step({type:'later'}).revision,13);
   for(const state of ['doing','later','review']) assert.equal(card.status({...row,state},fresh(),cap),'read-only');
-  assert(html.includes('<script>{{ANSWER_CARD_JS}}</script>'));
-  assert(html.includes('<style>{{ANSWER_CARD_CSS}}</style>'));
-  assert(html.includes("if(s.answerReceipt){answerReceipt(s.answerReceipt);return;}"));
   console.log('PASS tray capability, exact IPC payload, duplicate request, foreign receipt, timeout, same-ID retry, shared stale/lost-response fixtures');
 })().catch(e=>{console.error(e);process.exit(1);});

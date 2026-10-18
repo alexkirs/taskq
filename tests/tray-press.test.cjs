@@ -1,19 +1,17 @@
-// Chain: service tick -> receive -> render while a button is pressed. Risk: the rebuilt menu drops the click
-// (U-A4), a press never released stops refreshes, or the deferred refresh runs before the click.
-const fs=require('node:fs'),vm=require('node:vm'),assert=require('node:assert/strict');
-const html=fs.readFileSync('src/tray.html','utf8');
-const on={},win={},timers=[];let renders=0;
-const context={render:()=>renders++,setTimeout:f=>timers.push(f),performance:{now:()=>0},
-  menu:{addEventListener:(t,f)=>{on[t]=f;}},addEventListener:(t,f)=>{win[t]=f;}};
-vm.createContext(context);
-vm.runInContext(html.slice(html.indexOf('// a refresh between press and release'),html.indexOf('// Press end.')),context);
-const run=s=>vm.runInContext(s,context);
-run('refresh(0)');assert.equal(renders,1,'no press: a tick renders');
-context.performance.now=()=>1000;on.pointerdown();
-run('refresh(1500)');assert.equal(renders,1,'a tick during a press waits');
-win.pointerup();assert.equal(renders,1,'the release does not rebuild before the click');
-assert.equal(timers.length,1);timers.shift()();assert.equal(renders,2,'the waiting tick renders after the click');
-win.pointerup();assert.equal(timers.length,0,'a release without a waiting tick renders nothing');
-on.pointerdown();run('refresh(6001)');assert.equal(renders,3,'a press older than 5 s no longer holds refreshes');
-on.pointerdown();run('refresh(1200)');win.blur();timers.shift()();assert.equal(renders,4,'leaving the window ends the press');
+// Chain: actual press/release subscriptions preserve a click across service refresh.
+const assert=require('node:assert/strict');
+const on={},win={},timers=[];let renders=0,now=0;
+const context={render:()=>renders++,setTimeout:f=>timers.push(f),performance:{now:()=>now},send(){},
+ document:{fonts:{ready:Promise.resolve()},addEventListener(){}},
+ menu:{addEventListener:(t,f)=>(on[t]??=[]).push(f)},addEventListener:(t,f)=>(win[t]??=[]).push(f)};
+const app=require('./tray-harness.cjs').install(context);app.mount();
+const event={button:0,target:{closest:()=>null}};
+const fire=(surface,type)=>{for(const fn of surface[type])fn(event);};
+app.refresh(0);assert.equal(renders,1);
+now=1000;fire(on,'pointerdown');app.refresh(1500);assert.equal(renders,1);
+fire(win,'pointerup');assert.equal(renders,1);assert.equal(timers.length,1);timers.shift()();assert.equal(renders,2);
+fire(win,'pointerup');assert.equal(timers.length,0);
+fire(on,'pointerdown');app.refresh(6001);assert.equal(renders,3);
+fire(on,'pointerdown');app.refresh(1200);fire(win,'blur');timers.shift()();assert.equal(renders,4);
 for(const event of ['pointerup','pointercancel'])assert(event in win);
+console.log('PASS actual press callbacks, deferred refresh, stale press and blur release');

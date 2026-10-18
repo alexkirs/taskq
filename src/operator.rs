@@ -12,12 +12,30 @@ use std::path::{Path, PathBuf};
 pub const KEEP: usize = 20;
 const KINDS: [&str; 4] = ["result", "clarify", "proposal", "refuse"];
 
+fn state_error(reason:String)->String {
+    let _:Result<(),_>=coreq::telemetry::capture::operation("operator.state.read",||Err(reason.as_str()),|_|"local-state");reason
+}
+
 pub fn dir(root: &Path) -> PathBuf {
     crate::dot(root).join("requests")
 }
 
 pub fn read(p: &Path) -> Value {
-    fs::read_to_string(p).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(Value::Null)
+    let pending=p.with_file_name(format!("{}.pending",p.file_name().unwrap_or_default().to_string_lossy()));
+    let result=match fs::symlink_metadata(&pending) {Ok(_)=>Err("operator state has an interrupted replacement; file kept".into()),Err(e) if e.kind()==std::io::ErrorKind::NotFound=>crate::data::json(p),Err(e)=>Err(format!("operator state prepare unknown: {e}"))};
+    let result=result.and_then(|value| {
+        if p.file_name().is_some_and(|name|name.to_string_lossy().ends_with(".answer.json"))&&let Some(value)=&value {
+            if !matches!(value["state"].as_str(),Some("running"|"result"|"clarify"|"proposal"|"refuse"|"failed"|"applying"|"applied"|"apply failed"|"unknown"))
+                ||value.get("native_state").is_some_and(|s|!matches!(s.as_str(),Some("unknown"|"no-start"|"exited"))) {return Err("operator answer schema unknown; file kept".into());}
+        }
+        Ok(value)
+    });
+    match result {
+        Ok(Some(value))=>value,Ok(None)=>Value::Null,
+        Err(reason)=>{
+            json!({"state":"unknown","native_state":"unknown","reason":state_error(reason)})
+        }
+    }
 }
 
 pub fn answer_path(root: &Path, id: &str) -> PathBuf {
@@ -26,10 +44,17 @@ pub fn answer_path(root: &Path, id: &str) -> PathBuf {
 
 /// Write the answer of `id` with `rev` one above the last one.
 fn answer(root: &Path, id: &str, mut v: Value) {
+    if let Err(error)=save_answer(root,id,&mut v) {log!("operator answer unknown: {error}");}
+}
+
+fn save_answer(root:&Path,id:&str,v:&mut Value)->Result<(),String> {
+    let previous=read(&answer_path(root,id));
+    if previous["state"]=="unknown" {return Err("operator answer unknown; original file kept".into());}
     v["id"] = json!(id);
-    v["rev"] = json!(read(&answer_path(root, id))["rev"].as_u64().unwrap_or(0) + 1);
-    let _ = crate::platform::write_atomic(&answer_path(root, id), &v.to_string());
-    crate::poke(root);
+    v["rev"] = json!(previous["rev"].as_u64().unwrap_or(0).checked_add(1).ok_or("operator revision exhausted; file kept")?);
+    coreq::write_durable(&answer_path(root, id), &v.to_string())?;
+    let _ = crate::poke(root);
+    Ok(())
 }
 
 /// Request ids, oldest first: the tray names them by epoch milliseconds, so only digits.
@@ -107,22 +132,43 @@ fn comment_of(root: &Path, req: &Value) -> Value {
 /// After a restart no thread waits for a `running` operator: say so (§ 4).
 pub fn recover(root: &Path) {
     for id in ids(root) {
-        if read(&answer_path(root, &id))["state"] == "running" {
-            answer(root, &id, json!({"state": "failed", "reason": "service restarted; partial effects unknown; reconcile before retry"}));
+        let value=read(&answer_path(root,&id));
+        if matches!(value["state"].as_str(),Some("running"|"applying"))||value["state"]=="failed"&&value["reason"].as_str().is_some_and(|reason|reason.starts_with("service restarted; partial effects unknown")) {
+            let mut value=value;value["state"]=json!("failed");value["native_state"]=json!("unknown");
+            value["reason"]=json!("service restarted; partial effects unknown; original native exit unconfirmed; reconcile the original session before retry");
+            answer(root,&id,value);
         }
     }
 }
 
 /// A running operator can edit files; restart and another turn must wait for it.
 pub fn running(root: &Path) -> bool {
-    ids(root).iter().any(|id| read(&answer_path(root, id))["state"] == "running")
+    wait(root).is_some()
+}
+
+fn unresolved(value:&Value)->bool {
+    matches!(value["state"].as_str(),Some("running"|"applying"|"unknown"))||value["native_state"]=="unknown"
+}
+
+pub fn wait(root:&Path)->Option<String> {
+    let entries=match fs::read_dir(dir(root)) {Ok(entries)=>entries,Err(e) if e.kind()==std::io::ErrorKind::NotFound=>return None,Err(e)=>return Some(state_error(format!("operator state unknown: {e}")))};
+    for entry in entries {
+        let entry=match entry {Ok(entry)=>entry,Err(e)=>return Some(state_error(format!("operator state unknown: {e}")))};
+        let name=entry.file_name();let name=name.to_string_lossy();
+        let name=name.strip_suffix(".pending").unwrap_or(&name);
+        if name.strip_suffix(".answer.json").is_none_or(|id|id.is_empty()||!id.bytes().all(|b|b.is_ascii_digit())) {continue;}
+        let value=read(&dir(root).join(name));
+        if value.is_null() {return Some("operator state changed while reading; native ownership unknown".into());}
+        if unresolved(&value) {return Some(if value["native_state"]=="unknown" {format!("operator native ownership unknown: {}",value["reason"].as_str().unwrap_or("inspect original session"))}else{"operator".into()});}
+    }
+    None
 }
 
 /// One service pass: start an operator for each new request, apply a confirmed proposal, drop all but the newest 20.
 pub fn step(root: &Path, install: &Path, exe: &Path, rt: Option<&str>) {
     let ids = ids(root);
     for id in ids.iter().rev().skip(KEEP) {
-        if read(&answer_path(root, id))["state"] == "running" { continue; }
+        if unresolved(&read(&answer_path(root, id))) { continue; }
         for f in [format!("{id}.json"), format!("{id}.answer.json"), format!("{id}.confirm"), format!("{id}.out"), format!("{id}.err")] {
             let _ = fs::remove_file(dir(root).join(f));
         }
@@ -145,7 +191,7 @@ pub fn step(root: &Path, install: &Path, exe: &Path, rt: Option<&str>) {
         // only the proposal the owner saw, once: a stale or repeated confirm does nothing (M-A7)
         // ponytail: files are not signed; whoever can write them can run the same allowlisted `taskq` commands anyway
         if a["state"] == "proposal" && rev.trim().parse::<u64>().ok() == a["rev"].as_u64() {
-            answer(root, id, json!({"state": "applying", "text": a["text"], "ops": a["ops"], "effects": a["effects"]}));
+            if let Err(error)=save_answer(root,id,&mut json!({"state": "applying", "text": a["text"], "ops": a["ops"], "effects": a["effects"]})) {log!("operator proposal not applied: {error}");continue;}
             let ops = a["ops"].as_array().map_or(&[][..], |v| v);
             let (ok, lines, receipts) = match onboard(root, &read(&dir(root).join(format!("{id}.json")))) {
                 Some(r) => {
@@ -161,14 +207,16 @@ pub fn step(root: &Path, install: &Path, exe: &Path, rt: Option<&str>) {
 
 fn start(root: &Path, install: &Path, id: &str, rt: Option<&str>) {
     let req = read(&dir(root).join(format!("{id}.json")));
+    if req["state"]=="unknown" {return answer(root,id,json!({"state":"failed","reason":req["reason"],"native_state":"no-start"}));}
     let prior = req["after"].as_str().filter(|s| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit()))
         .map(|after| read(&answer_path(root, after)));
     let Some(rt) = prior.as_ref().and_then(|p| p["rt"].as_str()).or(rt).map(String::from) else {
-        return answer(root, id, json!({"state": "failed", "reason": "no runtime with a nonzero limit on this host"}));
+        return answer(root, id, json!({"state": "failed", "native_state": "no-start", "reason": "operator runtime selection unavailable; check service status and host limits"}));
     };
-    answer(root, id, json!({"state": "running", "rt": rt}));
+    if let Err(error)=save_answer(root,id,&mut json!({"state":"running","rt":rt})) {log!("operator not started: {error}");return;}
     let (root, install, id) = (root.to_path_buf(), install.to_path_buf(), id.to_string());
-    std::thread::spawn(move || {
+    let failed_root=root.clone();let failed_id=id.clone();
+    if let Err(error)=coreq::telemetry::capture::operation("operator.dispatch",||std::thread::Builder::new().name("taskq-operator".into()).spawn(coreq::telemetry::capture::bind(move || {
         let mut v = match run(&root, &install, &id, &rt) {
             Ok(text) => {
                 let req = read(&dir(&root).join(format!("{id}.json")));
@@ -179,7 +227,7 @@ fn start(root: &Path, install: &Path, id: &str, rt: Option<&str>) {
         v["rt"] = json!(rt);
         v["session"] = json!(session(&rt, &dir(&root).join(format!("{id}.out"))));
         answer(&root, &id, v);
-    });
+    })),|_|"thread-spawn") {answer(&failed_root,&failed_id,json!({"state":"failed","native_state":"no-start","reason":format!("operator thread not started: {error}")}));}
 }
 
 /// Resume only the recorded conversation; failure never silently repeats work in a fresh one.
@@ -203,19 +251,50 @@ fn session(rt: &str, log: &Path) -> Option<String> {
         .find_map(|v| v["session_id"].as_str().map(String::from))
 }
 
+fn wait_native(turn:&mut dyn crate::runtime::Proc,root:&Path,logs:&Path,name:&str,rt:&str,cadence:std::time::Duration)->i32 {
+    let mut unknown=None;
+    loop {
+        let reason=match turn.exited() {
+            Ok(Some(code))=>return code,
+            Ok(None)=>None,
+            Err(reason)=>Some(reason),
+        };
+        if reason!=unknown {
+            let mut saved=true;
+            if let Some(reason)=&reason {
+                log!("{rt} operator observation unknown: {reason}; retaining execution");
+                if let Err(error)=fs::write(logs.join(format!("{name}.err")),reason) {log!("operator diagnostic unavailable: {error}");}
+            }
+            // Retro shares this observer but has no request answer to update.
+            if logs==dir(root) {
+                let mut value=read(&answer_path(root,name));
+                if value["state"]=="running" {
+                    if let Some(reason)=&reason {value["native_state"]=json!("unknown");value["reason"]=json!(reason);}
+                    else if let Some(object)=value.as_object_mut() {object.remove("native_state");object.remove("reason");}
+                    if let Err(error)=save_answer(root,name,&mut value) {log!("operator observation not saved: {error}; retaining execution");saved=false;}
+                }
+            }
+            if saved {unknown=reason;}
+        }
+        std::thread::sleep(cadence);
+    }
+}
+
 /// Normal runtime tools and project permissions; logs stay separate from the working directory.
 /// `taskq retro` also uses this path, with a read/recommend-only request.
 pub fn exec(rt: &str, brief: &str, root: &Path, logs: &Path, name: &str, resume: Option<&str>) -> Result<String, String> {
     if !["claude", "codex"].contains(&rt) { return Err(format!("operator runtime {rt} unsupported; select claude or codex")); }
-    let (cfg, config) = crate::load(root)?;
-    let cap = crate::service::capacity(&config, &cfg.me)?;
+    let (mut cfg, config) = crate::load(root)?;
+    let policy = crate::host::Policy::read(&cfg.install)?;
+    policy.apply(&mut cfg);
+    let cap = policy.project(&config)?;
     if cap.limits.get(rt).copied().unwrap_or(if cap.auto { u32::MAX } else { 0 }) == 0 {
         return Err(format!("operator runtime {rt} disabled on this host; no fallback"));
     }
     let board_env = cfg.board.worker_env(&crate::platform::tool(&cfg.install), &cfg.web_host)?;
     let exe = cfg.install.join(crate::platform::tool(&cfg.install).exe_name());
     let env = crate::runtime::Env { root, exe: &exe, install: &cfg.install, permission_mode: &cfg.permission_mode, codex: &cfg.codex, publish: &cfg.delivery, board_env: &board_env };
-    let l = crate::runtime::Launch { task: 0, title: name.into(), attempt: 0, role: "operator".into(), rt: rt.into(),
+    let l = crate::runtime::Launch { execution: None, task: 0, title: name.into(), attempt: 0, role: "operator".into(), rt: rt.into(),
         session: resume.map(String::from).unwrap_or_else(|| crate::runtime::new_session(rt)), url: String::new(), resume: resume.map(String::from) };
     // § 8 Access: the operator runs under the same grants as workers
     let access = crate::runtime::access(&env, rt).map_err(|e| e.to_string())?;
@@ -226,31 +305,19 @@ pub fn exec(rt: &str, brief: &str, root: &Path, logs: &Path, name: &str, resume:
     fs::create_dir_all(logs).map_err(|e| e.to_string())?;
     let out = logs.join(format!("{name}.out"));
     if rt == "claude" && (resume.is_none() || crate::runtime::claude_background(root, &l.session)?) {
-        use crate::runtime::Proc;
-        let mut turn = crate::runtime::ClaudeTurn::start(&env, &l, &out, &text, &access)?;
-        loop {
-            match turn.exited() {
-                Ok(Some(0)) => break,
-                Ok(Some(code)) => return Err(format!("Claude operator failed (exit {code}); partial effects unknown")),
-                Err(reason) => { fs::write(logs.join(format!("{name}.err")), reason).map_err(|e| e.to_string())?; }
-                Ok(None) => {}
-            }
-            std::thread::sleep(std::time::Duration::from_millis(500));
-        }
+        let mut turn = crate::runtime::ClaudeTurn::start(&env, &l, &out, &text, &access).map_err(|e| e.to_string())?;
+        let code=wait_native(&mut turn,root,logs,name,rt,std::time::Duration::from_millis(500));
+        if code!=0 {return Err(format!("Claude operator failed (exit {code}): {}; partial effects unknown",crate::runtime::Proc::exit_reason(&turn).unwrap_or("inspect native request log")));}
         return fs::read_to_string(&out).map_err(|e| e.to_string())?.lines().rev().filter_map(|line| serde_json::from_str::<Value>(line).ok())
             .find_map(|v| (v["type"] == "result").then(|| v["result"].as_str().map(String::from)).flatten()).ok_or("Claude final response missing".into());
     }
     let f = fs::File::create(&out).map_err(|e| e.to_string())?;
     let err = fs::File::create(logs.join(format!("{name}.err"))).map_err(|e| e.to_string())?;
-    let mut child = c.current_dir(root).stdin(std::process::Stdio::piped()).stdout(f).stderr(err).spawn().map_err(|e| format!("{rt}: {e}"))?;
-    if let Err(e) = std::io::Write::write_all(&mut child.stdin.take().unwrap(), text.as_bytes()) {
-        crate::runtime::Proc::kill(&mut child);
-        return Err(format!("operator input failed: {e}; partial effects unknown"));
-    }
-    let status = child.wait().map_err(|e| format!("operator wait: {e}; partial effects unknown"))?;
+    let mut child = crate::runtime::start_command(c.current_dir(root).stdout(f).stderr(err), root, &text).map_err(|e| format!("{rt}: {e}"))?;
+    let status=wait_native(child.as_mut(),root,logs,name,rt,std::time::Duration::from_millis(50));
     let events: Vec<Value> = fs::read_to_string(&out).map_err(|e| e.to_string())?.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
-    if !status.success() || events.iter().any(|v| v["is_error"] == true || v["type"] == "turn.failed") {
-        return Err(format!("{rt} operator failed (exit {}); partial effects unknown; inspect request log before retry", status.code().unwrap_or(-1)));
+    if status!=0 || events.iter().any(|v| v["is_error"] == true || v["type"] == "turn.failed") {
+        return Err(format!("{rt} operator failed (exit {}); partial effects unknown; inspect request log before retry", status));
     }
     crate::runtime::final_text(&events).ok_or("operator returned no final response; partial effects unknown".into())
 }
@@ -372,7 +439,7 @@ fn onboard(root: &Path, req: &Value) -> Option<PathBuf> {
 fn cmd(prog: impl AsRef<std::ffi::OsStr>, args: &[&str], dir: &Path, env: &[(&str, &str)]) -> Result<String, String> {
     let mut c = std::process::Command::new(prog);
     c.args(args).current_dir(dir).envs(env.iter().copied()).env_remove("TASKQ_TASK").env_remove("TASKQ_ATTEMPT").stdin(std::process::Stdio::null());
-    let o = crate::platform::quiet(&mut c).output().map_err(|e| format!("{}: {e}", args.first().unwrap_or(&"")))?;
+    let o = crate::platform::output("operator.command", &mut c, std::time::Duration::from_secs(30))?;
     let (out, err) = (String::from_utf8_lossy(&o.stdout).trim().to_string(), String::from_utf8_lossy(&o.stderr).to_string());
     if o.status.success() { Ok(out) } else { Err(err.lines().chain(out.lines()).find(|l| !l.trim().is_empty()).unwrap_or("failed").trim().to_string()) }
 }
@@ -622,7 +689,7 @@ fn apply(install: &Path, exe: &Path, ops: &[Value], id: &str, rev: u64) -> (bool
                 if focus(&r) == f { Ok(format!("focus {f}")) } else { Err(format!("focus reads {}", focus(&r))) }
             }
             Op::Pause(r) => {
-                crate::pause(&r)?;
+                crate::pause(&r,false)?;
                 if focus(&r) == "off" { Ok("paused".into()) } else { Err(format!("focus reads {}", focus(&r))) }
             }
             Op::Resume(r) => {
@@ -633,8 +700,8 @@ fn apply(install: &Path, exe: &Path, ops: &[Value], id: &str, rev: u64) -> (bool
                 // a repeated `add` item takes the op id of its first copy: one issue, the first receipt again (§ 5)
                 let k = if args[0] == "add" { ops.iter().position(|x| x == o).unwrap_or(k) } else { k };
                 args.extend(["--json".into(), "--op-id".into(), format!("{id}.{rev}.{k}")]);
-                let out = std::process::Command::new(exe).args(&args).current_dir(&r).env("TASKQ_ROOT", &r)
-                    .env_remove("TASKQ_TASK").env_remove("TASKQ_ATTEMPT").output().map_err(|e| e.to_string())?;
+                let out = crate::platform::output("operator.board-command", std::process::Command::new(exe).args(&args).current_dir(&r).env("TASKQ_ROOT", &r)
+                    .env_remove("TASKQ_TASK").env_remove("TASKQ_ATTEMPT"), std::time::Duration::from_secs(60))?;
                 let text = String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
                 let rc: Value = String::from_utf8_lossy(&out.stdout).lines().rev().find_map(|l| serde_json::from_str(l).ok()).unwrap_or_default();
                 receipts.push(rc.clone());
@@ -657,6 +724,34 @@ fn apply(install: &Path, exe: &Path, ops: &[Value], id: &str, rev: u64) -> (bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // R6/R12: unknown native reads must reach the UI without releasing or resubmitting the request.
+    #[test]
+    fn operator_observation_publishes_changed_uncertainty_and_recovers() {
+        struct Turn {root:PathBuf,step:usize}
+        impl crate::runtime::Proc for Turn {
+            fn exited(&mut self)->Result<Option<i32>,String> {
+                let value=read(&answer_path(&self.root,"1"));
+                match self.step {
+                    0=>assert_eq!(value["rev"],1),
+                    1|2=>{assert_eq!(value["rev"],2);assert_eq!(value["native_state"],"unknown");assert_eq!(value["reason"],"Workspace not trusted");assert!(running(&self.root));},
+                    3=>{assert_eq!(value["rev"],3);assert!(value.get("native_state").is_none());assert!(value.get("reason").is_none());},
+                    _=>unreachable!(),
+                }
+                self.step+=1;
+                match self.step {1|2=>Err("Workspace not trusted".into()),3=>Ok(None),_=>Ok(Some(0))}
+            }
+            fn kill(&mut self)->Result<(),String> {panic!("unknown observation cannot cancel the native execution")}
+            fn id(&self)->u32 {0}
+        }
+        let root=temp("native-observation");fs::create_dir_all(dir(&root)).unwrap();
+        answer(&root,"1",json!({"state":"running","rt":"claude"}));
+        let mut turn=Turn {root:root.clone(),step:0};
+        assert_eq!(wait_native(&mut turn,&root,&dir(&root),"1","claude",std::time::Duration::ZERO),0);
+        assert_eq!(turn.step,4);assert_eq!(read(&answer_path(&root,"1"))["rev"],3);
+        assert_eq!(fs::read_to_string(dir(&root).join("1.err")).unwrap(),"Workspace not trusted");
+        fs::remove_dir_all(root).unwrap();
+    }
 
     fn temp(tag: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!("taskq-op-{tag}-{}", std::process::id()));
@@ -815,45 +910,65 @@ mod tests {
     // Chain: § 4 proposal apply. Risk: a proposal applies twice or without readback.
     #[test]
     fn a_proposal_applies_once_at_its_rev_with_readback() {
-        let (install, root) = (temp("install"), temp("root"));
-        fs::write(install.join("projects"), format!("{}\n", root.display())).unwrap();
-        fs::create_dir_all(dir(&root)).unwrap();
-        fs::write(crate::dot(&root).join("focus"), "area-x").unwrap();
-        let name = crate::project_name(&root);
-        fs::write(dir(&root).join("5.json"), r#"{"text": "pause it"}"#).unwrap();
-        answer(&root, "5", json!({"state": "running"}));
-        answer(&root, "5", json!({"state": "proposal", "text": "Pause", "ops": [{"op": "pause", "project": name}]}));
-        let a = || read(&answer_path(&root, "5"));
-        let focus = || fs::read_to_string(crate::dot(&root).join("focus")).unwrap();
-        let confirm = |rev: &str| {
-            fs::write(dir(&root).join("5.confirm"), rev).unwrap();
+        crate::with_test_capture(|store, _| {
+            let (install, root) = (temp("install"), temp("root"));
+            fs::write(install.join("projects"), format!("{}\n", root.display())).unwrap();
+            fs::create_dir_all(dir(&root)).unwrap();
+            fs::write(crate::dot(&root).join("focus"), "area-x").unwrap();
+            let name = crate::project_name(&root);
+            fs::write(dir(&root).join("5.json"), r#"{"text": "pause it"}"#).unwrap();
+            answer(&root, "5", json!({"state": "running"}));
+            answer(&root, "5", json!({"state": "proposal", "text": "Pause", "ops": [{"op": "pause", "project": name}]}));
+            let a = || read(&answer_path(&root, "5"));
+            let focus = || fs::read_to_string(crate::dot(&root).join("focus")).unwrap();
+            let confirm = |rev: &str| {
+                fs::write(dir(&root).join("5.confirm"), rev).unwrap();
+                step(&root, &install, Path::new("/nonexistent"), None);
+            };
+            assert_eq!(a()["rev"], 2);
+            confirm("1");
+            assert_eq!((a()["state"].as_str(), focus().as_str()), (Some("proposal"), "area-x"), "a stale rev does nothing");
+            confirm("2");
+            assert_eq!((a()["state"].as_str(), focus().as_str()), (Some("applied"), "off"), "{}", a());
+            assert!(a()["readback"][0].as_str().unwrap().ends_with("pause ok: paused"));
+            let rev = a()["rev"].clone();
+            fs::write(crate::dot(&root).join("focus"), "area-y").unwrap();
+            confirm("2");
+            confirm(&rev.to_string());
+            assert_eq!((a()["rev"].clone(), focus().as_str()), (rev, "area-y"), "a repeated confirm applies nothing");
+            // AI failure is not task failure; a restart cannot certify that the native operator ended.
+            fs::write(dir(&root).join("6.json"), r#"{"text": "x"}"#).unwrap();
             step(&root, &install, Path::new("/nonexistent"), None);
-        };
-        assert_eq!(a()["rev"], 2);
-        confirm("1");
-        assert_eq!((a()["state"].as_str(), focus().as_str()), (Some("proposal"), "area-x"), "a stale rev does nothing");
-        confirm("2");
-        assert_eq!((a()["state"].as_str(), focus().as_str()), (Some("applied"), "off"));
-        assert!(a()["readback"][0].as_str().unwrap().ends_with("pause ok: paused"));
-        let rev = a()["rev"].clone();
-        fs::write(crate::dot(&root).join("focus"), "area-y").unwrap();
-        confirm("2");
-        confirm(&rev.to_string());
-        assert_eq!((a()["rev"].clone(), focus().as_str()), (rev, "area-y"), "a repeated confirm applies nothing");
-        // a request without a runtime fails as an AI failure, not a task; a restart ends a running one
-        fs::write(dir(&root).join("6.json"), r#"{"text": "x"}"#).unwrap();
-        step(&root, &install, Path::new("/nonexistent"), None);
-        assert_eq!(read(&answer_path(&root, "6"))["state"], "failed");
-        answer(&root, "6", json!({"state": "running"}));
-        recover(&root);
-        assert_eq!(read(&answer_path(&root, "6"))["state"], "failed");
-        for i in 10..40 {
-            fs::write(dir(&root).join(format!("{i}.json")), "{}").unwrap();
-        }
-        step(&root, &install, Path::new("/nonexistent"), None);
-        assert_eq!(ids(&root).len(), KEEP);
-        assert_eq!(ids(&root).first().map(String::as_str), Some("20"), "the newest 20 stay");
-        let _ = (fs::remove_dir_all(&install), fs::remove_dir_all(&root));
+            assert_eq!(read(&answer_path(&root, "6"))["state"], "failed");
+            assert_eq!(read(&answer_path(&root, "6"))["native_state"], "no-start", "unavailable runtime selection refuses before native dispatch");
+            answer(&root, "6", json!({"state": "running"}));
+            recover(&root);
+            assert_eq!(read(&answer_path(&root, "6"))["state"], "failed");
+            assert_eq!(read(&answer_path(&root,"6"))["native_state"],"unknown");assert!(running(&root));
+            fs::write(answer_path(&root,"6"),"[").unwrap();assert!(running(&root),"corrupt ownership cannot certify an idle operator");
+            assert_eq!(read(&answer_path(&root,"6"))["state"],"unknown");
+            assert!(save_answer(&root,"6",&mut json!({"state":"result"})).is_err());
+            assert_eq!(fs::read(answer_path(&root,"6")).unwrap(),b"[","a late thread answer cannot overwrite corrupt ownership");
+            let pending=dir(&root).join("5.answer.json.pending");fs::write(&pending,"interrupted").unwrap();
+            let original=fs::read(answer_path(&root,"5")).unwrap();
+            assert!(save_answer(&root,"5",&mut json!({"state":"applying"})).is_err());
+            assert_eq!(fs::read(answer_path(&root,"5")).unwrap(),original);assert!(pending.is_file());
+            fs::remove_file(pending).unwrap();
+            for i in 10..40 {
+                fs::write(dir(&root).join(format!("{i}.json")), "{}").unwrap();
+            }
+            step(&root, &install, Path::new("/nonexistent"), None);
+            assert_eq!(ids(&root).len(), KEEP+1,"unresolved native ownership stays beside the newest requests");
+            assert_eq!(ids(&root).first().map(String::as_str),Some("6"));
+            assert_eq!(ids(&root).get(1).map(String::as_str),Some("20"),"the newest 20 still stay");
+            let page=store.export(0,0,1024).unwrap();
+            let receipts:Vec<_>=page["events"].as_array().unwrap().iter().map(|r|&r["observation"])
+                .filter(|r|r["source"]=="command").collect();
+            assert_eq!(receipts.len(),2,"proposal confirmation either bypassed receipts or reapplied a repeated operation");
+            assert_eq!(receipts[0]["kind"],"command.received");assert_eq!(receipts[1]["kind"],"command.applied");
+            assert_eq!(receipts[0]["span"],receipts[1]["span"]);assert_eq!(receipts[0]["operation"],"taskq.pause");
+            let _ = (fs::remove_dir_all(&install), fs::remove_dir_all(&root));
+        });
     }
     // Chain: R3/R9 operator request -> native tools -> verified result -> same-session continuation.
     // Paid/client-dependent qualification: deliberately excluded from the normal CI gate.
@@ -877,8 +992,11 @@ mod tests {
         let original = format!("canary-{}\n", crate::runtime::uuid());
         fs::write(root.join("input.txt"), &original).unwrap();
         fs::create_dir_all(dir(&root)).unwrap();
-        let install = root.join("fixture-install");
+        let install = crate::platform::default_install();
+        assert!(std::env::var_os("TASKQ_INSTALL").is_some() && (install == root.join("fixture-install") || install == root.parent().unwrap().join("install")), "set TASKQ_INSTALL to this fixture's nested or sibling installation");
         fs::create_dir_all(&install).unwrap();
+        if !install.join("token").exists() { fs::write(install.join("token"), "owned-fixture-not-a-credential").unwrap(); }
+        fs::write(install.join("host.json"), json!({"limits": {rt.clone():1}, "permission_mode":"dontAsk", "codex":["-s","workspace-write","-c","sandbox_workspace_write.network_access=true"]}).to_string()).unwrap();
         fs::write(install.join("projects"), format!("{}\n", root.display())).unwrap();
         let exe = std::env::current_exe().unwrap();
         let wait = |id: &str| {
@@ -907,10 +1025,12 @@ mod tests {
         assert!(!running(&root));
         let log = fs::read_to_string(dir(&root).join("1.out")).unwrap();
         assert!(if rt == "claude" { log.contains("tool_use") } else { log.contains("command_execution") }, "actual tools, not acknowledgement");
-        let mut config = read(&root.join("taskq.json"));
-        let (cfg, _) = crate::load(&root).unwrap();
-        config["capacity_hosts"][&cfg.me]["limits"][&rt] = json!(0);
-        fs::write(root.join("taskq.json"), config.to_string()).unwrap();
+        let mut config = read(&install.join("host.json"));
+        config["limits"][&rt] = json!(0);
+        fs::write(install.join("host.json"), config.to_string()).unwrap();
+        let mut project = read(&root.join("taskq.json"));
+        project["limits"][&rt] = json!(0);
+        fs::write(root.join("taskq.json"), project.to_string()).unwrap();
         fs::write(dir(&root).join("3.json"), json!({"after":"2", "text":"Read input.txt again."}).to_string()).unwrap();
         step(&root, &install, &exe, Some(&rt));
         let disabled = wait("3");

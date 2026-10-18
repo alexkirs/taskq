@@ -1,57 +1,51 @@
-// Chain: tray Capacity -> shared resource controls -> `service capacity` IPC receipt. Risk: an operation writes
-// untouched fields, a foreign or lost receipt reads as saved, or an invalid config stays editable.
-const fs=require('node:fs'),vm=require('node:vm'),assert=require('node:assert/strict');
+// Chain: native host projection -> shared editor -> immutable typed IPC -> exact saved receipt.
+const fs=require('node:fs'),assert=require('node:assert/strict');
 const rc=require('../src/resource-controls.js');
-const html=fs.readFileSync('src/tray.html','utf8');
-const source=html.slice(html.indexOf('// Capacity (taskq.md § 4)'),html.indexOf('function project(p){'));
 const fx=JSON.parse(fs.readFileSync('tests/fixtures/resource-controls.json','utf8'));
+const modern=fx.cases.find(c=>c.name.startsWith('host commands'));
 const sent=[],timers=new Map();let id=0;
-const saved={limits:{claude:2},load_gate:{enabled:true,cpu_max:85,memory_min:10}};
-const project={root:'p',name:'taskq',cap_host:'mac',cap_saved:saved,resources:fx.cases[0].groups[0]};
-const context={S:{projects:[project],font:16,now:1000},TaskqResources:rc,esc:s=>String(s),send:m=>sent.push(m),fit:()=>{},menu:{scrollHeight:400},
+const saved={limits:{claude:2,codex:3},load_gate:{enabled:true,cpu_max:90,memory_min:10}};
+const project={root:'p',name:'taskq',cap_host:'mac',cap_saved:saved,resources:structuredClone(modern.groups[0])};
+const context={S:{projects:[project],font:16,now:1000},TaskqResources:rc,esc:String,send:m=>sent.push(m),fit:()=>{},menu:{scrollHeight:400},
   setTimeout:(f,ms)=>{timers.set(++id,{f,ms});return id;},clearTimeout:i=>timers.delete(i)};
-vm.createContext(context);vm.runInContext(source,context);
-const call=(name,...args)=>{context.args=args;return vm.runInContext(name+'(...args)',context);};
-const plain=x=>JSON.parse(JSON.stringify(x));
+require('./tray-harness.cjs').install(context);
+const call=(name,...args)=>context[name](...args),plain=x=>JSON.parse(JSON.stringify(x));
 (async()=>{
   const g=call('resourceGroup',project);
   assert.equal(g.key,'p');assert.deepEqual(plain(g.labels),{host:'mac',project:'taskq'});
   assert.equal(call('resourceCapability',g).edit,true);
-  project.cap_saved={error:'bad toml'};
-  assert.deepEqual(plain(call('resourceCapability',g)),{edit:false,reason:'Read-only here',note:'Config: bad toml'});
+  assert(call('resourceCapability',g).note.includes('all registered projects'));
+  project.cap_saved={error:'bad policy'};
+  assert.deepEqual(plain(call('resourceCapability',g)),{edit:false,reason:'Read-only here',note:'Config: bad policy'});
   project.cap_saved=saved;
-  assert(call('capacity',project).includes('Legacy guard · Fixed limits · Load gate: Ready'));
-  assert.equal(call('capacity',{...project,resources:null}),'','no projection, no section');
-  // the lost-receipt fixture's operation maps onto exactly its changed fields
-  const lost=fx.cases.find(c=>/lost receipt/.test(c.name)),op={id:'op-1',ops:lost.events.find(e=>e.ops).ops};
+  assert(call('capacity',project).includes('Host limits · no maximum · Load gate: Ready'));
+  assert.equal(call('capacity',{...project,resources:null}),'');
+  const target=project.resources.targets.find(t=>t.target.runtime_id==='codex');
+  const op={id:'op-1',ops:[{target:target.target,policy_schema:'taskq.host-capacity/1',expected_revision:target.current_revision,changes:{runtime_limit:4}}]};
   const first=call('resourceSend',g,op);
-  assert.deepEqual(plain(sent),[{a:'capacity',root:'p',id:'op-1',set:{limits:{codex:1}},expect:saved}]);
-  call('resourceReceipt',{root:'other',id:'op-1',text:'Saved: x'});
-  call('resourceReceipt',{root:'p',id:'op-2',text:'Saved: x'});
-  assert.equal(timers.size,1,'foreign receipt leaves request pending');
-  [...timers.values()][0].f();
-  assert.equal((await first).state,'unknown','timeout never reads as saved');
-  const original=plain(sent[0]);
-  saved.limits.claude=9;
-  project.cap_saved={...saved,limits:{claude:4}};
-  op.ops[0].changes.runtime_limit=7;
+  const original={a:'capacity',root:'p',id:'op-1',ops:plain(op.ops),issued_at:1000,expires_at:1300};
+  assert.deepEqual(plain(sent),[original]);
+  call('resourceReceipt',{root:'other',id:'op-1',state:'saved',saved_revision:'2'.repeat(32)});
+  call('resourceReceipt',{root:'p',id:'op-2',state:'saved',saved_revision:'2'.repeat(32)});
+  assert.equal(timers.size,1,'foreign receipt leaves the original request pending');
+  [...timers.values()][0].f();assert.equal((await first).state,'unknown');
+  project.cap_saved={...saved,limits:{claude:9}};context.S.now=1100;op.ops[0].changes.runtime_limit=7;
   const again=call('resourceSend',g,op);
-  assert.deepEqual(plain(sent[1]),original,'retry freezes the entire first payload despite config and operation changes');
-  call('resourceReceipt',{root:'p',id:'op-1',text:'Error: config changed on disk'});
+  assert.deepEqual(plain(sent[1]),original,'retry freezes body, revisions and expiry despite later edits');
+  call('resourceReceipt',{root:'p',id:'op-1',state:'rejected',reason:'config changed on disk'});
   assert.deepEqual(plain(await again),{state:'rejected',reason:'config changed on disk'});
-  const gate=fx.cases.find(c=>/saved then applied/.test(c.name)).events.find(e=>e.ops).ops;
-  assert.deepEqual(plain(call('resourceSet',{ops:gate})),{limits:{},enabled:true,cpu_max:70,memory_min:10});
-  const done=call('resourceSend',g,{id:'op-3',ops:gate});
-  call('resourceReceipt',{root:'p',id:'op-3',text:'Saved: load gate'});
-  assert.equal((await done).state,'saved');
-  // #954: Auto/maximum travel only when edited; null removes the maximum, never zero
-  assert.deepEqual(plain(call('resourceSet',{ops:[{target:{},changes:{mode:'fixed'}}]})),{limits:{},mode:'fixed'});
-  assert.deepEqual(plain(call('resourceSet',{ops:[{target:{},changes:{maximum:null}}]})),{limits:{},maximum:null});
-  assert(call('workEntry','p').includes('data-root="p"'),'project entry preselects that project');
-  assert(call('workEntry').includes('data-a="work"')&&!call('workEntry').includes('data-root'),'home entry selects nothing');
-  assert(html.includes("working?workPage():"));
-  assert(html.includes('<script>{{RESOURCE_CONTROLS_JS}}</script>'));
-  assert(html.includes('<style>{{RESOURCE_CONTROLS_CSS}}</style>'));
-  assert(html.includes('if(s.capmsg){resourceReceipt(s.capmsg);return;}'));
-  console.log('PASS tray resource capability, exact capacity IPC, foreign receipt, timeout, same-ID retry, rejection, saved');
+  const done=call('resourceSend',g,{...op,id:'op-3'});
+  call('resourceReceipt',{root:'p',id:'op-3',state:'saved',saved_revision:'2'.repeat(32)});
+  assert.deepEqual(plain(await done),{state:'saved',saved_revision:'2'.repeat(32)});
+  const malformed=call('resourceSend',g,{...op,id:'op-4'});
+  call('resourceReceipt',{root:'p',id:'op-4',text:'Saved: equal values'});
+  assert.equal((await malformed).state,'unknown','untyped legacy receipt cannot acknowledge host settings');
+  const before=sent.length;
+  assert.equal((await call('resourceSend',g,{id:'legacy',ops:[{...op.ops[0],policy_schema:'taskq.capacity/1'}]})).state,'rejected');
+  assert.equal(sent.length,before,'legacy project edits do not enter the host bridge');
+  assert(call('workEntry','p').includes('data-root="p"'));assert(call('workEntry').includes('data-a="work"'));
+  assert(call('workPage').includes('data-resources="p"')&&!call('workPage').includes('data-work'),'one host editor cannot pretend project selection narrows its scope');
+  project.resources=fx.cases[0].groups[0];
+  assert.equal(call('resourceCapability',call('resourceGroup',project)).edit,false,'legacy projections remain read-only in native tray');
+  console.log('PASS typed host IPC, original expiry/revision replay, exact receipt, stale/legacy refusal and global host scope');
 })().catch(e=>{console.error(e);process.exit(1);});

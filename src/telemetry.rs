@@ -1,19 +1,33 @@
-//! Installation-local telemetry. Caller holds taskq-profile.lock across import, write and read.
+//! Installation-local telemetry. All storage mutations share the installation budget lock; export is read-only.
+mod semantic;
+pub(crate) use semantic::Sample;
+pub(crate) mod diagnostic;
+mod source;
+
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 use std::io::Read;
 
 const APP: i64 = 0x5451544d;
-const PAGES: u64 = 7168; // 28 MiB database + at most 29 MiB WAL + 1 MiB SHM + 4 MiB legacy log < 64 MiB.
 const LINE_MAX: usize = 64 << 10;
 const WINDOW_MS: u64 = 30 * 86400 * 1000;
 const LEGACY_MAX: u64 = crate::data::LOG_MAX + LINE_MAX as u64;
+
+/// Reserve bounded text growth, peer SHM creation and fixed IPC/lock metadata; count existing files too.
+pub(crate) fn budget(install:&Path,peer:&str)->Result<coreq::telemetry::Budget,String> {
+    let install=std::path::absolute(install).map_err(|e|e.to_string())?;
+    let dir=install.join("telemetry.log");
+    Ok(coreq::telemetry::Budget {lock:install.join("taskq-profile.lock"),
+        peers:vec![dir.join(peer),dir.join(format!("{peer}-wal")),dir.join(format!("{peer}-shm")),install.join("taskq.log")],
+        total:64<<20,reserved:LEGACY_MAX+(2<<20)})
+}
 
 fn open(install: &Path) -> Result<Connection, String> {
     // Older release sweep keeps *.log entries, including directories; rollback must preserve DB and sidecars together.
     let dir = install.join("telemetry.log");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let path = dir.join("telemetry.sqlite3");
+    let ceiling=budget(install,"universal.sqlite3")?.check_files(&path)?;
     let exists = path.exists();
     let db = Connection::open(&path).map_err(|e| format!("telemetry SQLite: {e}"))?;
     db.busy_timeout(std::time::Duration::from_secs(1)).map_err(|e| e.to_string())?;
@@ -22,9 +36,12 @@ fn open(install: &Path) -> Result<Connection, String> {
     if exists && (app != APP || version != 1) {
         return Err("telemetry SQLite: foreign or unsupported schema; file kept".into());
     }
+    let page:i64=db.pragma_query_value(None,"page_size",|r|r.get(0)).map_err(|e|e.to_string())?;
+    let pages:i64=db.pragma_query_value(None,"page_count",|r|r.get(0)).map_err(|e|e.to_string())?;
+    if page<1024||pages>ceiling/page {return Err("telemetry installation budget exhausted; legacy archive preserved".into());}
     db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA temp_store=MEMORY; PRAGMA cache_spill=OFF; PRAGMA cache_size=-32768; PRAGMA wal_autocheckpoint=0;")
         .map_err(|e| e.to_string())?;
-    db.pragma_update(None, "max_page_count", PAGES as i64).map_err(|e| e.to_string())?;
+    db.pragma_update(None, "max_page_count", ceiling/page).map_err(|e| e.to_string())?;
     if !exists {
         db.execute_batch(&format!("BEGIN IMMEDIATE; PRAGMA application_id={APP}; PRAGMA user_version=1;
             CREATE TABLE records(seq INTEGER PRIMARY KEY, retained_ms INTEGER NOT NULL, line TEXT NOT NULL);
@@ -74,14 +91,32 @@ fn telemetry(line: &str) -> bool {
 }
 
 fn space(db: &Connection, bytes: usize) -> Result<(), String> {
-    let reserve = (bytes as u64).div_ceil(4096) * 2 + 32;
-    loop {
-        checkpoint(db)?;
-        let pages: i64 = db.query_row("PRAGMA page_count", [], |r| r.get(0)).map_err(|e| e.to_string())?;
-        let free: i64 = db.query_row("PRAGMA freelist_count", [], |r| r.get(0)).map_err(|e| e.to_string())?;
-        if (pages - free).max(0) as u64 + reserve < PAGES { return Ok(()); }
-        if db.execute("DELETE FROM records WHERE seq IN (SELECT seq FROM records ORDER BY seq LIMIT 256)", []).map_err(|e| e.to_string())? == 0 {
-            return Err("telemetry SQLite full; retained legacy checkpoint kept".into());
+    checkpoint(db)?;
+    let page:i64=db.pragma_query_value(None,"page_size",|r|r.get(0)).map_err(|e|e.to_string())?;
+    let ceiling:i64=db.pragma_query_value(None,"max_page_count",|r|r.get(0)).map_err(|e|e.to_string())?;
+    let pages:i64=db.pragma_query_value(None,"page_count",|r|r.get(0)).map_err(|e|e.to_string())?;
+    let free:i64=db.pragma_query_value(None,"freelist_count",|r|r.get(0)).map_err(|e|e.to_string())?;
+    let reserve=(bytes as u64).div_ceil(page as u64)*2+32;
+    if (pages-free).max(0) as u64+reserve>=ceiling as u64 {
+        return Err("legacy import full; source archive preserved; migration required".into());
+    }
+    Ok(())
+}
+
+fn legacy_offset(db: &Connection, text: &str) -> Result<Option<usize>, String> {
+    let previous: Option<String> = db.query_row("SELECT text FROM legacy WHERE id=1", [], |r| r.get(0)).optional().map_err(|e| e.to_string())?;
+    let previous = previous.map(|s| serde_json::from_str::<serde_json::Value>(&s).map_err(|e| format!("legacy checkpoint: {e}"))).transpose()?;
+    let matches = |n: usize, digest: &str| text.get(..n).is_some_and(|s| (s.is_empty() || s.ends_with('\n')) && hash(s) == digest);
+    match previous.as_ref() {
+        None => Ok(None),
+        Some(old) => {
+            let n = old["bytes"].as_u64().ok_or("legacy checkpoint: missing length")? as usize;
+            let digest = old["sha256"].as_str().ok_or("legacy checkpoint: missing digest")?;
+            let trimmed = old["trimmed_bytes"].as_u64().ok_or("legacy checkpoint: missing trimmed length")? as usize;
+            let trimmed_hash = old["trimmed_sha256"].as_str().ok_or("legacy checkpoint: missing trimmed digest")?;
+            if matches(n, digest) { Ok(Some(n)) }
+            else if trimmed > 0 && matches(trimmed, trimmed_hash) { Ok(Some(trimmed)) }
+            else { Err("legacy taskq.log rewritten or lost; retained SQLite history kept; coverage unknown".into()) }
         }
     }
 }
@@ -89,21 +124,7 @@ fn space(db: &Connection, bytes: usize) -> Result<(), String> {
 /// Existing records have no event IDs: track stream position, never deduplicate by record contents.
 fn import(db: &mut Connection, install: &Path, now: u64) -> Result<(), String> {
     let text = legacy_text(install)?;
-    let previous: Option<String> = db.query_row("SELECT text FROM legacy WHERE id=1", [], |r| r.get(0)).optional().map_err(|e| e.to_string())?;
-    let previous = previous.map(|s| serde_json::from_str::<serde_json::Value>(&s).map_err(|e| format!("legacy checkpoint: {e}"))).transpose()?;
-    let matches = |n: usize, digest: &str| text.get(..n).is_some_and(|s| hash(s) == digest);
-    let start = match previous.as_ref() {
-        None => 0,
-        Some(old) => {
-            let n = old["bytes"].as_u64().ok_or("legacy checkpoint: missing length")? as usize;
-            let digest = old["sha256"].as_str().ok_or("legacy checkpoint: missing digest")?;
-            let trimmed = old["trimmed_bytes"].as_u64().ok_or("legacy checkpoint: missing trimmed length")? as usize;
-            let trimmed_hash = old["trimmed_sha256"].as_str().ok_or("legacy checkpoint: missing trimmed digest")?;
-            if matches(n, digest) { n }
-            else if trimmed > 0 && matches(trimmed, trimmed_hash) { trimmed }
-            else { return Err("legacy taskq.log rewritten or lost; retained SQLite history kept; coverage unknown".into()); }
-        }
-    };
+    let previous=legacy_offset(db,&text)?;let start=previous.unwrap_or(0);
     if start == text.len() && previous.is_some() { return Ok(()); }
     let tail = &text.as_bytes()[text.len().saturating_sub((crate::data::LOG_MAX / 2) as usize)..];
     let tail = tail.iter().position(|c| *c == b'\n').map_or(tail, |i| &tail[i+1..]);
@@ -120,6 +141,55 @@ fn import(db: &mut Connection, install: &Path, now: u64) -> Result<(), String> {
     checkpoint(db)
 }
 
+/// Metadata-only product records share the installed capture queue and its health.
+#[cfg(test)]
+pub fn observe(line:&str)->Result<(),String> {
+    if line.len()>LINE_MAX {return Err("telemetry append exceeds 64 KiB".into());}
+    coreq::telemetry::capture::observe(semantic::observation(line.trim_end())?)
+}
+
+/// Live producers submit existing typed records directly; text decoding belongs to historical input.
+pub(crate) fn record(sample:Sample)->std::io::Result<()> {
+    let prepare=||->Result<serde_json::Value,String> {
+        let kind=sample.kind();let original=sample.canonical()?;
+        if semantic::encoded_size(kind,&original)?>LINE_MAX {return Err("telemetry append exceeds 64 KiB".into());}
+        semantic::encode(kind,original)
+    };
+    prepare().and_then(coreq::telemetry::capture::observe).map_err(std::io::Error::other)
+}
+
+/// One owner uses the existing election and budget; live collectors must be quiesced first.
+pub fn migrate(install:&Path)->Result<u64,String> {
+    let path=install.join("telemetry.log/universal.sqlite3");
+    let _owner=coreq::telemetry::maintenance(&path)?;
+    if !has_legacy(install)? {return Ok(0);}
+    let mut archive=source::prepare(install)?;
+    let target=coreq::telemetry::Store::open_bounded(&path,budget(install,"telemetry.sqlite3")?)?;
+    source::import(&mut archive,&target,install)
+}
+
+pub(crate) fn visit_samples(install:&Path,kinds:&[&str],accept:impl FnMut(usize,Sample))->Result<(),String> {
+    // Include this process's admitted records before taking the committed snapshot.
+    tracing::dispatcher::get_default(|d|d.downcast_ref::<coreq::telemetry::capture::Capture>().cloned()).map(|capture|capture.flush()).transpose()?;
+    tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(),|| {
+        let path=install.join("telemetry.log/universal.sqlite3");
+        let reader=path.try_exists().map_err(|e|e.to_string())?.then(||coreq::telemetry::Reader::open(&path)).transpose()?;
+        let cursor=reader.as_ref().map(|r|r.import_cursor("taskq.legacy")).transpose()?.flatten();
+        let archive=legacy_rows(install,cursor.as_deref())?.into_iter().map(|(_,_,line)|line+"\n").collect::<String>();
+        semantic::visit_samples(reader.as_ref(),kinds,&archive,accept)
+    })
+}
+
+pub(crate) fn report_samples(install:&Path,kinds:&[&str])->Result<Vec<Sample>,String> {
+    let mut lanes:[Vec<Sample>;3]=Default::default();visit_samples(install,kinds,|lane,sample|lanes[lane].push(sample))?;Ok(lanes.into_iter().flatten().collect())
+}
+
+#[cfg(test)]
+pub fn report_input(install:&Path)->Result<String,String> {
+    let mut text=String::new();for sample in report_samples(install,semantic::KINDS)? {text.push_str(&sample.line()?);text.push('\n');}Ok(text)
+}
+
+#[cfg(test)]
 pub fn append(install: &Path, line: &str, now: u64) -> Result<(), String> {
     if line.len() > LINE_MAX { return Err("telemetry append exceeds 64 KiB".into()); }
     let mut db = open(install)?;
@@ -133,6 +203,7 @@ pub fn append(install: &Path, line: &str, now: u64) -> Result<(), String> {
 }
 
 pub fn read(install: &Path, now: u64) -> Result<String, String> {
+    if !has_legacy(install)? {return Ok(String::new());}
     let mut db = open(install)?;
     import(&mut db, install, now)?;
     let mut statement = db.prepare("SELECT line FROM records ORDER BY seq").map_err(|e| e.to_string())?;
@@ -142,8 +213,99 @@ pub fn read(install: &Path, now: u64) -> Result<String, String> {
     Ok(text)
 }
 
-/// Existing service owns retention; failed pruning preserves both stores and is reported by its caller.
+/// Transitional archive view; the service alone imports text and performs retention.
+fn legacy_rows(install: &Path,cursor:Option<&str>) -> Result<Vec<(i64,i64,String)>,String> {
+    let path=install.join("telemetry.log/telemetry.sqlite3");
+    match std::fs::metadata(&path) {
+        Err(e) if e.kind()==std::io::ErrorKind::NotFound => {
+            if cursor.is_some() {return Err("legacy source: imported archive missing; coverage unknown".into());}
+            if legacy_text(install)?.lines().any(telemetry) {return Err("legacy telemetry awaits service import".into());}
+            return Ok(Vec::new());
+        }
+        Err(e)=>return Err(e.to_string()),Ok(_)=>{}
+    }
+    let _lock=crate::profile::read_log_lock(install).map_err(|e|format!("legacy snapshot lock: {e}"))?;
+    let db=Connection::open_with_flags(&path,rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|e|e.to_string())?;
+    db.busy_timeout(std::time::Duration::from_secs(1)).map_err(|e|e.to_string())?;
+    db.execute_batch("PRAGMA query_only=ON; BEGIN;").map_err(|e|e.to_string())?;
+    let app:i64=db.pragma_query_value(None,"application_id",|r|r.get(0)).map_err(|e|e.to_string())?;
+    let version:i64=db.pragma_query_value(None,"user_version",|r|r.get(0)).map_err(|e|e.to_string())?;
+    if app!=APP||version!=1 {return Err("legacy snapshot: foreign or unsupported schema; preserved".into());}
+    let text=legacy_text(install)?;let offset=legacy_offset(&db,&text)?.unwrap_or(0);
+    if text[offset..].lines().any(telemetry) {return Err("legacy telemetry awaits service import".into());}
+    let after=source::pending(&db,cursor)?;
+    let sql=if after.is_some() {"SELECT seq,retained_ms,line FROM records WHERE telemetry_epoch>?1 OR (telemetry_epoch=?1 AND seq>?2) ORDER BY telemetry_epoch,seq"} else {"SELECT seq,retained_ms,line FROM records WHERE ?1=-1 AND ?2=0 ORDER BY seq"};
+    let mut statement=db.prepare(sql).map_err(|e|e.to_string())?;
+    let after=after.unwrap_or((-1,0));
+    let rows=statement.query_map(params![after.0,after.1],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?))).map_err(|e|e.to_string())?
+        .collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
+    drop(statement);drop(db);drop(_lock);
+    if rows.iter().any(|(seq,received,line)|*seq<=0||*received<0||line.len()>LINE_MAX) {
+        return Err("legacy snapshot: invalid retained record".into());
+    }
+    Ok(rows)
+}
+
+fn legacy_export(install:&Path,since:Option<u64>,cursor:Option<&str>)->Result<(serde_json::Value,String),String> {
+    use serde_json::json;
+    let rows=legacy_rows(install,cursor)?;
+    if !install.join("telemetry.log/telemetry.sqlite3").try_exists().map_err(|e|e.to_string())? {
+        return Ok((json!({"state":"absent","samples":0}),String::new()));
+    }
+    let bounds=rows.first().zip(rows.last()).map(|(first,last)|[first.0,last.0]);
+    let mut out=String::new();let mut samples=0;let mut unknown=0;
+    let (mut first,mut last)=(None::<u64>,None::<u64>);
+    for (seq,received,line) in rows {
+        let value=semantic::observation(&line)?;
+        if let Some(time)=value["started_ms"].as_u64() {
+            if time>i64::MAX as u64 {return Err("legacy snapshot: invalid source time".into());}
+            first=Some(first.map_or(time,|old|old.min(time)));last=Some(last.map_or(time,|old|old.max(time)));
+        } else {unknown+=1;}
+        if since.is_some_and(|since|value["started_ms"].as_u64().is_some_and(|time|time<since)) {continue;}
+        out.push_str(&json!({"source":"legacy","seq":seq,"id":null,"received_ms":received,"observation":value}).to_string());out.push('\n');samples+=1;
+    }
+    Ok((json!({"state":"read","samples":samples,"retained_seq":bounds,"retained_ms":[first,last],"unknown_started_count":unknown,"id":"not-recorded","pruned_count":null,"unknown":"legacy-retention-not-recorded"}),out))
+}
+
+/// Read committed metadata without acquiring write permission, migration, retention or network access.
+#[tracing::instrument(name="telemetry.export",skip_all)]
+pub fn export(install:&Path,since:Option<u64>) -> Result<String,String> {
+    // Record the export boundary, not a recursive trace for each decoded telemetry row.
+    tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(),||export_snapshot(install,since))
+}
+
+fn export_snapshot(install:&Path,since:Option<u64>) -> Result<String,String> {
+    use serde_json::json;
+    let reader=coreq::telemetry::Reader::open(&install.join("telemetry.log/universal.sqlite3"))?;
+    let since_i64=since.unwrap_or(0).min(i64::MAX as u64) as i64;
+    let mut page=reader.export(since_i64,0,1024)?;
+    let mut universal=page.clone();
+    for key in ["events","after","next","more","schema"] {universal.as_object_mut().unwrap().remove(key);}
+    universal["state"]=json!("read");
+    let mut out=String::new();let mut samples=0;
+    loop {
+        for row in page["events"].as_array().ok_or("invalid telemetry export page")? {
+            let mut row=row.clone();row["source"]=json!("universal");out.push_str(&row.to_string());out.push('\n');samples+=1;
+        }
+        if page["more"]==false {break;}
+        page=reader.export(since_i64,page["next"].as_i64().ok_or("invalid telemetry export cursor")?,1024)?;
+    }
+    universal["samples"]=json!(samples);
+    let cursor=reader.import_cursor("taskq.legacy")?;
+    let (legacy,old)=legacy_export(install,since,cursor.as_deref())?;
+    drop(reader); // Source filtering and target rows share one import-cursor snapshot.
+    let header=json!({"schema":2,"coverage":"committed-import-cursor-snapshot","since_ms":since,"sources":{"universal":universal,"legacy":legacy}});
+    Ok(header.to_string()+"\n"+&out+&old)
+}
+
+fn has_legacy(install:&Path)->Result<bool,String> {
+    Ok(install.join("telemetry.log/telemetry.sqlite3").try_exists().map_err(|e|e.to_string())?
+        || legacy_text(install)?.lines().any(telemetry))
+}
+
+/// Existing service owns archive retention; never create an empty replacement legacy sink.
 pub fn prune(install: &Path, now: u64) -> Result<(), String> {
+    if !has_legacy(install)?||source::preserved(install)? {return Ok(());}
     let mut db = open(install)?;
     import(&mut db, install, now)?;
     loop {
@@ -159,8 +321,141 @@ pub fn prune(install: &Path, now: u64) -> Result<(), String> {
 mod tests {
     use super::*;
     fn dir() -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("taskq-sqlite-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
-        std::fs::create_dir_all(&d).unwrap(); d
+        let d = std::env::temp_dir().join(format!("taskq-sqlite-{}-{}", std::process::id(), crate::runtime::uuid()));
+        std::fs::create_dir(&d).unwrap(); d
+    }
+    // Chain: product migration retry -> mixed reports -> original clocks, archive and rollback reader.
+    #[test]
+    fn maintenance_migration_retries_without_duplicate_reports_or_retention_reset() {
+        let d=dir();drop(crate::profile::log_lock(&d.join("taskq.log")).unwrap());
+        let now=std::time::SystemTime::now().duration_since(std::time::SystemTime::UNIX_EPOCH).unwrap().as_millis() as u64;
+        let received=now-60_000;
+        let line=r#"taskq-profile {"op":"spawn","us":7,"error":"none","at_ms":1}"#;
+        let mut archive=open(&d).unwrap();
+        {let tx=archive.transaction().unwrap();for i in 0..1100 {
+            let stage=if i==1023 {Some(r#"taskq-stage {"project":"o/r","host":"mac","stage":"build","task":1,"attempt":1,"rt":"claude","open":true,"outcome":"unknown","error":"none","at_ms":1,"unknown":"open-stage"}"#)}
+                else if i==1024 {Some(r#"taskq-stage {"project":"o/r","host":"mac","stage":"build","task":1,"attempt":1,"rt":"claude","open":false,"outcome":"ok","error":"none","at_ms":1}"#)} else {None};
+            insert(&tx,stage.unwrap_or(line),received).unwrap();
+        }tx.commit().unwrap();}
+        checkpoint(&archive).unwrap();drop(archive);
+        let expected=crate::profile::legacy_reports(&report_input(&d).unwrap(),now).unwrap();
+        let path=d.join("telemetry.log/universal.sqlite3");drop(coreq::telemetry::Store::open(&path).unwrap());
+        let inject=Connection::open(&path).unwrap();
+        inject.execute_batch("CREATE TABLE imports(source TEXT PRIMARY KEY,cursor TEXT NOT NULL,receipt TEXT NOT NULL); CREATE TRIGGER refuse_second BEFORE UPDATE ON imports BEGIN SELECT RAISE(ABORT,'injected second batch failure'); END").unwrap();
+        assert!(migrate(&d).unwrap_err().contains("injected second batch failure"));
+        assert_eq!(crate::profile::legacy_reports(&report_input(&d).unwrap(),now).unwrap(),expected,"partly committed import double-counted history");
+        let cursor=coreq::telemetry::Reader::open(&path).unwrap().import_cursor("taskq.legacy").unwrap().unwrap();
+        assert!(cursor.ends_with(".0.1024"));
+        inject.execute_batch("DROP TRIGGER refuse_second").unwrap();drop(inject);
+        assert_eq!(migrate(&d).unwrap(),76);assert_eq!(migrate(&d).unwrap(),0);
+        assert_eq!(crate::profile::legacy_reports(&report_input(&d).unwrap(),now).unwrap(),expected);
+        let exported=export(&d,None).unwrap();let rows=exported.lines().map(|s|serde_json::from_str::<serde_json::Value>(s).unwrap()).collect::<Vec<_>>();
+        assert_eq!(rows.len(),1101);assert_eq!(rows[0]["sources"]["legacy"]["samples"],0);
+        assert!(rows[1..].iter().all(|r|r["received_ms"]==received));
+        let old=open(&d).unwrap();insert(&old,line,received+1).unwrap();checkpoint(&old).unwrap();
+        assert_eq!(report_input(&d).unwrap().lines().count(),1101,"old writer append vanished");
+        drop(old);assert_eq!(migrate(&d).unwrap(),1);
+        assert_eq!(read(&d,now).unwrap().lines().count(),1101,"compatible rollback reader lost history");
+        // Expired target records stay pruned even though the preserved archive still holds them.
+        let old=open(&d).unwrap();let seq:i64=old.query_row("SELECT max(seq) FROM records",[],|r|r.get(0)).unwrap();
+        insert(&old,line,1).unwrap();checkpoint(&old).unwrap();drop(old);
+        assert_eq!(migrate(&d).unwrap(),1);
+        assert_eq!(report_input(&d).unwrap().lines().count(),1101);
+        assert_eq!(migrate(&d).unwrap(),0);
+        assert_eq!(read(&d,now).unwrap().lines().count(),(seq+1) as usize);
+        prune(&d,now+WINDOW_MS+1).unwrap();
+        assert_eq!(read(&d,now).unwrap().lines().count(),(seq+1) as usize,"service retired the unaccepted migration source");
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    // Chain: retained semantic history + automatic observations -> read-only schema2 agent export.
+    #[test]
+    fn live_capacity_counts_retained_archive_without_deleting_it() {
+        let d=dir();drop(crate::profile::log_lock(&d.join("taskq.log")).unwrap());
+        let path=d.join("telemetry.log/universal.sqlite3");std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let live=coreq::telemetry::Store::open_bounded(&path,budget(&d,"telemetry.sqlite3").unwrap()).unwrap();
+        let before=live.storage().unwrap()["database_limit"].as_i64().unwrap();
+        let archive_count;
+        {
+            let _lock=crate::profile::log_lock(&d.join("taskq.log")).unwrap();let old=open(&d).unwrap();
+            old.execute("INSERT INTO records(retained_ms,line) VALUES(1,?1)",[r#"taskq-profile {"op":"spawn","us":1,"error":"none","at_ms":1}"#]).unwrap();
+            for _ in 0..17 {checkpoint(&old).unwrap();old.execute("INSERT INTO records(retained_ms,line) SELECT retained_ms,line FROM records",[]).unwrap();}
+            checkpoint(&old).unwrap();archive_count=old.query_row("SELECT count(*) FROM records",[],|r|r.get::<_,i64>(0)).unwrap();
+        }
+        let event=coreq::telemetry::Event::new(semantic::observation(r#"taskq-profile {"op":"spawn","us":2,"error":"none","at_ms":2}"#).unwrap()).unwrap();
+        live.append(&[event]).unwrap();let storage=live.storage().unwrap();
+        assert!(storage["database_limit"].as_i64().unwrap()<before);
+        assert!(storage["installation_accounted_bytes"].as_u64().unwrap()<=64<<20);
+        let _lock=crate::profile::log_lock(&d.join("taskq.log")).unwrap();let old=open(&d).unwrap();
+        assert_eq!(old.query_row("SELECT count(*) FROM records",[],|r|r.get::<_,i64>(0)).unwrap(),archive_count);
+        drop(old);drop(_lock);drop(live);std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn live_semantics_use_the_installed_capture_and_leave_no_legacy_sink() {
+        use tracing_subscriber::prelude::*;
+        let d=dir();std::fs::create_dir(d.join("telemetry.log")).unwrap();
+        let store=std::sync::Arc::new(coreq::telemetry::Store::open_bounded(&d.join("telemetry.log/universal.sqlite3"),budget(&d,"telemetry.sqlite3").unwrap()).unwrap());
+        let capture=coreq::telemetry::capture::Capture::new(store.clone(),"taskq","test").unwrap();
+        let ops=(0..1200).map(|mut i|{let mut route=String::from("route");for _ in 0..4 {route.push((b'a'+(i%26) as u8) as char);i/=26;}(format!("GET issues/N/{route}"),1)}).collect::<std::collections::BTreeMap<_,u64>>();
+        let bytes=serde_json::to_vec(&ops).unwrap().len();assert!(bytes>16<<10&&bytes<LINE_MAX-1024);
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(capture.clone()),|| {
+            let _action=tracing::info_span!("fixture.command").entered();
+            record(Sample::legacy(r#"taskq-stage {"stage":"claim","task":1,"attempt":2,"rt":"other","us":1,"outcome":"ok","error":"none","at_ms":1,"unknown":"no-model"}"#).unwrap()).unwrap();
+            for line in [
+                r#"taskq-profile {"op":"spawn","us":1,"error":"none","at_ms":1}"#,
+                r#"taskq-board {"op":"close","us":12,"outcome":"failed","error":"http4xx","remaining":null,"at_ms":1}"#,
+                r#"taskq-transition {"project":"other","task":1,"entry":2,"from":"doing","to":"ask","prev_s":null,"rt":null,"host":null,"at_ms":1}"#,
+            ] {record(Sample::legacy(line).unwrap()).unwrap();}
+            crate::requests::record("worker service status",&ops);
+        });
+        capture.flush().unwrap();
+        assert!(!d.join("telemetry.log/telemetry.sqlite3").exists(),"live semantic events must use the installed writer");
+        let rows=store.export_kinds(&["stage"],0,0,1024).unwrap();
+        let event=&rows["events"][0]["observation"];
+        assert_eq!(event["version"],"test");assert!(event["trace"].is_string());
+        let report=report_samples(&d,semantic::KINDS).unwrap();
+        assert_eq!(report.len(),5);
+        for kind in semantic::KINDS {
+            assert!(report.iter().any(|sample|sample.kind()==*kind),"{kind}");
+        }
+        let requests=report.iter().find(|sample|sample.kind()=="requests").unwrap().canonical().unwrap();
+        assert_eq!(requests["ops"],serde_json::to_value(&ops).unwrap());
+        assert!(crate::requests::sources_samples(&report,crate::profile::now_ms().unwrap()).contains("worker service status"));
+        let parts=store.export_kinds(&["requests"],0,0,1024).unwrap();let parts=parts["events"].as_array().unwrap();assert!(parts.len()>1);
+        assert!(parts.iter().all(|part|part["observation"]["group_id"].is_string()));
+        drop(capture);
+        let db=Connection::open(d.join("telemetry.log/universal.sqlite3")).unwrap();
+        assert_eq!(db.execute("DELETE FROM events WHERE id=?1",[parts.last().unwrap()["id"].as_str().unwrap()]).unwrap(),1);drop(db);
+        assert!(report_samples(&d,&["requests"]).err().unwrap().contains("incomplete count summary"));
+        assert!(crate::profile::report(&d).contains("Profile: unknown (telemetry incomplete count summary)"));
+        drop(store);std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn export_preserves_history_unknowns_and_refuses_unimported_tail() {
+        let d=dir();
+        let old="taskq-profile {\"op\":\"spawn\",\"us\":7,\"error\":\"none\",\"at_ms\":1}\n";
+        let unknown="taskq-profile {\"op\":\"spawn\",\"us\":8,\"error\":\"none\",\"at_ms\":null}\n";
+        drop(crate::profile::log_lock(&d.join("taskq.log")).unwrap());
+        append(&d,old,1).unwrap();
+        append(&d,unknown,1).unwrap();
+        let store=coreq::telemetry::Store::open(&d.join("telemetry.log/universal.sqlite3")).unwrap();
+        store.append(&[coreq::telemetry::Event::new(serde_json::json!({"product":"taskq","version":"1","operation":"resume","kind":"method","trace":"t","span":"s","started_ms":2000,"outcome":"failed","error":"returned-error"})).unwrap()]).unwrap();
+        drop(store);
+        let archive=d.join("telemetry.log/telemetry.sqlite3");let before=std::fs::read(&archive).unwrap();
+        let output=export(&d,Some(1000)).unwrap();
+        let rows:Vec<serde_json::Value>=output.lines().map(|s|serde_json::from_str(s).unwrap()).collect();
+        assert_eq!(rows[0]["sources"]["universal"]["samples"],1);assert_eq!(rows[0]["sources"]["legacy"]["samples"],1);
+        assert_eq!(rows[1]["observation"]["operation"],"resume");
+        assert_eq!(rows[2]["source"],"legacy");assert_eq!(rows[2]["id"],serde_json::Value::Null);
+        assert_eq!(rows[2]["observation"]["started_ms"],serde_json::Value::Null);
+        assert_eq!(rows[2]["observation"]["unknown"]["started_ms"],"not-recorded");
+        assert_eq!(std::fs::read(&archive).unwrap(),before);
+        std::fs::write(d.join("taskq.log"),old).unwrap();
+        assert!(export(&d,None).unwrap_err().contains("awaits service import"));
+        assert_eq!(std::fs::read(&archive).unwrap(),before);assert_eq!(std::fs::read_to_string(d.join("taskq.log")).unwrap(),old);
+        std::fs::remove_dir_all(d).unwrap();
     }
     #[test]
     fn legacy_retry_append_rotation_and_identical_events() {
@@ -243,15 +538,18 @@ mod tests {
         std::fs::remove_dir_all(d).unwrap();
     }
     #[test]
-    fn pressure_prunes_oldest_and_keeps_total_disk_bound() {
-        let d = dir();
+    fn archive_pressure_refuses_growth_without_deleting_history() {
+        let d=dir();let mut accepted=0;
         for n in 0..600 {
-            append(&d, &format!("{n}:{}\n", "x".repeat(60 << 10)), 100).unwrap();
-            let bytes: u64 = std::fs::read_dir(d.join("telemetry.log")).unwrap().map(|e| e.unwrap().metadata().unwrap().len()).sum();
-            assert!(bytes < 64 << 20, "{bytes}");
+            match append(&d,&format!("{n}:{}\n","x".repeat(60<<10)),100) {
+                Ok(())=>accepted+=1,
+                Err(error)=>{assert!(error.contains("source archive preserved"),"append {n} at {}: {error}",d.display());break;}
+            }
+            let bytes:u64=std::fs::read_dir(d.join("telemetry.log")).unwrap().map(|e|e.unwrap().metadata().unwrap().len()).sum();
+            assert!(bytes<64<<20);
         }
-        let text = read(&d,100).unwrap();
-        assert!(!text.starts_with("0:")); assert!(text.lines().last().unwrap().starts_with("599:"));
+        assert!(accepted>0&&accepted<600);
+        let text=read(&d,100).unwrap();assert_eq!(text.lines().count(),accepted);assert!(text.starts_with("0:"));
         std::fs::remove_dir_all(d).unwrap();
     }
     #[test]

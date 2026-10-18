@@ -19,6 +19,11 @@ assert(q.task(p,{...row,title:'<script>alert(1)</script>',url:'javascript:alert(
 assert(!q.task(p,{...row,url:'javascript:alert(1)'}).includes('href="javascript:'));
 assert(!q.task(p,{...row,local_session:false}).includes('codex://'));
 assert(q.task(p,{...row,local_session:false,session_reason:'Codex session opens only on WIN'}).includes('title="Codex session opens only on WIN">Session unavailable'));
+// R6/R12: the native snapshot's unresolved execution must remain visible in every shared task block.
+const waiting=require('./fixtures/status-snapshot.json').tasks.find(t=>t.n===2),waitRow=q.task(p,waiting);
+assert(waitRow.includes(waiting.execution_wait),'unknown execution reason is visible, not only a missing session link');
+assert(waitRow.indexOf(waiting.execution_wait)<waitRow.indexOf('tqp-task-title'),'execution status stays with metadata');
+assert(!q.task(p,{...row,execution_wait:'<script>secret</script>'}).includes('<script>'),'execution reason is escaped');
 // Chain: #1204 remote Claude row. Risk: the account-scoped link is dropped, or the remote mark follows the runtime mark or adds text.
 const remoteClaude=q.task(p,{...row,runtime:'claude',local_session:false,session_url:'https://claude.ai/code/session_014abc'});
 assert(remoteClaude.includes('href="https://claude.ai/code/session_014abc"'));
@@ -40,8 +45,8 @@ assert.equal(Object.keys(manifest.icons).length,16);
 for(const [file,hash] of Object.entries(manifest.files))assert.equal(crypto.createHash('sha256').update(fs.readFileSync(file,'utf8').replace(/\r\n/g,'\n')).digest('hex'),hash,file);
 for(const [name,hash] of Object.entries(manifest.icons))assert.equal(crypto.createHash('sha256').update(q.assets[name]).digest('hex'),hash,name);
 for(const name of ['github','gitlab','claude','openai'])assert.equal(q.assets[name],fs.readFileSync('docs/design/assets/'+name+'.svg','utf8').replace(/\r\n/g,'\n'));
-const tray=fs.readFileSync('src/tray.html','utf8'),rust=fs.readFileSync('src/tray.rs','utf8'),release=fs.readFileSync('.github/workflows/release.yml','utf8');
-for(const asset of ['JS','CSS'])assert(tray.includes('{{PROJECT_BLOCKS_'+asset+'}}'));
-for(const file of ['project-blocks.js','project-blocks.css'])assert(rust.includes('include_str!("'+file+'")')&&release.includes('cp src/'+file));
-assert(tray.includes('TaskqProjectBlocks.task(')&&tray.includes('TaskqProjectBlocks.summary(')&&tray.includes('TaskqProjectBlocks.aggregate(')&&tray.includes('TaskqProjectBlocks.handle('));
+const tray=fs.readFileSync('build/web/tray.html','utf8');
+const sandbox={setTimeout,clearTimeout,crypto:require('node:crypto').webcrypto};require('node:vm').createContext(sandbox);
+require('node:vm').runInContext(fs.readFileSync('build/web/project-blocks.js','utf8'),sandbox);
+assert.deepEqual(JSON.parse(JSON.stringify(sandbox.TaskqProjectBlocks.observation([p]))),JSON.parse(JSON.stringify(q.observation([p]))));
 console.log('PASS shared counts, dedup/conflict/partial/Closed, safe links, local/remote sessions, independent navigation, provider assets, provenance and native/release wiring');

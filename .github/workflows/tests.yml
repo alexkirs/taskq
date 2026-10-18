@@ -1,59 +1,78 @@
-# Main pushes and PR updates run tests; updates require trusted exact-SHA success.
+# Selected checks share one command; tag/main releases require this exact-source result.
 name: tests
 on:
   workflow_dispatch:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
 permissions:
   contents: read
+env:
+  CHECK_BASE: ${{ github.event.pull_request.base.sha || github.event.before || 'HEAD^' }}
+  CHECK_FULL: ${{ github.event_name == 'workflow_dispatch' || github.ref_type == 'tag' }}
 jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      scope: ${{ steps.plan.outputs.scope }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: plan
+        run: python3 scripts/check.py --plan >> "$GITHUB_OUTPUT"
+      - run: git diff --check
+      - run: python3 scripts/check.test.py
   rust:
+    needs: plan
+    if: needs.plan.outputs.scope != 'docs'
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 16
     steps:
       - uses: actions/checkout@v4
-      - run: rustup default stable
-      - run: cargo test --locked
-      - run: node tests/tray-reply.test.cjs
-      - run: node tests/tray-home-ai.test.cjs
-      - run: node tests/tray-home-proposal.test.cjs
-      - run: node tests/tray-next.test.cjs
-      - run: node tests/tray-navigation.test.cjs
-      - run: node tests/tray-press.test.cjs
-      - run: node tests/tray-incidents.test.cjs
-      - run: node tests/answer-card.test.cjs
-      - run: node tests/tray-answer.test.cjs
-      - run: node tests/project-blocks.test.cjs
-      - run: node tests/finding-composer.test.cjs
-      - run: node tests/resource-controls.test.cjs
-      - run: node tests/tray-resources.test.cjs
-      - run: cargo run --locked -- selftest
-        env:
-          TASKQ_SELFTEST_OFFLINE: '1'
-          TASKQ_INCIDENT_REPORTS: 'off'
-  windows-gnu: # GNU loads the DLL; the Windows MSVC matrix uses a static loader.
+        with:
+          fetch-depth: 0
+      - run: python3 scripts/check.py
+  windows-gnu:
+    needs: plan
+    if: needs.plan.outputs.scope == 'full'
     runs-on: windows-latest
+    timeout-minutes: 16
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install stable-x86_64-pc-windows-gnu
-      - run: cargo +stable-x86_64-pc-windows-gnu test --locked --test windows_install
-  shots: # README screenshots: stale against the UI sources warns (exit 2), any other check.sh error fails (taskq.md R12)
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: cargo +stable-x86_64-pc-windows-gnu test --locked --bin taskq platform::tests::installed_windows_release_starts_without_build_paths -- --exact --show-output
+  shots:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - run: docs/shots/check.test.sh
-      - run: .github/release-tag.test.sh
       - run: |
           rc=0; docs/shots/check.sh || rc=$?
-          [ $rc = 2 ] && { echo '::warning::README shots are stale; run the README shots workflow (dispatch) or wait for the next release tag'; exit 0; }
+          [ $rc = 2 ] && { echo '::warning::README shots are stale; run the README shots workflow'; exit 0; }
           exit $rc
-  tests: # required status check name; gates on the rust matrix and the shots check
-    needs: [rust, windows-gnu, shots]
+  tests:
+    needs: [plan, rust, windows-gnu, shots]
+    if: always()
     runs-on: ubuntu-latest
     steps:
-      - run: echo ok
+      - env:
+          PLAN: ${{ needs.plan.result }}
+          SCOPE: ${{ needs.plan.outputs.scope }}
+          RUST: ${{ needs.rust.result }}
+          GNU: ${{ needs.windows-gnu.result }}
+          SHOTS: ${{ needs.shots.result }}
+        run: |
+          test "$PLAN" = success && test "$SHOTS" = success
+          case "$SCOPE" in
+            docs) test "$RUST" = skipped && test "$GNU" = skipped ;;
+            web) test "$RUST" = success && test "$GNU" = skipped ;;
+            full) test "$RUST" = success && test "$GNU" = success ;;
+            *) exit 1 ;;
+          esac

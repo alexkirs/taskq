@@ -87,13 +87,13 @@ fn fault<'a>(code: &'a str, site: &'a str, runtime: &'a str, board: &'a str,
 }
 
 pub fn detect(code: &str, site: &str, runtime: &str, fields: &[&str], evidence: &[&str]) {
-    let site: &str = &site.replace('\\', "/"); // Windows file!() joins submodule paths with '\'
+    let site: &str = &coreq::telemetry::capture::original_source(site, crate::COREQ_TELEMETRY_SOURCE_ROOT, crate::COREQ_TELEMETRY_SOURCE_BASE);
     #[cfg(test)]
     {
         let mut fingerprint_fields = vec![site];
         fingerprint_fields.extend_from_slice(fields);
         let f = fault(code, site, runtime, "github", &fingerprint_fields, evidence, "0123456789ab");
-        assert!(safe(&f), "unsafe catalog detection {code}");
+        assert!(safe(&f), "unsafe catalog detection {code}: site={site}, fields={fingerprint_fields:?}, revision={}, contract={}", f.revision, f.contract);
         assert!(coreq::incident::check(&coreq::incident::build(&crate::platform::tool(&crate::platform::default_install()), &f,
             "11111111-1111-4111-8111-111111111111")).is_ok());
         if let Some(root) = std::env::var_os("TASKQ_TEST_PANIC_REPORT") {
@@ -163,7 +163,7 @@ pub fn install_panic_hook() {
             }
             let class = panic_class(msg);
             let location = info.location().map(|l| {
-                let file = l.file().replace('\\', "/");
+                let file = coreq::telemetry::capture::original_source(l.file(), crate::COREQ_TELEMETRY_SOURCE_ROOT, crate::COREQ_TELEMETRY_SOURCE_BASE);
                 file.strip_prefix("src/").map(|f| format!("src/{f}:{}", l.line()))
                     .filter(|s| site(s)).unwrap_or_else(|| "dep".into())
             }).unwrap_or_else(|| "dep".into());

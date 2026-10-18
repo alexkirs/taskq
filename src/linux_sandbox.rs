@@ -44,7 +44,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         .ok_or("linux sandbox: explicit project grant required")?;
     if g.mode != *mode && !(g.mode == "workspace" && mode == "restricted") { return Err("linux sandbox: grant changed or does not permit this mode".into()); }
     let bin = Path::new(&args[3]).canonicalize().map_err(|e| e.to_string())?;
-    if bin != crate::runtime::which("codex").canonicalize().map_err(|e| e.to_string())? || args[4] != "exec" || args[5..].iter().any(|a| ["danger-full-access", "--yolo", "--dangerously-bypass-approvals-and-sandbox"].contains(&a.as_str())) {
+    if bin != crate::runtime::codex_native(crate::runtime::which("codex"))?.canonicalize().map_err(|e| e.to_string())? || args[4] != "exec" || args[5..].iter().any(|a| ["danger-full-access", "--yolo", "--dangerously-bypass-approvals-and-sandbox"].contains(&a.as_str())) {
         return Err("linux sandbox: only bounded Codex exec allowed".into());
     }
     let home = PathBuf::from(std::env::var_os("HOME").ok_or("linux sandbox: HOME missing")?);
@@ -72,6 +72,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     // No sudo/setid escape, even when the host account has broader privileges.
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 { return Err(std::io::Error::last_os_error().to_string()); }
     c.args(["--setenv", "TMPDIR", "/tmp", "--chdir"]).arg(&root).arg("--").arg(bin).args(&args[4..]);
+    coreq::telemetry::capture::before_exec();
     Err(format!("linux sandbox: {}", c.exec()))
 }
 
@@ -125,7 +126,7 @@ mod tests {
         std::fs::write(root.join("AGENTS.md"), "Read taskq.md; disposable qualification only.\n").unwrap();
         let attempt = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() * 2;
         for (i, role) in ["worker", "reviewer"].iter().enumerate() {
-            let mut l = Launch { task: 1, title: "Owner-authorized isolated boundary qualification. Follow fixture taskq.md; no board or publication.".into(), attempt: attempt + i as u64, role: role.to_string(), rt: "codex".into(), session: crate::runtime::uuid(), url: "https://github.com/taskqorg/taskq".into(), resume: None };
+            let mut l = Launch { execution: None, task: 1, title: "Owner-authorized isolated boundary qualification. Follow fixture taskq.md; no board or publication.".into(), attempt: attempt + i as u64, role: role.to_string(), rt: "codex".into(), session: crate::runtime::uuid(), url: "https://github.com/taskqorg/taskq".into(), resume: None };
             for turn in 0..2 {
                 std::fs::write(root.join("stage"), turn.to_string()).unwrap();
                 std::fs::remove_file(root.join("proof.json")).ok();

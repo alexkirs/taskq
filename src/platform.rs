@@ -4,7 +4,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub use coreq::service::{Unit, run_all, unit, write_unit};
+#[cfg(test)] pub use coreq::service::Unit;
 pub use coreq::{Tool, quiet, write_atomic};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -14,11 +14,16 @@ pub const RELEASE_REPO: &str = "taskqorg/taskq";
 
 /// taskq as a coreq tool installed in `install`.
 pub fn tool(install: &Path) -> Tool {
-    Tool { install: install.into(), fault: Some(crate::incident::launcher), ..Tool::new("taskq", "TaskQ", RELEASE_REPO, VERSION) }
+    Tool { name:"taskq",title:"TaskQ",repo:RELEASE_REPO,version:VERSION,install:install.into(),fault:Some(crate::incident::launcher) }
 }
 
 pub fn default_install() -> PathBuf {
-    Tool::new("taskq", "TaskQ", RELEASE_REPO, VERSION).install
+    let aliases:&[&str]=if cfg!(windows) {&["taskq-tray.exe"]}else{&[]};
+    coreq::install_dir("taskq","TaskQ",aliases).unwrap_or_else(|error| {
+        use std::io::Write;
+        let _=writeln!(std::io::stderr(),"taskq: {error}; set TASKQ_INSTALL explicitly to inspect or repair this installation");
+        coreq::telemetry::capture::exit(1)
+    })
 }
 
 static SERVICE_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -79,18 +84,38 @@ pub fn error_text(msg: &str, root: Option<&Path>) -> String {
     format!("Error: {}\nNext: {next}", crate::compact(msg, 153))
 }
 
+/// Complete bounded dependency output, including nonzero exits whose receipt the caller must inspect.
+pub fn output(name: &'static str, command: &mut std::process::Command, budget: std::time::Duration) -> Result<std::process::Output,String> {
+    match coreq::process::output(name,command,budget) {
+        Ok(output) | Err(coreq::process::Failure::Exit(output)) => Ok(output),
+        Err(error) => Err(format!("{name}: {error}; outcome unknown")),
+    }
+}
+
 /// § 8 update steps (coreq), then the sweep: Ok(Some(version)) when a new release became current; with `check`, when
 /// one is available.
 pub fn update(install: &Path, check: bool) -> Result<Option<String>, String> {
     let _lock = update_lock(install)?;
+    transition_ready(install)?;
     crate::profile::measure("update", || update_inner(install, check))
 }
 
-fn update_lock(install: &Path) -> Result<fs::File, String> {
+pub(crate) fn update_lock(install: &Path) -> Result<coreq::file_lock::Lock, String> {
     fs::create_dir_all(install).map_err(|e| e.to_string())?;
-    let f = fs::OpenOptions::new().create(true).truncate(false).write(true).open(install.join("update.lock")).map_err(|e| e.to_string())?;
-    f.try_lock().map_err(|e| format!("update busy or lock unavailable: {e}"))?;
-    Ok(f)
+    coreq::file_lock::try_lock(&install.join("update.lock")).map_err(|e| format!("update busy or lock unavailable: {e}"))
+}
+
+/// An interrupted registry/install transition retains admission and active release selection together.
+pub(crate) fn transition_ready(install:&Path)->Result<(),String> {
+    let prepare=format!("{}.pending",crate::host::INSTALL_PENDING);
+    for name in ["projects.pending",crate::host::INSTALL_PENDING,prepare.as_str()] {
+        match fs::symlink_metadata(install.join(name)) {
+            Err(e) if e.kind()==std::io::ErrorKind::NotFound=>{},
+            Err(e)=>return Err(format!("installation transition unknown: {e}; update held")),
+            Ok(_)=>return Err(format!("{name} retained; installation reconciliation required before update")),
+        }
+    }
+    Ok(())
 }
 
 fn update_inner(install: &Path, check: bool) -> Result<Option<String>, String> {
@@ -106,20 +131,72 @@ fn update_inner(install: &Path, check: bool) -> Result<Option<String>, String> {
     Ok(v)
 }
 
-/// § 8 step 5: coreq `install_self` copies over an existing release binary in place, and macOS then kills every later
-/// exec of it (`OS_REASON_CODESIGNING`), so a second `service install` of one build rolled it back (#973). Unlinking
-/// first makes the copy a new file; running processes keep the old one.
-pub fn install_self(t: &Tool) -> Result<(), String> {
-    let (me, dst) = (std::env::current_exe().map_err(|e| e.to_string())?, t.release_exe(t.version));
-    #[cfg(all(windows, target_env = "gnu"))]
-    install_webview2_loader(t)?;
-    if fs::canonicalize(&me).ok() != fs::canonicalize(&dst).ok() {
-        // ponytail: a start in the unlink-to-copy gap fails once; coreq writing tmp + rename would close it
-        let _ = fs::remove_file(&dst);
+/// Freeze the source before local signing; an immutable release retains the original source binding.
+pub fn prepare_install(t:&Tool)->Result<String,String> {
+    let source=fs::read(std::env::current_exe().map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
+    let hash=|bytes:&[u8]|->String {ring::digest::digest(&ring::digest::SHA256,bytes).as_ref().iter().map(|b|format!("{b:02x}")).collect()};
+    let source_hash=hash(&source);
+    let binding=t.release_exe(t.version).with_file_name("install-source");
+    match fs::symlink_metadata(&binding) {
+        Ok(meta) if meta.is_file()&&meta.len()<=256=>{},Ok(_)=>return Err("prepared source binding unsupported; kept".into()),
+        Err(e) if e.kind()==std::io::ErrorKind::NotFound=>{},Err(e)=>return Err(e.to_string()),
     }
-    coreq::update::install_self(t)?;
-    #[cfg(target_os = "macos")]
-    sign_copies(t, t.version);
+    match fs::read_to_string(&binding) {
+        Ok(old)=>{
+            let bound:Vec<_>=old.lines().collect();
+            if bound.len()!=2||bound.iter().any(|v|v.len()!=64||!v.bytes().all(|b|b.is_ascii_hexdigit()&&!b.is_ascii_uppercase())) {return Err("prepared release source binding invalid; kept".into());}
+            match fs::read(t.release_exe(t.version)) {
+                Ok(bytes)=>{
+                    let candidate_hash=hash(&bytes);
+                    if bound[1]!=candidate_hash||(bound[0]!=source_hash&&candidate_hash!=source_hash) {return Err("prepared release source differs; use a new version, existing file kept".into());}
+                    coreq::update::prepare_install(t,&bytes)?;
+                    #[cfg(all(windows,target_env="gnu"))] prepare_webview2_loader(t)?;
+                    return Ok(candidate_hash);
+                },
+                Err(e) if e.kind()==std::io::ErrorKind::NotFound&&bound[0]==source_hash=>{},Err(e)=>return Err(e.to_string()),
+            }
+        },
+        Err(e) if e.kind()==std::io::ErrorKind::NotFound=>{},Err(e)=>return Err(e.to_string()),
+    }
+    if fs::read(t.release_exe(t.version)).ok().as_deref()==Some(source.as_slice()) {
+        coreq::update::prepare_install(t,&source)?;
+        coreq::write_durable(&binding,format!("{source_hash}\n{source_hash}\n"))?;
+        #[cfg(all(windows,target_env="gnu"))] prepare_webview2_loader(t)?;
+        return Ok(source_hash);
+    }
+    #[cfg(target_os="macos")]
+    let source={
+        let scratch=std::env::temp_dir().join(format!("taskq-install-sign-{}",crate::runtime::uuid()));
+        fs::write(&scratch,&source).map_err(|e|e.to_string())?;
+        let result=codesign(SIGNING_IDENTITY,&scratch,"org.taskq.taskq").and_then(|signed| {
+            if !signed {log("signing: local identity absent; candidate keeps its original signature");}
+            fs::read(&scratch).map_err(|e|e.to_string())
+        });
+        let cleanup=fs::remove_file(&scratch).map_err(|e|format!("signing scratch cleanup: {e}"));
+        let bytes=result?;cleanup?;bytes
+    };
+    let candidate=hash(&source);
+    match fs::symlink_metadata(t.release_exe(t.version)) {
+        Ok(meta) if meta.is_file()&&fs::read(t.release_exe(t.version)).map_err(|e|e.to_string())?==source=>{},
+        Ok(_)=>return Err("prepared release differs; use a new version, existing file kept".into()),
+        Err(e) if e.kind()==std::io::ErrorKind::NotFound=>{},Err(e)=>return Err(e.to_string()),
+    }
+    // The source binding precedes immutable publication, so a crash cannot leave an unbound signed candidate.
+    fs::create_dir_all(binding.parent().ok_or("prepared release directory missing")?).map_err(|e|e.to_string())?;
+    coreq::write_durable(&binding,format!("{source_hash}\n{candidate}\n"))?;
+    coreq::update::prepare_install(t,&source)?;
+    #[cfg(all(windows,target_env="gnu"))] prepare_webview2_loader(t)?;
+    Ok(candidate)
+}
+
+/// Activate the immutable executable and its prepared GNU loader before any native start.
+pub fn activate_install(t:&Tool)->Result<(),String> {
+    coreq::update::activate_install(t)?;
+    #[cfg(all(windows,target_env="gnu"))] {
+        let bytes=fs::read(t.release_exe(t.version).with_file_name("WebView2Loader.dll")).map_err(|e|e.to_string())?;
+        let target=t.install.join("WebView2Loader.dll");
+        if fs::read(&target).ok().as_deref()!=Some(bytes.as_slice()) {coreq::write_durable(&target,bytes)?;}
+    }
     Ok(())
 }
 
@@ -132,11 +209,11 @@ pub const SIGNING_IDENTITY: &str = "TaskQ Local Signing";
 #[cfg(target_os = "macos")]
 pub fn codesign(identity: &str, path: &Path, id: &str) -> Result<bool, String> {
     use std::process::Command;
-    let ids = Command::new("security").args(["find-identity", "-p", "codesigning"]).output().map_err(|e| format!("security: {e}"))?;
+    let ids = coreq::process::output("signing.identity", Command::new("security").args(["find-identity", "-p", "codesigning"]), std::time::Duration::from_secs(30)).map_err(|e| format!("security: {e}"))?;
     let Some(sha1) = identity_hash(identity, &ids)? else { return Ok(false) };
-    let run = |c: &mut Command| match c.output() {
-        Ok(o) if o.status.success() => Ok(()),
-        Ok(o) => Err(format!("{}: {}", path.display(), String::from_utf8_lossy(&o.stderr).trim())),
+    let run = |c: &mut Command| match coreq::process::output("signing.command", c, std::time::Duration::from_secs(30)) {
+        Ok(_) => Ok(()),
+        Err(coreq::process::Failure::Exit(o)) => Err(format!("{}: {}", path.display(), String::from_utf8_lossy(&o.stderr).trim())),
         Err(e) => Err(format!("{}: {e}", path.display())),
     };
     run(Command::new("codesign").args(["-f", "-s", &sha1, "-i", id]).arg(path))?;
@@ -177,7 +254,7 @@ fn sign_copies(t: &Tool, v: &str) {
 
 /// GNU links the DLL; MSVC release artifacts link the loader statically.
 #[cfg(all(windows, target_env = "gnu"))]
-fn install_webview2_loader(t: &Tool) -> Result<(), String> {
+fn loaded_webview2_loader() -> Result<Vec<u8>, String> {
     use std::os::windows::ffi::OsStringExt;
     use windows::{core::w, Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW}};
     let mut path = vec![0u16; 32768];
@@ -189,30 +266,35 @@ fn install_webview2_loader(t: &Tool) -> Result<(), String> {
     if len == 0 || len >= path.len() {
         return Err("cannot locate loaded WebView2Loader.dll".into());
     }
-    let bytes = fs::read(PathBuf::from(std::ffi::OsString::from_wide(&path[..len]))).map_err(|e| e.to_string())?;
-    for folder in [t.release_exe(t.version).parent().unwrap(), t.install.as_path()] {
-        fs::create_dir_all(folder).map_err(|e| e.to_string())?;
-        let dst = folder.join("WebView2Loader.dll");
-        // Repeated installs must not rewrite a loader already mapped by a running launcher.
-        match fs::read(&dst) {
-            Ok(old) if old == bytes => continue,
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(format!("{}: {e}", dst.display())),
-            _ => {}
-        }
-        let tmp = dst.with_extension("dll.tmp");
-        fs::write(&tmp, &bytes).and_then(|_| fs::rename(&tmp, &dst)).map_err(|e| format!("{}: {e}", dst.display()))?;
+    fs::read(PathBuf::from(std::ffi::OsString::from_wide(&path[..len]))).map_err(|e|e.to_string())
+}
+
+#[cfg(all(windows,target_env="gnu"))]
+fn prepare_webview2_loader(t:&Tool)->Result<(),String> {
+    let bytes=loaded_webview2_loader()?;
+    let target=t.release_exe(t.version).with_file_name("WebView2Loader.dll");
+    match fs::symlink_metadata(&target) {
+        Ok(meta) if meta.is_file()&&fs::read(&target).map_err(|e|e.to_string())?==bytes=>Ok(()),
+        Ok(_)=>Err("prepared WebView2 loader differs; existing release kept, use a new version".into()),
+        Err(e) if e.kind()==std::io::ErrorKind::NotFound=>coreq::write_durable(&target,bytes),
+        Err(e)=>Err(e.to_string()),
     }
-    Ok(())
 }
 
 /// Service step 7 also catches a release made current by another service on this install.
 pub fn service_update(install: &Path) -> Result<Option<String>, String> {
+    let _lock=update_lock(install)?;
+    transition_ready(install)?;
+    crate::profile::measure("update",||service_update_locked(install))
+}
+
+fn service_update_locked(install:&Path)->Result<Option<String>,String> {
     if let Some(v) = tool(install).current().filter(|v| coreq::update::newer(v, VERSION)) {
         log!("current is {v}; restarting");
         return Ok(Some(v));
     }
-    if update(install, true)?.is_some() {
-        let v = update(install, false)?;
+    if update_inner(install, true)?.is_some() {
+        let v = update_inner(install, false)?;
         if let Some(v) = &v {
             log!("updated to {v}; restarting");
         }
@@ -237,15 +319,19 @@ pub fn sweep(install: &Path, shim: &Path) {
     let read = |f: &str| fs::read_to_string(install.join(f)).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     let mut keep: Vec<String> = [read("current"), read("previous"), Some(VERSION.into())].into_iter().flatten().collect();
     // a corrupt status.json leaves its project's version unknown: every release stays (§ 4 Data)
-    let mut unknown = false;
-    for root in fs::read_to_string(install.join("projects")).unwrap_or_default().lines().filter(|l| !l.is_empty()) {
-        match crate::data::json(&Path::new(root).join(".taskq/status.json")) {
-            Ok(st) => keep.extend(st.as_ref().and_then(|s| s["version"].as_str()).map(String::from)),
-            Err(_) => unknown = true,
-        }
+    let registry=coreq::telemetry::capture::operation("update.projects",||crate::host::project_paths(install),|_|"registry-unreadable");
+    let mut unknown=registry.is_err();
+    for root in registry.unwrap_or_default() {
+        let version=coreq::telemetry::capture::operation("update.project-version",|| {
+            crate::data::json(&root.join(".taskq/status.json"))?.as_ref()
+                .and_then(|st|st["version"].as_str()).filter(|v|!v.is_empty()).map(String::from)
+                .ok_or_else(||"project version unknown".to_string())
+        },|_|"version-unknown");
+        match version {Ok(version)=>keep.push(version),Err(_)=>unknown=true}
     }
     let owned = |n: &str| {
-        ["releases", "current", "previous", "projects", "token", "installation-id", "connection", "taskq", "taskq.exe", "WebView2Loader.dll", "taskq-tray.exe", "TaskQ.app", "capacity", "resources", "windows-native", crate::policy::FILE, "taskq-profile.lock", "hold", "admission.json", "admission.lock", "update.lock"].contains(&n)
+        ["releases", "current", "previous", "projects", "token", "installation-id", "connection", "taskq", "taskq.exe", "WebView2Loader.dll", "taskq-tray.exe", "TaskQ.app", "capacity", "resources", "windows-native", crate::policy::FILE, "taskq-profile.lock", "hold", "admission.json", "admission.lock", "update.lock", "host.json", "host.json.pending", "host-policy-migration", "native", "service", "service.lock", "poke", "restart", "update", "projects.lock", "projects.pending", "rollback-floor"].contains(&n)
+            ||n==crate::host::INSTALL_PENDING||n.strip_suffix(".pending")==Some(crate::host::INSTALL_PENDING)
             || n.ends_with(".log") || n.ends_with(".tmp") || n.starts_with("tray") || (n.starts_with("TaskQ-") && n.ends_with(".xml"))
     };
     let gone = |p: &Path| {
@@ -435,6 +521,35 @@ mod tests {
     use super::*;
 
     // Chain: § 4 service log lines. Risk: a line without its UTC time, or one message split over lines.
+    // Chain: short adapter -> silent/nonzero dependency -> bounded response and private failure evidence.
+    #[test]
+    fn short_dependency_outputs_are_bounded_and_preserve_nonzero_receipts() {
+        crate::with_test_capture(|store,_| {
+            let fixture=|mode:&str| {
+                let mut command=std::process::Command::new(std::env::current_exe().unwrap());
+                command.args(["--exact","platform::tests::short_dependency_child","--ignored","--nocapture"]).env("TASKQ_SHORT_DEPENDENCY",mode);command
+            };
+            let began=std::time::Instant::now();
+            let error=output("fixture.silent",&mut fixture("silent"),std::time::Duration::from_millis(100)).unwrap_err();
+            assert!(error.contains("timeout")&&error.contains("unknown"));
+            assert!(began.elapsed()<std::time::Duration::from_secs(2));
+            let receipt=output("fixture.nonzero",&mut fixture("nonzero"),std::time::Duration::from_secs(5)).unwrap();
+            assert_eq!(receipt.status.code(),Some(7));
+            assert!(String::from_utf8_lossy(&receipt.stderr).contains("private dependency receipt"));
+            tracing::dispatcher::get_default(|d|d.downcast_ref::<coreq::telemetry::capture::Capture>().unwrap().flush().unwrap());
+            let export=store.export(0,0,1024).unwrap();let rows=export["events"].as_array().unwrap();
+            for class in ["timeout","exit"] {assert!(rows.iter().any(|r|r["observation"]["error"]==class));}
+            assert!(!export.to_string().contains("private dependency receipt"));
+        });
+    }
+
+    #[test]
+    #[ignore="owned silent/nonzero subprocess for the short dependency adapter"]
+    fn short_dependency_child() {
+        if std::env::var("TASKQ_SHORT_DEPENDENCY").unwrap()=="nonzero" {eprintln!("private dependency receipt");std::process::exit(7);}
+        loop {std::thread::park();}
+    }
+
     #[test]
     fn service_log_lines_start_with_utc_time_and_fold() {
         let at = crate::board::iso("2026-10-14T04:27:05Z").unwrap();
@@ -481,8 +596,7 @@ mod tests {
         assert!(!install.join("releases").exists());
         assert!(!coreq::update::newer(next, &tool(&install).current().unwrap()));
         assert_eq!(fs::read_to_string(install.join("current")).unwrap().trim(), next);
-        fs::remove_file(install.join("current")).unwrap();
-        fs::remove_dir(&install).unwrap();
+        fs::remove_dir_all(&install).unwrap();
     }
 
     // Chain: incident update.smoke. Risk: download failures reported as smoke failures.
@@ -513,23 +627,59 @@ mod tests {
         assert!(m > 0.0 && m < 100.0, "{m}");
     }
 
-    // Chain: § 8 step 5 repeated `service install`. Risk: the second install rewrites the release binary in place and
-    // macOS kills its next starts until rollback (#973).
-    #[cfg(unix)]
+    // H-A5/#973: local signing and repeated preparation cannot rewrite the immutable release or active files.
     #[test]
-    fn second_install_writes_a_new_release_file() {
-        use std::os::unix::fs::MetadataExt;
-        let install = std::env::temp_dir().join(format!("taskq-install-self-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&install);
-        let t = tool(&install);
-        let ino = || fs::metadata(t.release_exe(VERSION)).unwrap().ino();
-        install_self(&t).unwrap();
-        let first = ino();
-        // A hard link keeps the first inode alive, as a running service does; ext4 would reuse a freed one.
-        fs::hard_link(t.release_exe(VERSION), install.join("first")).unwrap();
-        install_self(&t).unwrap();
-        assert_ne!(ino(), first, "the release binary was rewritten in place");
-        let _ = fs::remove_dir_all(&install);
+    fn repeated_install_preparation_preserves_immutable_release() {
+        let install=std::env::temp_dir().join(format!("taskq-install-self-{}",crate::runtime::uuid()));
+        let t=tool(&install);
+        let first=prepare_install(&t).unwrap();
+        assert!(!install.join("current").exists()&&!install.join(t.exe_name()).exists());
+        let bytes=fs::read(t.release_exe(VERSION)).unwrap();
+        #[cfg(unix)] let inode={use std::os::unix::fs::MetadataExt;fs::metadata(t.release_exe(VERSION)).unwrap().ino()};
+        assert_eq!(prepare_install(&t).unwrap(),first);
+        assert_eq!(fs::read(t.release_exe(VERSION)).unwrap(),bytes);
+        #[cfg(unix)] {use std::os::unix::fs::MetadataExt;assert_eq!(fs::metadata(t.release_exe(VERSION)).unwrap().ino(),inode);}
+        activate_install(&t).unwrap();
+        assert_eq!(fs::read(install.join(t.exe_name())).unwrap(),bytes);
+        assert_eq!(fs::read_to_string(install.join("current")).unwrap(),VERSION);
+        fs::write(t.release_exe(VERSION),"changed-same-version").unwrap();
+        assert!(prepare_install(&t).unwrap_err().contains("differs"));
+        assert_eq!(fs::read(t.release_exe(VERSION)).unwrap(),b"changed-same-version");
+        fs::remove_dir_all(install).unwrap();
+    }
+
+    // Windows install layout: relocated executable/real launcher must find GNU's loader without Cargo's PATH.
+    #[cfg(windows)]
+    #[test]
+    fn installed_windows_release_starts_without_build_paths() {
+        let base=std::env::temp_dir().join(format!("taskq-windows-install-{}",crate::runtime::uuid()));
+        let appdata=base.join("appdata");let install=appdata.join("taskq");let t=tool(&install);
+        prepare_install(&t).unwrap();activate_install(&t).unwrap();
+        let system32=PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32");
+        for exe in [t.release_exe(VERSION),install.join(t.exe_name())] {
+            let out=coreq::process::output("test.installed-windows-binary",std::process::Command::new(&exe)
+                .args(["--exact","platform::tests::installed_windows_binary_fixture","--ignored","--nocapture"])
+                .current_dir(&base).env("PATH",&system32).env("LOCALAPPDATA",&appdata).env_remove("TASKQ_ROOT")
+                .env("TASKQ_INSTALL_FIXTURE",&install).env("TASKQ_SELFTEST_OFFLINE","1").env("TASKQ_INCIDENT_REPORTS","off"),std::time::Duration::from_secs(30));
+            assert!(out.is_ok(),"{}: {out:?}",exe.display());
+            assert!(String::from_utf8_lossy(&out.unwrap().stdout).contains("golden traces PASS"));
+        }
+        #[cfg(target_env="gnu")] for folder in [&install,t.release_exe(VERSION).parent().unwrap()] {assert!(folder.join("WebView2Loader.dll").is_file());}
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore="owned relocated-binary fixture; requires TASKQ_INSTALL_FIXTURE"]
+    fn installed_windows_binary_fixture() {
+        let install=PathBuf::from(std::env::var_os("TASKQ_INSTALL_FIXTURE").expect("owned fixture installation"));
+        if std::env::current_exe().unwrap().parent()==Some(install.as_path()) {
+            coreq::launcher::launch(&tool(&install),&std::env::args().skip(1).collect::<Vec<_>>());
+        }
+        let _telemetry=coreq::telemetry::capture::Runtime::install_bounded(
+            &install.join("telemetry.log/universal.sqlite3"),"taskq",VERSION,crate::telemetry::budget(&install,"telemetry.sqlite3").unwrap(),
+        ).unwrap();
+        crate::run(&["selftest".into()]).unwrap();
     }
 
     // Chain: § 8 step 5 macOS signing (#1089). Risk: an absent identity or a failed signature passes silently, or two
@@ -560,6 +710,30 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    // H-A5: all update entrypoints respect installation ownership, including the current-version fast path.
+    #[test]
+    fn installation_transition_fences_updates_before_release_selection_or_effects() {
+        let install=std::env::temp_dir().join(format!("taskq-install-update-{}",crate::runtime::uuid()));
+        fs::create_dir_all(&install).unwrap();
+        fs::write(install.join("current"),"999.0.0").unwrap();
+        let lock=update_lock(&install).unwrap();
+        assert!(service_update(&install).unwrap_err().contains("busy"));
+        for check in [true,false] {assert!(update(&install,check).unwrap_err().contains("busy"));}
+        drop(lock);
+        // An installer crash releases the OS lock but leaves its recovery/admission marker.
+        let prepare=format!("{}.pending",crate::host::INSTALL_PENDING);
+        for name in ["projects.pending",crate::host::INSTALL_PENDING,prepare.as_str()] {
+            fs::write(install.join(name),"retained-install-binding").unwrap();
+            assert!(service_update(&install).unwrap_err().contains(name));
+            for check in [true,false] {assert!(update(&install,check).unwrap_err().contains(name));}
+            assert_eq!(fs::read_to_string(install.join("current")).unwrap(),"999.0.0");
+            assert!(!install.join("releases").exists(),"a held transition must not download or prune");
+            fs::remove_file(install.join(name)).unwrap();
+        }
+        assert_eq!(service_update(&install).unwrap(),Some("999.0.0".into()));
+        fs::remove_dir_all(install).unwrap();
+    }
+
     // Chain: CLI/service update ownership -> cleanup -> the same metadata and activation lock stays exclusive.
     #[test]
     fn updates_share_one_lock_through_cleanup_and_release_it() {
@@ -569,8 +743,18 @@ mod tests {
         sweep(&install, &install.join("absent-shim"));
         let other = fs::OpenOptions::new().write(true).open(install.join("update.lock")).unwrap();
         assert!(other.try_lock().is_err(), "cleanup must not unlink the live update lock");
+        #[cfg(unix)]
+        let inherited = unsafe { libc::fork() };
+        #[cfg(unix)]
+        {
+            assert!(inherited >= 0);
+            if inherited == 0 { unsafe { libc::poll(std::ptr::null_mut(), 0, 250); libc::_exit(0); } }
+        }
         drop(lock);
-        other.try_lock().unwrap();
+        let released = other.try_lock();
+        #[cfg(unix)]
+        unsafe { libc::waitpid(inherited, std::ptr::null_mut(), 0); }
+        released.unwrap();
         drop(other);
         fs::remove_dir_all(install).unwrap();
     }
@@ -583,7 +767,7 @@ mod tests {
         let _ = fs::remove_dir_all(&t);
         // the running version's release stays, whatever the build sets it to (release CI: the tag)
         let mine = format!("releases/{VERSION}");
-        let dirs = ["releases/4.2.0", "releases/4.1.0", "releases/4.0.5", &mine, "releases/cc33ae6", "releases/4.3.0.tmp", "service/x", "mac-pre-update-backup", "capacity", "resources", "windows-native/state", "failed-release-evidence"];
+        let dirs = ["releases/4.2.0", "releases/4.1.0", "releases/4.0.5", &mine, "releases/cc33ae6", "releases/4.3.0.tmp", "obsolete-service/x", "mac-pre-update-backup", "capacity", "resources", "windows-native/state", "failed-release-evidence"];
         for d in dirs {
             fs::create_dir_all(install.join(d)).unwrap();
         }
@@ -599,6 +783,18 @@ mod tests {
         fs::write(install.join("previous"), "4.1.0").unwrap();
         fs::write(install.join("windows-native/state/cap_sid"), "native control state").unwrap();
         fs::write(install.join("projects"), format!("{}\n", root.display())).unwrap();
+        // H-A5: update keeps policy, interrupted writes, exact native recovery and the qualified rollback floor.
+        let protected=[("host.json","{\"limits\":{\"codex\":2},\"owner_field\":\"keep\"}"),
+            ("host.json.pending","interrupted policy; preserve"),("service","123"),("service.lock",""),("poke","wake"),
+            ("restart","restart requested"),("update","update requested"),("projects.lock","")];
+        for (name,text) in protected {fs::write(install.join(name),text).unwrap();}
+        fs::create_dir_all(install.join("host-policy-migration")).unwrap();
+        fs::write(install.join("host-policy-migration/original.json"),"original configuration").unwrap();
+        let native=crate::kids_path(&install,&root).unwrap();fs::create_dir_all(native.parent().unwrap()).unwrap();
+        let owner=coreq::process::identity(std::process::id()).unwrap().unwrap();
+        let recovery=format!("pid {} {} executor-v1\n7 41 codex 123 child 43 40\n",owner.pid,owner.started);
+        fs::write(&native,&recovery).unwrap();
+        coreq::launcher::set_rollback_floor(&tool(&install),"4.2.0").unwrap();
         let (shim, other) = (t.join("bin-taskq"), t.join("bin-other"));
         fs::write(&shim, format!("exec python3 {}/releases/cc33ae6/taskq.py launch --install-dir {} -- \"$@\"", install.display(), install.display())).unwrap();
         fs::write(&other, "#!/bin/sh\nexec something").unwrap();
@@ -613,7 +809,14 @@ mod tests {
         want.sort();
         want.dedup();
         assert_eq!(ls(&install.join("releases")), want);
-        assert_eq!(ls(&install), ["TaskQ-proj.xml", "admission.json", "admission.lock", "capacity", "current", "hold", "previous", "proj.log", "projects", "releases", "resources", "taskq", "taskq.log", "taskq.log.tmp", "token", "tray", "tray.json", "update.lock", "windows-native", "worker-policy.json"]);
+        for (name,text) in protected {assert_eq!(fs::read_to_string(install.join(name)).ok().as_deref(),Some(text),"update lost {name}");}
+        assert_eq!(fs::read_to_string(install.join("host-policy-migration/original.json")).unwrap(),"original configuration");
+        assert_eq!(fs::read_to_string(&native).unwrap(),recovery);
+        assert_eq!(crate::kids_file(&install,&root).unwrap()[0].execution,43,"native execution identity survives update");
+        assert_eq!(fs::read_to_string(install.join("rollback-floor")).unwrap(),"4.2.0");
+        let mut owned=vec!["TaskQ-proj.xml", "admission.json", "admission.lock", "capacity", "current", "hold", "previous", "proj.log", "projects", "releases", "resources", "taskq", "taskq.log", "taskq.log.tmp", "token", "tray", "tray.json", "update.lock", "windows-native", "worker-policy.json", "native", "host-policy-migration", "rollback-floor"];
+        owned.extend(protected.iter().map(|(name,_)|*name));owned.sort();
+        assert_eq!(ls(&install),owned);
         assert_eq!(crate::admission::hold(&install).as_deref(), Some("invented incident hold"), "update cleanup must never release an emergency hold");
         assert_eq!(fs::read_to_string(install.join("windows-native/state/cap_sid")).unwrap(), "native control state");
         assert!(!shim.exists() && other.exists(), "only the v3 shim of this install goes");
@@ -623,6 +826,28 @@ mod tests {
         sweep(&install, &shim);
         assert!(install.join("releases/4.0.1").exists() && install.join("releases/4.0.5").exists());
         assert_eq!(fs::read_to_string(root.join(".taskq/status.json")).unwrap(), "{\"version\": \"4.0");
+        crate::with_test_capture(|store,_| {
+            fs::write(root.join(".taskq/status.json"),r#"{"version":"4.0.5"}"#).unwrap();
+            fs::write(install.join("projects"),b"\xff").unwrap();
+            fs::create_dir_all(install.join("releases/4.0.2")).unwrap();sweep(&install,&shim);
+            assert!(install.join("releases/4.0.2").exists(),"unreadable registry cannot authorize release deletion");
+            fs::write(install.join("projects"),format!("{}\n",root.display())).unwrap();
+            fs::write(install.join("projects.pending"),"retained registry prepare").unwrap();
+            sweep(&install,&shim);
+            assert!(install.join("releases/4.0.2").exists(),"interrupted registry cannot authorize release deletion");
+            assert_eq!(fs::read_to_string(install.join("projects.pending")).unwrap(),"retained registry prepare");
+            fs::remove_file(install.join("projects.pending")).unwrap();
+            fs::remove_file(root.join(".taskq/status.json")).unwrap();
+            sweep(&install,&shim);
+            assert!(install.join("releases/4.0.2").exists(),"missing project status cannot authorize release deletion");
+            tracing::dispatcher::get_default(|d|d.downcast_ref::<coreq::telemetry::capture::Capture>().unwrap().flush().unwrap());
+            let export=store.export(0,0,1024).unwrap();
+            for class in ["registry-unreadable","version-unknown"] {
+                assert!(export["events"].as_array().unwrap().iter().any(|row|row["observation"]["error"]==class),"missing cleanup failure {class}");
+            }
+            let private=serde_json::to_string(root.to_str().unwrap()).unwrap();
+            assert!(!export.to_string().contains(private.trim_matches('"')),"private local paths entered telemetry");
+        });
         let _ = fs::remove_dir_all(&t);
     }
 }

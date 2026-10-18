@@ -53,9 +53,10 @@ Counter scope, all states and quiet Closed totals: [K-A1–K-A6](task-counters.m
 
 - Compact q shows play when at least one project admits; pause for a fully paused admission set. Observation-only is distinct. Mixed shows paused N of M, excluding observation-only projects.
 - Pause stops new admission; current attempts finish. Resume restores saved focus; missing saved focus requires selection, never implicit all.
+- A failed project action returns its reason to the menu and clears its pending indicator. The error remains through status refreshes until another action for that project; successful dispatch still waits for state readback.
 - Global commands name affected projects/host and unchanged targets before apply. Per-project actions affect only that project.
 - Show pending, applied, partial failure and unknown separately; confirm application by readback.
-- Restart, pause and stop until next login have distinct effects. Stop preserves autostart; expose active-work consequences before use.
+- Restart, pause and stop have distinct effects. Stop retains autostart; show its native restart condition and active-work consequences before use.
 - Uninstall uses a nested confirmation naming the project, removes its service unit and preserves project files and other registrations. Remove shared install resources only when no consumer remains. R11 applies.
 - Emergency termination is required, separate from Pause; [E1–E5](emergency-recovery.md) define the reviewed-recovery candidate.
 
@@ -108,7 +109,7 @@ Native sizing, scroll ownership and cadence rendering follow [R-UI1–R-UI6](ren
 
 - Categories: Appearance, Activity history, Agents, Services and About. Work mode remains a direct entry, not a second editor.
 - Appearance contains view/font; Activity history contains M6 presets/custom range; Agents retains host probes; proposed permission controls follow [P1–P9](worker-permissions.md), pending authority/enforcement approval.
-- Services lists targets with freshness, incidents, log/folder, restart, stop until next login and nested uninstall confirmation. Retain Resources access to the existing external monitor and incident consent controls. No repeated service sections on home.
+- Services lists targets with freshness, incidents, log/folder, restart, stop with its native restart condition, and nested uninstall confirmation. Retain Resources access to the existing external monitor and incident consent controls. No repeated service sections on home.
 - Stale status does not prove a dead process. Known logs remain accessible during failure; unknown log paths are explained.
 - About shows tray/service versions and host. Update now appears only for a verified newer version; preserve progress, readback, failure and rollback visibility.
 - Update writes the existing service request and follows §8. Do not claim completion from a button click.
@@ -140,14 +141,14 @@ Canonical selections/default candidates: [D01–D14](decision-register.md). The 
 ## M12 Shared Work mode
 
 - One editor from home/settings/project; project entry preselects that project. Open it in the existing workspace (approved Workspace review), preserving menu navigation and drafts. Recovery uses the same workspace route.
-- Named host, explicitly selected projects, new-task filter, per-project/runtime limits, optional load guard, change review.
-- Selection defines change targets, not registered observations. Unchecking a project leaves its focus/limits unchanged.
-- Preserve runtime-specific limits, including codex-app. No shared host pool. Disable fields for unselected projects; unknown values follow [unknown is never healthy](https://github.com/taskqorg/specq/blob/main/engineering/verification.md#unknown-is-never-healthy).
+- Named host; host limits and load guard affect all its registered projects. Project focus/filter/ceiling edits name their own selected projects and review; that selection never narrows a host edit.
+- Selection defines project change targets, not registered observations. Unchecking leaves that project's focus/ceilings unchanged; host edits separately name their wider effect.
+- Preserve runtime-specific host limits, including codex-app, and separately named lowering project ceilings. Disable unselected project fields; unknown values follow [unknown is never healthy](https://github.com/taskqorg/specq/blob/main/engineering/verification.md#unknown-is-never-healthy).
 - Different current focus displays Mixed. Opening does not overwrite it. Change only explicitly edited fields.
 - Review exact project/host old→new changes; current attempts continue. Cancel preserves settings; readback is per project, including partial failure.
 - Preserve CPU/memory gate controls and saved-vs-applied distinction from the current UI. Gate semantics remain in taskq.md.
 - AI prepares the same reviewable operations; no hidden alternate apply route. Preview matches/exclusions for UC-05 once the filter contract exists.
-- Native tray (#954): Work mode edits Auto/Fixed, host maximum, runtime limits and the load gate with the [shared resource controls](shared-resource-controls.md#shared-component-930); the new-task filter stays in Scope until the filter contract exists.
+- Native tray (#954): Work mode exposes one host editor for maximum, runtime limits and load gate, without project-selection controls that could imply a narrower effect. Project entry retains that project's observation context. Fixed remains legacy-only. Use the [shared resource controls](shared-resource-controls.md#shared-component-930); project focus/filter/ceiling work remains a separate target until its contracts and backends are qualified.
 
 ## M13 Pinned window
 

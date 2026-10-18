@@ -4,7 +4,7 @@
 const fs=require('node:fs');
 const fx=require('./fixtures/finding-composer.json'),answer=require('./fixtures/answer-card.json').cases[0];
 const css=['project-blocks','answer-card','finding-composer'].map(n=>fs.readFileSync('src/'+n+'.css','utf8')).join('\n');
-const scripts=['project-blocks','answer-card','finding-composer'].map(n=>fs.readFileSync('src/'+n+'.js','utf8')).join('\n');
+const scripts=['project-blocks','answer-card','finding-composer'].map(n=>fs.readFileSync('build/web/'+n+'.js','utf8')).join('\n');
 async function check(fx,answer){
   const eq=(a,b,why)=>{if(JSON.stringify(a)!==JSON.stringify(b))throw Error(why+': '+JSON.stringify(a)+' != '+JSON.stringify(b));};
   const assert=(yes,why)=>{if(!yes)throw Error(why);};
@@ -57,4 +57,11 @@ const frames=[];for(const theme of fx.themes)for(const font of fx.fonts)for(cons
   frames.push('<section><h2>'+label+'</h2><iframe title="'+label+'" style="width:'+width+'px;height:1600px;border:1px solid #888" srcdoc="'+html.replace(/&/g,'&amp;').replace(/"/g,'&quot;')+'"></iframe></section>');
 }
 const out='<!doctype html><title>Finding composer checks</title><style>body{font:16px sans-serif}main{display:flex;gap:16px;flex-wrap:wrap}h2{font:inherit}pre{white-space:pre-wrap}</style><h1>Finding composer browser checks</h1><pre id="results">Running 8 fixtures…</pre><main>'+frames.join('')+'</main><script>const results=[];window.addEventListener("message",e=>{if(!e.data.label)return;results.push(e.data);document.querySelector("#results").textContent=results.map(r=>(r.ok?"PASS ":"FAIL ")+r.label+(r.error?"\\n"+r.error:"")).join("\\n");document.title=results.length===8?results.every(r=>r.ok)?"PASS 8 finding composer fixtures":"FAIL finding composer fixtures":"Running finding composer checks";});</script>';
-if(!process.argv[2])throw Error('Supply an output HTML path');fs.writeFileSync(process.argv[2],out);console.log('Wrote '+process.argv[2]+'; open in a browser and require PASS for all 8 fixtures.');
+if(process.argv[2]){fs.writeFileSync(process.argv[2],out);console.log('Wrote '+process.argv[2]+'; open in a browser and require PASS for all 8 fixtures.');}
+else (async()=>{
+ const {chromium}=require('playwright'),browser=await chromium.launch(require('./browser.cjs')());
+ try{const page=await browser.newPage({viewport:{width:1600,height:1200}});await page.setContent(out);
+  await page.waitForFunction(()=>document.title.startsWith('PASS')||document.title.startsWith('FAIL'),{timeout:10000});
+  const result=await page.title();if(!result.startsWith('PASS'))throw Error(await page.locator('#results').innerText());console.log(result);
+ }finally{await browser.close();}
+})().catch(error=>{console.error(error);process.exitCode=1;});

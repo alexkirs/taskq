@@ -1,6 +1,6 @@
 # Shared project summaries and task rows
 
-Implementation of [B1–B4](shared-blocks.md), [K-A1–K-A8](task-counters.md) and Menu M2/M3, under R6. TaskQ owns `src/project-blocks.js` and `.css`; both the tray and browser consumers render these exact assets. No network client, credentials, parser, framework or task operation is added.
+Implementation of [B1–B4](shared-blocks.md), [K-A1–K-A8](task-counters.md) and Menu M2/M3, under R6. TaskQ owns `src/project-blocks.js` and `.css`; the tray and standalone browser bundles use this same source. No network client, credentials, parser, framework or task operation is added.
 
 ## Interface and delivery
 
@@ -28,3 +28,5 @@ Release staging publishes `taskq-<release>-project-blocks.js`, `.css`, `.LICENSE
 Owner-approved delivery for #938: extraction PR, release wiring and browser comparisons first; published release/checksum and native Windows/macOS conformance follow separately, as for #920. README screenshot freshness is an open native capture gate; no manifest or check is weakened here. Composer/create/recovery remain #949/#948.
 
 Parent defect (M3/B3): the prototype's unbounded project button can overflow on a long unbroken project name. The shared block bounds its identity region and wraps text without shrinking it. Counter comparisons use identical bounded labels; long project identity is additionally checked in both consumer harnesses. M3 in #1104 supersedes the original parent task flow with a metadata/links row and a full wrapped title block. Existing parent comparisons still cover outer task styling and summary geometry; the M3 row chain checks retained full text and independent links.
+
+Browser delivery uses the self-contained `build/web/project-blocks.js` bundle (`npm run build`), published under the existing release filename. Source checksums identify editable CommonJS modules; released bundle integrity comes from `SHA256SUMS`. See [JS packaging](profiling.md#js-execution-architecture).

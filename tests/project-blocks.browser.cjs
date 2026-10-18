@@ -1,10 +1,10 @@
 // B4 instrument: identical parent/standalone/tray fixtures; browser output is not native or live-board proof.
 const fs=require('node:fs'),path=require('node:path'),assert=require('node:assert/strict'),crypto=require('node:crypto'),{chromium}=require('playwright');
 const q=require('../src/project-blocks.js'),fx=require('./fixtures/project-blocks.json');
-const source=fs.readFileSync('docs/design/menu-next-variants.html','utf8'),css=fs.readFileSync('src/project-blocks.css','utf8'),js=fs.readFileSync('src/project-blocks.js','utf8');
+const source=fs.readFileSync('docs/design/menu-next-variants.html','utf8'),css=fs.readFileSync('src/project-blocks.css','utf8'),js=fs.readFileSync('build/web/project-blocks.js','utf8');
 const parentCSS=[...source.matchAll(/<style>([\s\S]*?)<\/style>/g)].map(m=>m[1]).join('\n');
 const parentFunctions=source.split('\n').filter(l=>/^(const (esc|icon|button|ib)=|function (counts|projectRow|task)\()/.test(l)).join('\n');
-const tray=fs.readFileSync('src/tray.html','utf8').replace('{{ANSWER_CARD_JS}}',fs.readFileSync('src/answer-card.js','utf8')).replace('{{ANSWER_CARD_CSS}}',fs.readFileSync('src/answer-card.css','utf8')).replace('{{PROJECT_BLOCKS_JS}}',js).replace('{{PROJECT_BLOCKS_CSS}}',css).replace('{{RESOURCE_CONTROLS_JS}}',fs.readFileSync('src/resource-controls.js','utf8')).replace('{{RESOURCE_CONTROLS_CSS}}',fs.readFileSync('src/resource-controls.css','utf8'));
+const tray=fs.readFileSync('build/web/tray.html','utf8');
 const base='<style>:root{color-scheme:light dark}body{margin:0;padding:8px;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}</style>';
 function fixture(n){return {...fx.project,name:'project',closed:n,tasks:q.states.filter(s=>s[0]!=='closed').flatMap(([state],i)=>Array.from({length:n},(_,j)=>({...fx.row,n:i*1000+j+1,state,revision:4}))) };}
 function look(sel){
@@ -58,10 +58,10 @@ function taskLook(sel){const el=document.querySelector(sel),s=getComputedStyle(e
       }finally{for(const p of pages)await p.close();}
     }
     // Real DOM navigation, long-flow layout, unknown/partial and GitLab fixtures for both consumers.
-    for(const mode of ['browser','tray']){
-      const page=await browser.newPage({viewport:{width:320,height:1800},colorScheme:'dark'});
+    for(const mode of ['browser','tray'])for(const width of fx.widths){
+      const page=await browser.newPage({viewport:{width,height:1800},colorScheme:'dark'});
       try{
-        const p={...fixture(1),name:fx.project.name,closed:null},row={...fx.row,state:'review'};
+        const p={...fixture(1),name:fx.project.name,closed:null},row={...fx.row,state:'review',execution_wait:require('./fixtures/status-snapshot.json').tasks.find(t=>t.n===2).execution_wait};
         await page.setContent(mode==='tray'?tray:base+'<style>'+css+'</style><div id="consumer" style="font-size:20px"></div><script>'+js+'</script>');
         await page.evaluate(()=>{window.navigation=[];window.messages=[];window.ipc={postMessage:s=>messages.push(JSON.parse(s))};});
         if(mode==='browser')await page.evaluate(({p,row})=>{const el=document.querySelector('#consumer');el.innerHTML=TaskqProjectBlocks.summary(p)+TaskqProjectBlocks.task(p,row);el.addEventListener('click',e=>TaskqProjectBlocks.handle(e,{project:id=>navigation.push(['project',id]),tasks:(id,s)=>navigation.push(['tasks',id,s]),open:u=>navigation.push(['open',u])}));},{p,row});
@@ -76,6 +76,7 @@ function taskLook(sel){const el=document.querySelector(sel),s=getComputedStyle(e
         assert.deepEqual(opened,[row.url,row.session_url]);
         const flow=await page.locator('.tqp-task').evaluate(el=>({display:getComputedStyle(el).display,title:el.textContent,width:el.getBoundingClientRect().width}));
         assert.equal(flow.display,'block');assert(flow.title.includes(row.title));assert(flow.width>280);
+        assert.equal(await page.locator('.tqp-execution-wait').innerText(),row.execution_wait);assert(await page.locator('.tqp-execution-wait').isVisible());
         await page.evaluate(p=>{document.querySelector('.tqp-project').outerHTML=TaskqProjectBlocks.summary({...p,complete:false,board:{kind:'gitlab',url:'https://gitlab.example/o/r/-/issues'}});},p);
         assert.match(await page.locator('.tqp-project').innerText(),/Partial:/);assert.equal(await page.locator('.tqp-project [data-icon=gitlab]').count(),1);assert.equal(await page.locator('.tqp-project button[data-state]').count(),8);
         assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);

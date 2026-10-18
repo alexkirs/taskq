@@ -17,7 +17,7 @@ use wry::{WebView, WebViewBuilder};
 use crate::icon::{self, Rgba, compact};
 use crate::notify;
 
-const HTML: &str = include_str!("tray.html");
+const HTML: &str = include_str!(concat!(env!("OUT_DIR"),"/web/tray.html"));
 const FONTS: [u64; 4] = [14, 16, 18, 20];
 const PERIODS: [(&str, i64); 5] = [("5m", 300), ("1h", 3600), ("1d", 86400), ("1w", 604800), ("1mo", 2592000)];
 
@@ -32,11 +32,12 @@ fn alone(install: &Path) -> bool {
 enum Ev {
     Tick,
     Ipc(String),
+    Evaluated(u64, &'static str),
     Click(Rect),
     Shot,
     Shot2,
-    /// Add project: the picked folder classified, or Null (cancel)
-    Added(Value),
+    /// Add project: the generation fences a late picker or install result.
+    Added(u64, Value),
     Answer(Value),
     /// A notification click: its request identifier (M14)
     Note(String),
@@ -202,7 +203,7 @@ fn ai(install: &Path, a: &str, m: &Value) {
             if crate::platform::write_atomic(&crate::operator::dir(root).join(format!("{id}.json")), &json!({"text": text, "after": after, "onboard": onboard}).to_string()).is_err() {
                 return;
             }
-            crate::poke(root);
+            let _ = crate::poke(root);
             if onboard.is_some() {
                 return;
             }
@@ -213,7 +214,7 @@ fn ai(install: &Path, a: &str, m: &Value) {
             let (r, id) = (m["root"].as_str().unwrap_or(""), m["id"].as_str().unwrap_or(""));
             if roots(install).iter().any(|x| x == r) && !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()) {
                 let _ = fs::write(crate::operator::dir(Path::new(r)).join(format!("{id}.confirm")), m["rev"].as_u64().unwrap_or(0).to_string());
-                crate::poke(Path::new(r));
+                let _ = crate::poke(Path::new(r));
             }
             return;
         }
@@ -336,7 +337,7 @@ fn answer(install: &Path, m: &Value) -> Value {
     let prepare = || -> Result<_, String> {
         let args = answer_args(install, m)?;
         let root = Path::new(m["root"].as_str().unwrap());
-        let out = crate::platform::quiet(owner_command(root)?.args(["status", "--json"])).output().map_err(|e| e.to_string())?;
+        let out = crate::platform::output("tray.answer-status",owner_command(root)?.args(["status", "--json"]),Duration::from_secs(30))?;
         let snapshot = serde_json::from_slice(&out.stdout).map_err(|_| String::from_utf8_lossy(&out.stderr).into_owned())?;
         answer_snapshot(&snapshot, m)?;
         Ok((root, args))
@@ -346,7 +347,7 @@ fn answer(install: &Path, m: &Value) -> Value {
         Err(e) => return response("rejected", &e, "Refresh the question or open it on the board."),
     };
     let r = answer_dispatch(m, &args, |args| {
-        let out = owner_command(root).and_then(|mut c| crate::platform::quiet(c.args(args)).output().map_err(|e| e.to_string()));
+        let out = owner_command(root).and_then(|mut c| crate::platform::output("tray.answer-command",c.args(args),Duration::from_secs(60)));
         match out {
             Ok(out) => serde_json::from_slice(&out.stdout).unwrap_or_else(|_| json!({"task": m["op"]["task"], "op_id": args[args.len()-3], "outcome": "unknown", "reason": String::from_utf8_lossy(&out.stderr), "next": "Check the board; retry the same operation id."})),
             Err(e) => json!({"task": m["op"]["task"], "op_id": args[args.len()-3], "outcome": "unknown", "reason": e, "next": "Check the board; retry the same operation id."}),
@@ -365,60 +366,44 @@ fn revision(v: &Value) -> Value {
     json!(format!("r{:016x}", h.finish()))
 }
 
-/// The project's capacity as one group of `taskq.resources/1` projection targets (host, project, runtimes) for the
-/// shared resource controls (docs/design/shared-resource-controls.md): `cap` is `status.json` `capacity` (null:
-/// unknown), `saved` the host's capacity from `taskq.json`. The only writes the tray offers are `service capacity`
-/// fields: legacy limits and gate, and Auto/Fixed with its maximum when the service reports admission.
-fn resource_group(cap: &Value, saved: &Value, observed_at: Option<i64>, installation: Option<String>, project: &str) -> Value {
-    let ok = cap.is_object();
+/// Host policy and occupancy are distinct from this project's narrowing ceilings.
+fn resource_group(cap: &Value, saved: &Value, saved_revision:&Value, project_limits: &Value, observed_at: Option<i64>, installation: Option<String>, project: &str) -> Value {
+    let host = crate::service::host_capacity(cap).unwrap_or(Value::Null);
+    let ok = host.is_object();
     let saved = if saved["error"].is_null() { saved } else { &Value::Null };
-    let auto = if ok { cap["admission"]["mode"] == "auto" } else { saved["admission"]["mode"] == "auto" };
     let target = |p: bool, rt: Option<&str>| json!({"installation_id": installation, "generation": 1, "project_id": if p { json!(project) } else { Value::Null }, "runtime_id": rt});
-    let legacy = |field: &str, scope: &str| json!({"policy_schema": "taskq.capacity/1", "modes": ["fixed"], "fields": [field], "scopes": [scope]});
-    let none = json!({"sample": null, "runtime_usage": [], "blockers": [], "completeness": if ok { "complete" } else { "unknown" }});
-    let entry = |t: Value, supported: Value, current: Value, effective: Value, rest: &Value| {
-        let rev = |p: &Value| { let mut p = p.clone(); p.as_object_mut().map(|o| o.remove("sources")); revision(&p) };
-        let mut e = json!({"target": t, "service_version": null, "supported": supported, "current_revision": if saved.is_null() { Value::Null } else { rev(&current) },
-            "effective_revision": if ok { rev(&effective) } else { Value::Null }, "current_policy": current, "effective_policy": effective});
-        for (k, v) in rest.as_object().unwrap() { e[k] = v.clone(); }
-        e
-    };
-    let mut host_supported = vec![];
-    let (mut cur, mut eff) = (json!({"sources": {}}), json!({"sources": {}}));
-    if ok && cap["admission"].is_object() {
-        // writable through `service capacity --mode/--max` (§ 5); advertised only when the service reports admission
-        host_supported.push(json!({"policy_schema": "taskq.admission/1", "modes": ["auto", "fixed"], "fields": ["mode", "maximum"], "scopes": ["host"]}));
-        let pol = |a: &Value| json!({"mode": a["mode"], "maximum": a["max"], "sources": {"mode": "unknown", "maximum": "unknown"}});
-        (cur, eff) = (pol(&saved["admission"]), pol(&cap["admission"]));
-    }
-    let mut targets = vec![entry(target(false, None), json!(host_supported), cur, eff, &none)];
-    let mut rts: Vec<String> = ["claude", "codex"].map(String::from).to_vec();
-    for m in [&saved["limits"], &cap["limits"], &cap["used"]] {
+    let entry = |t: Value, current: Value, effective: Value| {let project=!t["project_id"].is_null();let runtime=!t["runtime_id"].is_null();json!({"target": t, "service_version": crate::platform::VERSION,
+        "supported": [{"policy_schema": "taskq.host-capacity/1", "modes": [], "fields": if project||saved.is_null() {json!([])}else if runtime {json!(["runtime_limit"])}else{json!(["maximum","load_gate"])}, "scopes": if project {json!([])}else if runtime {json!(["runtime"])}else{json!(["host"])} }],
+        "current_revision": if saved.is_null() { Value::Null } else if project {revision(&current)}else{saved_revision.clone()},
+        "effective_revision": if !ok {Value::Null}else if project {revision(&effective)}else{cap["host_command"].clone()},
+        "current_policy": current, "effective_policy": effective,
+        "sample": null, "runtime_usage": [], "blockers": [], "completeness": if ok { "complete" } else { "unknown" }})};
+    let pol = |c: &Value| json!({"maximum": c["admission"]["max"], "load_gate": c["load_gate"]});
+    let mut h = entry(target(false, None), pol(saved), pol(&host));
+    let mut rts: Vec<String> = crate::service::RUNTIMES.iter().map(|rt| rt.to_string()).collect();
+    for m in [&saved["limits"], &host["limits"], &host["used"]] {
         for k in m.as_object().into_iter().flatten().map(|(k, _)| k) { if !rts.contains(k) { rts.push(k.clone()); } }
     }
-    let limits = if ok { &cap["limits"] } else { &saved["limits"] };
-    let usage: Vec<Value> = rts.iter().map(|rt| {
-        let l = limits[rt].as_u64();
-        let kind = if !ok && saved.is_null() { "unknown" } else { match l { Some(0) => "disabled", Some(_) => "ceiling", None if auto => "unbounded", None => "disabled" } };
-        json!({"runtime_id": rt, "used": if ok { json!(cap["used"][rt].as_u64().unwrap_or(0)) } else { Value::Null }, "limit": l, "limit_kind": kind})
-    }).collect();
-    let sample = if cap["sample_at"].is_i64() {
-        json!({"source": format!("taskq-admission-{}", if cfg!(windows) { "windows" } else if cfg!(target_os = "macos") { "macos" } else { "linux" }),
-            "sampled_at": cap["sample_at"], "age_seconds": cap["sample_age_seconds"], "cadence_seconds": 30, "window_seconds": if auto { 60 } else { 30 },
-            "cpu_busy_percent": cap["cpu_percent"], "memory_available_percent": cap["memory_available_percent"], "memory_available_gib": null, "pressure": null})
-    } else { Value::Null };
+    h["runtime_usage"] = json!(rts.iter().map(|rt| {
+        let l = if ok { host["limits"][rt].as_u64() } else { saved["limits"][rt].as_u64() };
+        let kind = if !ok && saved.is_null() { "unknown" } else { match l { Some(0) => "disabled", Some(_) => "ceiling", None => "unbounded" } };
+        json!({"runtime_id": rt, "used": host["used"][rt].as_u64(), "limit": l, "limit_kind": kind})
+    }).collect::<Vec<_>>());
+    if ok && host["sample_at"].is_i64() {
+        h["sample"] = json!({"source": format!("taskq-admission-{}", if cfg!(windows) { "windows" } else if cfg!(target_os = "macos") { "macos" } else { "linux" }),
+            "sampled_at": host["sample_at"], "age_seconds": host["sample_age_seconds"], "cadence_seconds": 30, "window_seconds": 60,
+            "cpu_busy_percent": host["cpu_percent"], "memory_available_percent": host["memory_available_percent"], "memory_available_gib": null, "pressure": null});
+    }
     const CODES: [&str; 18] = ["cpu", "memory", "pressure", "sample", "config", "cooldown", "spacing", "max", "version", "host", "runtime_disabled", "pause", "focus", "dependency", "routing", "access", "provider", "unknown"];
-    let blockers: Vec<Value> = cap["reasons"].as_array().into_iter().flatten().map(|r| {
+    h["blockers"] = json!(host["reasons"].as_array().into_iter().flatten().map(|r| {
         let code = match r["code"].as_str().unwrap_or("") { "hold" => "host", c if CODES.contains(&c) => c, _ => "unknown" };
-        let host_scope = ["host", "max", "spacing", "version"].contains(&code);
-        json!({"code": code, "scope": target(!host_scope, None), "knowledge": if code == "sample" || code == "unknown" || (code == "host" && cap["gate"] == "unknown") { "unknown" } else { "known" }})
-    }).collect();
-    let gate = |g: &Value| json!({"load_gate": g, "sources": {"load_gate": "unknown"}});
-    targets.push(entry(target(true, None), json!([legacy("load_gate", "project")]), gate(&saved["load_gate"]), gate(&cap["load_gate"]),
-        &json!({"sample": sample, "runtime_usage": usage, "blockers": blockers, "completeness": if ok { "complete" } else { "unknown" }})));
+        let host_scope = ["host", "max", "spacing", "version", "cpu", "memory", "pressure", "sample", "config"].contains(&code);
+        json!({"code": code, "scope": target(!host_scope, None), "knowledge": if code == "sample" || code == "unknown" || (code == "host" && host["gate"] == "unknown") { "unknown" } else { "known" }})
+    }).collect::<Vec<_>>());
+    let mut targets = vec![h, entry(target(true, None), json!({"limits": project_limits}), json!({"limits": cap["project_limits"]}))];
     for rt in &rts {
-        let lim = |m: &Value| json!({"runtime_limit": m[rt], "sources": {"runtime_limit": "unknown"}});
-        targets.push(entry(target(true, Some(rt)), json!([legacy("runtime_limit", "runtime")]), lim(&saved["limits"]), lim(&cap["limits"]), &none));
+        let lim = |c: &Value| json!({"runtime_limit": c["limits"][rt]});
+        targets.push(entry(target(false, Some(rt)), lim(saved), lim(&host)));
     }
     json!({"schema": "taskq.resources/1", "observed_at": observed_at, "targets": targets})
 }
@@ -441,21 +426,23 @@ fn project(install: &Path, root: &str) -> Value {
         Some(json!([w.first()?.parse::<i64>().ok()?, w.get(2)?, w.get(3)?, w.get(1)?.strip_prefix('#')?.parse::<u64>().ok()?]))
     }).collect();
     // the local host's saved capacity, for `Edit limits` and its readback (§ 4 Capacity)
-    let (cap_host, cap_saved, board_kind) = match crate::load(r) {
-        Ok((c, v)) => (json!(c.me), crate::service::capacity(&v, &c.me).map(|x| x.json()).unwrap_or_else(|e| json!({"error": e})), json!(c.board.name)),
-        Err(e) => (Value::Null, json!({"error": e}), Value::Null),
+    let (cap_host, cap_saved, cap_revision,board_kind, project_limits) = match crate::load(r) {
+        Ok((c, raw)) => {let policy=crate::host::Policy::read(install);let rev=policy.as_ref().ok().and_then(|p|p.revision().ok());let host=policy.as_ref().map(|p|json!(p.me)).unwrap_or(Value::Null);
+            (host, policy.map(|p|p.cap.json()).unwrap_or_else(|e| json!({"error": e})),json!(rev), json!(c.board.name), if raw["limits"].is_null() {json!({})} else {raw["limits"].clone()})},
+        Err(e) => (Value::Null, json!({"error": e}), Value::Null,Value::Null, Value::Null),
     };
     let mut tasks = s["tasks"].as_array().cloned().unwrap_or_default();
     for task in &mut tasks { task_session(r, cap_host.as_str().unwrap_or(""), task); }
     let installation = fs::read_to_string(install.join("installation-id")).ok().filter(|i| i.len() == 64 && i.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)));
     let id: String = crate::project_name(r).chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' }).take(64).collect();
-    let resources = resource_group(&s["capacity"], &cap_saved, age.map(|a| now() - a as i64), installation, &id);
+    let observed_at=s["at"].as_i64().filter(|at|*at<=now()&&now()-*at<=60).and(age.map(|a|now()-a as i64));
+    let resources = resource_group(&s["capacity"], &cap_saved,&cap_revision, &project_limits, observed_at, installation, &id);
     json!({"root": root, "name": s["project"].as_str().map(String::from).unwrap_or_else(|| crate::project_name(r)),
         "issues": s["issues"].as_str().unwrap_or(""), "board_kind": board_kind, "closed": Value::Null,
         "log": s["log"].is_string(), "alive": age.is_some_and(|a| a < 300), "age": age,
         "complete": crate::snapshot::complete(&s) && age.is_some_and(|a| a < 300),
         "error": bad.map(Value::from).or_else(|| [&s["error"], &s["focus_error"]].into_iter().find(|e| e.is_string()).cloned()).unwrap_or(Value::Null), "focus": s["focus"].as_array().cloned().unwrap_or_default(), "saved": saved, "labels": crate::status_labels(r),
-        "request": s["request"], "since": since, "events": events, "tasks": tasks, "host": s["host"], "version": s["version"], "update": s["update"],
+        "focus_command": s["focus_command"],"service_pid":s["pid"],"host_instance":s["host_instance"],"restart_waits":s["restart_waits"],"uninstall_review":crate::lifecycle::uninstall_review(install,"review",Some(r)).unwrap_or_else(|reason|json!({"state":"unknown","reason":reason})), "request": s["request"], "since": since, "events": events, "tasks": tasks, "host": s["host"], "version": s["version"], "update": s["update"],
         "resources": resources, "cap_host": cap_host, "cap_saved": cap_saved, "agents": s["agents"],
         "incident": s["incident"], "incident_line": s.get("incident").map(crate::incident::line), "incident_notice": s["incident_notice"],
         "incident_repo": crate::platform::RELEASE_REPO})
@@ -485,7 +472,7 @@ fn task_session(root: &Path, local: &str, row: &mut Value) {
         return;
     }
     let id = if own && ((id == "-" && rt == "codex") || rt == "claude") {
-        let l = crate::runtime::Launch { task: row["n"].as_u64().unwrap_or(0), title: String::new(), attempt: row["attempt"].as_u64().unwrap_or(0),
+        let l = crate::runtime::Launch { execution: None, task: row["n"].as_u64().unwrap_or(0), title: String::new(), attempt: row["attempt"].as_u64().unwrap_or(0),
             role: row["role"].as_str().unwrap_or("").into(), rt: rt.into(), session: id.into(), url: String::new(), resume: None };
         crate::runtime::codex_thread(&crate::runtime::log_path(root, &l)).unwrap_or_else(|| id.into())
     } else { id.into() };
@@ -542,6 +529,256 @@ fn summary(ps: &[Value], (start, end): (i64, i64)) -> Summary {
     Summary { counts: [t["doing"] + t["review"], t["ask"], t["ready"], t["failed"]], known, run: ps.iter().any(|p| p["focus"].as_array().is_some_and(|f| !f.is_empty())), bins, since }
 }
 
+struct QueuedAction {
+    id: String,
+    root: PathBuf,
+    message:Value,
+    context: Option<coreq::telemetry::capture::TraceContext>,
+    dispatch: tracing::Dispatch,
+}
+struct ActionQueue {
+    sender: std::sync::mpsc::SyncSender<QueuedAction>,
+    worker: std::thread::JoinHandle<()>,
+    allowed:&'static [&'static str],
+    pending: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>>,
+}
+enum AddJob { Pick(QueuedAction), Install(QueuedAction, Value) }
+const ADD_IDLE:u8=0;
+const ADD_RUNNING:u8=1;
+const ADD_UNAVAILABLE:u8=2;
+struct AddOwner { sender:std::sync::mpsc::SyncSender<AddJob>,state:std::sync::Arc<std::sync::atomic::AtomicU8>,_worker:std::thread::JoinHandle<()> }
+impl AddOwner {
+    fn start(install:PathBuf,proxy:tao::event_loop::EventLoopProxy<Ev>)->crate::Res<Self> {
+        let (sender,receiver)=std::sync::mpsc::sync_channel(1);let state=std::sync::Arc::new(std::sync::atomic::AtomicU8::new(ADD_IDLE));let released=state.clone();
+        let worker=std::thread::Builder::new().name("tray.add.execute".into()).spawn(move ||while let Ok(job)=receiver.recv() {
+            let (job,adding)=match job {AddJob::Pick(job)=>(job,None),AddJob::Install(job,adding)=>(job,Some(adding))};let generation=job.message["generation"].as_u64().unwrap_or(0);
+            let operation=if adding.is_some() {"tray.install.execute"} else {"tray.picker.execute"};
+            tracing::dispatcher::with_default(&job.dispatch,|| {let _context=job.context.as_ref().map(|c|c.span().entered());
+                let (mut result,state)=add_outcome(operation,||match adding {
+                    Some(adding)=>install_service(&install,adding),
+                    None=>match pick() {Ok(Some(dir))=>classify(&dir,selftest),Ok(None)=>json!({"state":"cancelled"}),Err(reason)=>json!({"state":"pick failed","reason":reason})},
+                });
+                result["generation"]=json!(generation);
+                released.store(state,std::sync::atomic::Ordering::Release);
+                let _=coreq::telemetry::capture::operation("tray.add.report",||proxy.send_event(Ev::Added(generation,result)),|_|"ui-closed");
+            });
+        }).map_err(|e|format!("Cannot start add worker: {e}"))?;
+        Ok(Self{sender,state,_worker:worker})
+    }
+    fn submit(&self,generation:u64,adding:Option<Value>)->crate::Res<()> {
+        coreq::telemetry::capture::operation("tray.add.dispatch",|| {
+        if self._worker.is_finished() {self.state.store(ADD_UNAVAILABLE,std::sync::atomic::Ordering::Release);return Err("Add project worker stopped; prior result unknown; do not retry".into());}
+        let action=if adding.is_some() {"add-install"} else {"add"};
+        let job=QueuedAction {id:format!("add-{generation}"),root:PathBuf::new(),message:json!({"a":action,"generation":generation}),context:coreq::telemetry::capture::TraceContext::current(),dispatch:tracing::dispatcher::get_default(Clone::clone)};
+        add_submit(&self.sender,&self.state,if let Some(adding)=adding {AddJob::Install(job,adding)} else {AddJob::Pick(job)})
+        },|_|"add-admission")
+    }
+}
+fn add_outcome(operation:&'static str,work:impl FnOnce()->Value)->(Value,u8) {
+    let result=coreq::telemetry::capture::operation(operation,||match std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)) {
+        Ok(value) if matches!(value["state"].as_str(),Some("pick failed"|"install failed"))=>Err((value,false)),
+        Ok(value)=>Ok(value),
+        Err(_)=>Err((json!({"state":"add failed","reason":"Add worker panicked; outcome unknown; verify the prior picker or installation before restarting the tray"}),true)),
+    },|(_,panicked)|if *panicked {"add-panic"}else{"add-failed"});
+    match result {Ok(value)=>(value,ADD_IDLE),Err((value,panicked))=>(value,if panicked {ADD_UNAVAILABLE}else{ADD_IDLE})}
+}
+fn add_submit(sender:&std::sync::mpsc::SyncSender<AddJob>,state:&std::sync::Arc<std::sync::atomic::AtomicU8>,job:AddJob)->crate::Res<()> {
+    match state.compare_exchange(ADD_IDLE,ADD_RUNNING,std::sync::atomic::Ordering::AcqRel,std::sync::atomic::Ordering::Acquire) {Ok(_)=>{},Err(ADD_UNAVAILABLE)=>return Err("Add project worker unavailable; prior result unknown; do not retry".into()),Err(_)=>return Err("Add project already in progress; wait for the picker or install to finish".into())};
+    sender.try_send(job).map_err(|e| {state.store(if matches!(e,std::sync::mpsc::TrySendError::Disconnected(_)) {ADD_UNAVAILABLE} else {ADD_IDLE},std::sync::atomic::Ordering::Release);match e {std::sync::mpsc::TrySendError::Full(_)=>"Add project queue full",std::sync::mpsc::TrySendError::Disconnected(_)=>"Add project worker unavailable; prior result unknown; do not retry"}.into()})
+}
+impl ActionQueue {
+    fn start<E>(install: PathBuf,allowed:&'static [&'static str],registered:bool,execute:E,report: impl Fn(PathBuf, String, crate::Res<Value>) + Send + 'static) -> crate::Res<Self>
+    where E: Fn(&Path,&Path,&Value)->crate::Res<Value> + Send + 'static {
+        let (sender, receiver)=std::sync::mpsc::sync_channel::<QueuedAction>(16);
+        let pending=std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+        let completed=pending.clone();
+        let operation=if allowed.contains(&"capacity") {"tray.capacity.execute"}else{"tray.focus.execute"};
+        let worker=std::thread::Builder::new().name(operation.into()).spawn(move || {
+            while let Ok(job)=receiver.recv() {
+                let operation=match job.message["a"].as_str() {Some("answer")=>"tray.answer.execute",Some("resources")=>"tray.resources.execute",Some("restart")=>"tray.restart.execute",Some("stop")=>"tray.stop.execute",Some("uninstall")=>"tray.uninstall.execute",_=>operation};
+                tracing::dispatcher::with_default(&job.dispatch,|| {
+                    let _context=job.context.as_ref().map(|c|c.span().entered());
+                    let result=coreq::telemetry::capture::operation(operation,||std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        if registered&&!crate::host::project_paths(&install)?.iter().any(|r|r==&job.root) {
+                            return Err("Project is no longer registered; command not applied".into());
+                        }
+                        execute(&install,&job.root,&job.message)
+                    })).unwrap_or_else(|_|Err("Command panicked; result unknown; check service status before retry".into())),|_|"command-failed");
+                    report(job.root.clone(),job.id.clone(),result);
+                    completed.lock().unwrap_or_else(|e|e.into_inner()).remove(&format!("{}#{}",job.root.display(),job.id));
+                });
+            }
+        }).map_err(|e|format!("Cannot start command worker: {e}"))?;
+        Ok(Self{sender,worker,allowed,pending})
+    }
+    fn submit(&self,message:&Value) -> crate::Res<()> {
+        let action=message["a"].as_str().unwrap_or("");let id=message["id"].as_str().unwrap_or("");
+        let name=match action {"answer"=>"tray.answer.dispatch","resources"=>"tray.resources.dispatch","pause"=>"tray.pause.dispatch","resume"=>"tray.resume.dispatch","focus"=>"tray.focus.dispatch","capacity"=>"tray.capacity.dispatch","restart"=>"tray.restart.dispatch","stop"=>"tray.stop.dispatch","uninstall"=>"tray.uninstall.dispatch",_=>"tray.invalid.dispatch"};
+        coreq::telemetry::capture::operation(name,|| {
+            if !self.allowed.contains(&action) {return Err(("invalid-command","Unsupported queued command"));}
+            if id.is_empty() || id.len()>64 || !id.bytes().all(|b|b.is_ascii_alphanumeric()||matches!(b,b'-'|b'.')) {
+                return Err(("invalid-id","Invalid command correlation id; action not submitted"));
+            }
+            let mut frozen=message.clone();frozen.as_object_mut().map(|m|m.remove("context"));
+            let bytes=serde_json::to_vec(&frozen).map_err(|_|("request-too-large","Command payload too large; action not submitted"))?;
+            if bytes.len()>20<<10 {return Err(("request-too-large","Command payload too large; action not submitted"));}
+            let root=message["root"].as_str().filter(|root|!root.is_empty()).ok_or(("invalid-root","Project root missing; action not submitted"))?;
+            if self.worker.is_finished() {return Err(("worker-unavailable","Command worker unavailable; action not submitted"));}
+            let key=format!("{root}#{id}");let mut pending=self.pending.lock().unwrap_or_else(|e|e.into_inner());
+            if let Some(existing)=pending.get(&key) {
+                return if existing==&bytes {Ok(())} else {Err(("id-mismatch","Correlation id is already pending for a different request"))};
+            }
+            pending.insert(key.clone(),bytes);
+            if let Err(error)=self.sender.try_send(QueuedAction {id:id.into(),root:root.into(),message:message.clone(),
+                context:coreq::telemetry::capture::TraceContext::current(),dispatch:tracing::dispatcher::get_default(Clone::clone)})
+            {
+                pending.remove(&key);
+                return Err(match error {
+                    std::sync::mpsc::TrySendError::Full(_)=>("queue-full","Command queue full; action not submitted"),
+                    std::sync::mpsc::TrySendError::Disconnected(_)=>("worker-unavailable","Command worker unavailable; action not submitted"),
+                });
+            }
+            Ok(())
+        },|(code,_)|*code).map_err(|(_,message)|message.into())
+    }
+}
+
+fn queued_focus(_install:&Path,root:&Path,message:&Value)->crate::Res<Value> {
+    let receipt=act(message["a"].as_str().unwrap_or(""),root,message["label"].as_str())?.ok_or("Command confirmation unavailable; check service status")?;
+    Ok(json!({"applied_receipt":receipt}))
+}
+fn queued_answer(install:&Path,_root:&Path,message:&Value)->crate::Res<Value> {Ok(answer(install,message))}
+fn queued_resources(_install:&Path,_root:&Path,_message:&Value)->crate::Res<Value> {resources()}
+fn answer_reply(root:PathBuf,id:String,result:crate::Res<Value>)->Value {result.unwrap_or_else(|error|json!({"answerReceipt":{"root":root,"id":id,"state":"unknown","reason":error,"next":"Check delivery with the same operation"}}))}
+fn resources_reply(result:crate::Res<Value>)->Value {match result {Ok(_)=>json!({"resources_receipt":{"state":"submitted","reason":"Resources terminal submitted"}}),Err(reason)=>json!({"resources_receipt":{"state":"unknown","reason":reason}})}}
+
+// The page owns asynchronous work; a submission result cannot acknowledge its execution.
+struct WebCalls {
+    next: u64,
+    pending: std::collections::BTreeMap<u64, (Instant, tracing::Span)>,
+    counts: [u64; 4],
+    saturated: bool,
+    failed: bool,
+    notified: bool,
+    metadata_unknown: bool,
+}
+impl WebCalls {
+    fn new() -> Self {
+        let mut calls=Self{next:0,pending:Default::default(),counts:[0;4],saturated:false,failed:false,notified:false,metadata_unknown:false};
+        calls.begin("tray.web.boot",Instant::now());
+        calls
+    }
+    fn begin(&mut self, name: &'static str, now: Instant) -> Option<u64> {
+        if self.pending.len()>=64 || self.next==u64::MAX {self.fault("pending-limit");return None;}
+        let id=self.next;self.next+=1;
+        self.pending.insert(id,(now,coreq::telemetry::capture::detached_span(name)));
+        Some(id)
+    }
+    fn fault(&mut self, reason: &'static str) {
+        if !self.failed {
+            self.failed=true;
+            eprintln!("taskq tray: interface outcomes unknown ({reason}); check service status before retry");
+            let _=coreq::telemetry::capture::operation("tray.web.delivery",||Err::<(),_>(reason),|code|*code);
+        }
+    }
+    fn finish(&mut self, id: u64, result: &'static str) {
+        let Some((_,span))=self.pending.remove(&id) else {return};
+        match result {
+            "ok" => {span.record("coreq_result","observed");}
+            "script-error"|"submit-error" => {
+                span.record("coreq_result","observed");span.record("coreq_error",result);self.fault(result);
+            }
+            _ => self.fault(result), // no callback is not proof that the script failed or did not run
+        }
+    }
+    fn expire(&mut self, now: Instant) {
+        let expired:Vec<_>=self.pending.iter().filter(|(_, (start,_))|now.duration_since(*start)>=Duration::from_secs(30)).map(|(id,_)|*id).collect();
+        for id in expired {self.finish(id,"ack-timeout");}
+    }
+    fn metadata(&mut self, row:&Value)->bool {
+        let value=match web_observation(row){Ok(value)=>value,Err(_)=>{self.fault("invalid-web-observation");return false;}};
+        if let Err(error)=coreq::telemetry::capture::observe_linked(value)&&!self.metadata_unknown {
+            self.metadata_unknown=true;
+            eprintln!("taskq tray: activity history incomplete ({error}); command confirmations remain separate");
+            return true;
+        }
+        false
+    }
+    fn errors(&mut self, message: &Value) {
+        let Some(values)=message["counts"].as_array().filter(|v|v.len()==4) else {self.fault("invalid-error-report");return;};
+        let mut counts=[0;4];
+        for (i,value) in values.iter().enumerate() {
+            let Some(n)=value.as_u64().filter(|n|*n>=self.counts[i] && *n<=u32::MAX as u64) else {self.fault("invalid-error-report");return;};
+            counts[i]=n;
+        }
+        let Some(saturated)=message["saturated"].as_bool() else {self.fault("invalid-error-report");return;};
+        for (i,class) in ["script-error","unhandled-rejection","resource-error","evaluation-error"].iter().enumerate() {
+            let delta=counts[i]-self.counts[i];
+            if delta>0 {
+                // Page-wide counts have no reliable initiating click; do not invent a parent.
+                let span=coreq::telemetry::capture::detached_span("tray.web.error");
+                if !span.is_disabled() {tracing::info!(parent:&span,calls=delta);}
+                span.record("coreq_result","observed");span.record("coreq_error",*class);
+            }
+        }
+        self.counts=counts;
+        if saturated && !self.saturated {
+            self.saturated=true;
+            let _=coreq::telemetry::capture::operation("tray.web.error-counts",||Err::<(),_>("count-saturated"),|code|*code);
+            self.fault("error-count-saturated");
+        }
+        else if counts.iter().any(|n|*n>0) {self.fault("page-error");}
+    }
+}
+
+// Accept only metadata named by the actual bundled modules; the WebView supplies no content fields.
+fn web_observation(row: &Value) -> crate::Res<Value> {
+    let object=row.as_object().ok_or("invalid-web-observation")?;
+    if row.to_string().len()>4096||object.keys().any(|key|!matches!(key.as_str(),"kind"|"source"|"operation"|"trace"|"span"|"parent"|"started_ms"|"duration_us"|"outcome"|"error"|"counts")) {return Err("invalid-web-observation".into());}
+    static INVENTORY:std::sync::OnceLock<Vec<String>>=std::sync::OnceLock::new();
+    let inventory=INVENTORY.get_or_init(||serde_json::from_str(include_str!(concat!(env!("OUT_DIR"),"/web/operations.json"))).expect("build-owned web inventory"));
+    if !inventory.iter().any(|name|row["operation"].as_str()==Some(name)) {return Err("unknown-web-operation".into());}
+    let (kind,source)=match row["kind"].as_str() {
+        Some("ui.start")=>("method.start","action"),Some("ui")=>("method","action"),
+        Some("method")=>("method","diagnostic"),Some("method.aggregate")=>("method.aggregate","aggregate"),
+        Some("effect.start")=>("method.start","effect"),Some("effect")=>("method","effect"),
+        Some("effect.wait")=>("effect.wait","effect"),Some("collection")=>("collection","web"),
+        Some("diagnostic")=>("diagnostic","web"),_=>return Err("invalid-web-kind".into()),
+    };
+    if !matches!(row["outcome"].as_str(),Some("ok"|"failed"|"unknown"))||!matches!(row["error"].as_str(),Some("none"|"javascript-error"|"unowned-async"|"completion-timeout"|"collection-incomplete")) {return Err("invalid-web-outcome".into());}
+    if let Some(counts)=row.get("counts") {
+        let counts=counts.as_object().ok_or("invalid-web-counts")?;
+        if counts.len()>6||counts.iter().any(|(key,value)|!matches!(key.as_str(),"calls"|"finished"|"failed"|"unknown"|"lost"|"pending")||value.as_u64().is_none_or(|n|n>9007199254740991)) {return Err("invalid-web-counts".into());}
+    }
+    let mut value=row.clone();
+    value["product"]=json!("taskq");value["version"]=json!(crate::platform::VERSION);value["process_id"]=json!(std::process::id());
+    value["kind"]=json!(kind);value["source"]=json!(source);
+    let mut unknown=serde_json::Map::new();
+    for key in ["trace","span","parent"] {
+        if value[key].is_null() {value[key]=Value::Null;unknown.insert(key.into(),json!("aggregate-unlinked"));}
+        else if value[key].as_str().is_none_or(|id|coreq::telemetry::capture::TraceContext::decode(&format!("1 {id} {id}")).is_err()) {return Err("invalid-web-context".into());}
+    }
+    if !unknown.is_empty(){value["unknown"]=Value::Object(unknown);}
+    coreq::telemetry::Event::new(value.clone())?;
+    Ok(value)
+}
+
+fn web_result(value: &str) -> &'static str {
+    match value {"\"ok\""=>"ok","\"script-error\""=>"script-error",_=>"invalid-ack"}
+}
+fn web_script(script: &str) -> String {
+    // eval catches syntax errors too; the callback contains only a fixed result code.
+    format!("(()=>{{try{{(0,eval)({});return 'ok';}}catch(_){{try{{window.taskqWebFault('evaluation');}}catch(_){{}}return 'script-error';}}}})()",json!(script))
+}
+fn web_eval(wv: &WebView, script: &str, name: &'static str, proxy: &tao::event_loop::EventLoopProxy<Ev>, calls: &mut WebCalls) {
+    if calls.pending.contains_key(&0) {calls.fault("page-not-ready");return;}
+    let Some(id)=calls.begin(name,Instant::now()) else {return};
+    let p=proxy.clone();
+    if wv.evaluate_script_with_callback(&web_script(script),move |value| {let _=p.send_event(Ev::Evaluated(id,web_result(&value)));}).is_err() {
+        calls.finish(id,"submit-error");
+    }
+}
+
 pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> Result<(), String> {
     if snapshot.is_none() && !alone(&install) {
         return Err("taskq tray already runs on this host".into());
@@ -553,11 +790,30 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
     let mut event_loop = EventLoopBuilder::<Ev>::with_user_event().build();
     #[cfg(target_os = "macos")]
     {
-        // menu bar only: no Dock icon, no app menu
+        // Accessory keeps the tray out of the Dock; AppKit menu accelerators enable native text editing.
         use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
         event_loop.set_activation_policy(ActivationPolicy::Accessory);
         // a snapshot never takes the owner's focus (taskq.md R12)
         event_loop.set_activate_ignoring_other_apps(snapshot.is_none());
+        if snapshot.is_none() {
+            use objc2::{MainThreadOnly,sel};
+            use objc2_foundation::{MainThreadMarker,NSString};
+            use objc2_app_kit::{NSApplication,NSMenu,NSEventModifierFlags as Mod};
+            let mtm=MainThreadMarker::new().ok_or("tray text editing requires the main thread")?;
+            let app=NSApplication::sharedApplication(mtm);
+            let menu=app.mainMenu().unwrap_or_else(||NSMenu::new(mtm));
+            let edit=NSMenu::initWithTitle(NSMenu::alloc(mtm),&NSString::from_str("Edit"));
+            for (title,action,key,shift) in [
+                ("Undo",sel!(undo:),"z",false),("Redo",sel!(redo:),"z",true),
+                ("Cut",sel!(cut:),"x",false),("Copy",sel!(copy:),"c",false),
+                ("Paste",sel!(paste:),"v",false),("Select All",sel!(selectAll:),"a",false),
+            ] {
+                let item=unsafe {edit.addItemWithTitle_action_keyEquivalent(&NSString::from_str(title),Some(action),&NSString::from_str(key))};
+                item.setKeyEquivalentModifierMask(Mod::Command|if shift {Mod::Shift}else{Mod::empty()});
+            }
+            let item=unsafe {menu.addItemWithTitle_action_keyEquivalent(&NSString::from_str("Edit"),None,&NSString::from_str(""))};
+            item.setSubmenu(Some(&edit));app.setMainMenu(Some(&menu));
+        }
     }
     let proxy = event_loop.create_proxy();
     TrayIconEvent::set_event_handler(Some(move |e: TrayIconEvent| {
@@ -572,6 +828,27 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
         }
     });
     let proxy = event_loop.create_proxy();
+    let replies=proxy.clone();
+    let focus_actions=ActionQueue::start(install.clone(),&["pause","resume","focus"],true,queued_focus,move |root,id,result| {
+        let mut reply=result.unwrap_or_else(|error|json!({"text":error}));reply["root"]=json!(root);reply["id"]=json!(id);
+        let _=coreq::telemetry::capture::operation("tray.focus.report",||replies.send_event(Ev::Answer(json!({"focus_receipt":reply}))),|_|"ui-closed");
+    })?;
+    let replies=proxy.clone();
+    let capacity_actions=ActionQueue::start(install.clone(),&["capacity","restart","stop","uninstall"],true,capacity,move |root,id,result| {
+        let mut reply=result.unwrap_or_else(|error|json!({"state":"unknown","reason":error}));reply["root"]=json!(root);reply["id"]=json!(id);
+        let _=coreq::telemetry::capture::operation("tray.capacity.report",||replies.send_event(Ev::Answer(json!({"capmsg":reply}))),|_|"ui-closed");
+    })?;
+    let replies=proxy.clone();
+    let answer_actions=ActionQueue::start(install.clone(),&["answer"],true,queued_answer,move |root,id,result| {
+        let receipt=answer_reply(root,id,result);
+        let _=coreq::telemetry::capture::operation("tray.answer.report",||replies.send_event(Ev::Answer(receipt)),|_|"ui-closed");
+    })?;
+    let replies=proxy.clone();
+    let resources_actions=ActionQueue::start(install.clone(),&["resources"],false,queued_resources,move |_root,_id,result| {
+        let receipt=resources_reply(result);
+        let _=coreq::telemetry::capture::operation("tray.resources.report",||replies.send_event(Ev::Answer(receipt)),|_|"ui-closed");
+    })?;
+    let add_actions=AddOwner::start(install.clone(),proxy.clone())?;
     let mut settings = Settings::load(&install);
     let mut ui: Option<(Window, WebView)> = None;
     let mut tray: Option<TrayIcon> = None;
@@ -583,14 +860,39 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
     // snapshot pages wider than their window (#1073): `tray --snapshot` fails naming them
     let mut overflow: Vec<String> = Vec::new();
     let mut adding = Value::Null;
+    let mut add_generation=0u64;
     let mut moved = false;
     let mut asked = false;
     let mut bursts = notify::Bursts::new();
+    let mut shot_wait=None;
+    let mut web=WebCalls::new();
     event_loop.run(move |event, target, flow| {
+        crate::telemetry::diagnostic::poll(&install);
         *flow = ControlFlow::Wait;
-        let push = |ui: &Option<(Window, WebView)>, st: &Value| {
+        let native=match &event {
+            Event::WindowEvent{event:WindowEvent::Resized(_),..}=>Some("tray.window.resize"),
+            Event::WindowEvent{event:WindowEvent::Moved(_),..}=>Some("tray.window.move"),
+            Event::WindowEvent{event:WindowEvent::Focused(_),..}=>Some("tray.window.focus"),
+            Event::WindowEvent{event:WindowEvent::ThemeChanged(_),..}=>Some("tray.window.theme"),
+            Event::WindowEvent{event:WindowEvent::Destroyed,..}=>Some("tray.window.destroy"),
+            Event::WindowEvent{event:WindowEvent::CloseRequested,..}=>Some("tray.window.close"),
+            Event::RedrawRequested(_)=>Some("tray.window.redraw-request"),_=>None,
+        };
+        if let Some(name)=native {let _=coreq::telemetry::capture::operation(name,||Ok::<_,&str>(()),|error|*error);}
+
+        web.expire(Instant::now());
+        if !web.pending.contains_key(&0)&&let Some((_,wv))=&ui&&let Some(selection)=crate::telemetry::diagnostic::take_web_selection(){
+            web_eval(wv,&format!("taskq.receive({})",json!({"diagnose":selection})),"tray.web.diagnose",&proxy,&mut web);
+        }
+        if web.failed && !web.notified {
+            web.notified=true;
+            if let Some(t)=&tray {let _=t.set_tooltip(Some("TaskQ: interface outcomes unknown; check service status"));}
+            if snapshot.is_none() && let Some((_,wv))=&ui {web_eval(wv,"window.taskqWebFault('native')","tray.web.notice",&proxy,&mut web);}
+        }
+        if web.failed && snapshot.is_some() && web.pending.is_empty() {std::process::exit(1);}
+        let push = |web: &mut WebCalls, ui: &Option<(Window, WebView)>, st: &Value| {
             if let Some((_, wv)) = ui {
-                let _ = wv.evaluate_script(&format!("taskq.receive({st})"));
+                if !web.failed {web_eval(wv,&format!("taskq.receive({st})"),"tray.web.receive",&proxy,web);}
             }
         };
         match event {
@@ -604,9 +906,7 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
                 let p = proxy.clone();
                 let built = b.build(target).map_err(|e| e.to_string()).and_then(|w| {
                     // only our page: a link goes to the browser through the bridge
-                    WebViewBuilder::new().with_accept_first_mouse(true).with_html(HTML.replace("{{ANSWER_CARD_CSS}}", include_str!("answer-card.css")).replace("{{ANSWER_CARD_JS}}", include_str!("answer-card.js"))
-                        .replace("{{PROJECT_BLOCKS_CSS}}", include_str!("project-blocks.css")).replace("{{PROJECT_BLOCKS_JS}}", include_str!("project-blocks.js"))
-                        .replace("{{RESOURCE_CONTROLS_CSS}}", include_str!("resource-controls.css")).replace("{{RESOURCE_CONTROLS_JS}}", include_str!("resource-controls.js"))).with_navigation_handler(|u| !u.starts_with("http"))
+                    WebViewBuilder::new().with_accept_first_mouse(true).with_html(HTML).with_navigation_handler(|u| !u.starts_with("http"))
                         .with_ipc_handler(move |r| {
                             let _ = p.send_event(Ev::Ipc(r.into_body()));
                         })
@@ -691,12 +991,13 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
                     settings.save(&install);
                 }
                 let st = state(&install, &settings, dark, None, &adding);
-                refresh_icon(&tray, &st, &settings, dark, &mut icon_sig);
+                if !web.failed {refresh_icon(&tray, &st, &settings, dark, &mut icon_sig);}
                 notes(&install, &mut settings, &st, &mut asked, &mut bursts);
-                let sig = st.to_string().replace(&format!("\"now\":{}", st["now"]), "");
-                if sig != shown {
+                let mut comparable=st.clone();comparable.as_object_mut().expect("tray snapshot object").remove("now");
+                let sig=comparable.to_string();
+                if sig != shown && !web.pending.contains_key(&0) {
                     shown = sig;
-                    push(&ui, &st);
+                    push(&mut web,&ui, &st);
                 }
             }
             Event::UserEvent(Ev::Click(rect)) => {
@@ -718,7 +1019,7 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
                 w.set_focus();
                 shown_at = Instant::now();
             }
-            Event::UserEvent(Ev::Answer(receipt)) => push(&ui, &receipt),
+            Event::UserEvent(Ev::Answer(receipt)) => push(&mut web,&ui, &receipt),
             // a notification click opens the menu (or raises the pinned window) on that card (M14)
             Event::UserEvent(Ev::Note(id)) => {
                 let Ok(id) = serde_json::from_str::<Value>(&id) else { return };
@@ -729,24 +1030,41 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
                 w.set_visible(true);
                 w.set_focus();
                 if id["root"].is_string() {
-                    push(&ui, &json!({"open": {"root": id["root"], "n": id["n"], "kind": id["k"], "title": id["t"]}}));
+                    push(&mut web,&ui, &json!({"open": {"root": id["root"], "n": id["n"], "kind": id["k"], "title": id["t"]}}));
                 }
             }
+            Event::UserEvent(Ev::Evaluated(id,result)) => {
+                web.finish(id,result);
+                if web.pending.is_empty() && let Some(next)=shot_wait.take() {let _=proxy.send_event(next);}
+            }
             Event::UserEvent(Ev::Ipc(m)) => {
-                let Ok(m) = serde_json::from_str::<Value>(&m) else { return };
+                let Ok(m) = serde_json::from_str::<Value>(&m) else {web.fault("invalid-ipc");return;};
                 let Some((w, _)) = &ui else { return };
+                if m["a"]=="web-error" {web.errors(&m);return;}
+                if m["a"]=="web-observation" {
+                    if web.metadata(&m["row"])&&let Some(tray)=&tray {
+                        let _=tray.set_tooltip(Some("TaskQ: activity history incomplete; check each command confirmation"));
+                    }
+                    return;
+                }
+                let context=match m["context"].as_str(){Some(text)=>match coreq::telemetry::capture::TraceContext::decode(text){Ok(context)=>Some(context),Err(_)=>{web.fault("invalid-web-context");return;}},None=>None};
+                let _continuation=context.as_ref().map(|context|context.span().entered());
+                if web.failed {return;}
                 match m["a"].as_str().unwrap_or("") {
                     "answer" if snapshot.is_none() => {
-                        let (p, install) = (proxy.clone(), install.clone());
-                        std::thread::spawn(move || { let _ = p.send_event(Ev::Answer(answer(&install, &m))); });
+                        let mut request=m.clone();request["id"]=m["op"]["id"].clone();
+                        if let Err(error)=answer_actions.submit(&request) {
+                            push(&mut web,&ui,&json!({"answerReceipt":{"root":m["root"],"id":m["op"]["id"],"state":"rejected","reason":error,"next":"Check delivery with the same operation"}}));
+                        }
                     }
                     "overflow" if snapshot.is_some() => overflow.push(format!("{} by {} px", m["shot"].as_str().unwrap_or("?"), m["x"])),
                     "ready" => {
+                        web.finish(0,"ok");
                         if snapshot.is_some() {
                             let _ = proxy.send_event(Ev::Shot);
                             return;
                         }
-                        push(&ui, &state(&install, &settings, dark, None, &adding));
+                        push(&mut web,&ui, &state(&install, &settings, dark, None, &adding));
                     }
                     "size" | "resize" => {
                         let Some((width, height)) = m["w"].as_f64().zip(m["h"].as_f64()).filter(|(w, h)| w.is_finite() && h.is_finite()) else { return };
@@ -774,7 +1092,7 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
                         settings.pin.top = !settings.pin.top;
                         w.set_always_on_top(settings.pin.top);
                         settings.save(&install);
-                        push(&ui, &state(&install, &settings, dark, None, &adding));
+                        push(&mut web,&ui, &state(&install, &settings, dark, None, &adding));
                     }
                     "pin" => {
                         settings.pin.pinned = !settings.pin.pinned;
@@ -788,13 +1106,15 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
                         }
                         settings.save(&install);
                         w.set_focus();
-                        push(&ui, &state(&install, &settings, dark, None, &adding));
+                        push(&mut web,&ui, &state(&install, &settings, dark, None, &adding));
                     }
                     "drag" => {
                         let _ = w.drag_window();
                     }
                     "resources" => {
-                        std::thread::spawn(resources);
+                        let id=format!("resources-{}",std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0,|d|d.as_nanos()));
+                        let request=json!({"a":"resources","root":install,"id":id});
+                        if let Err(error)=resources_actions.submit(&request) {push(&mut web,&ui,&json!({"resources_receipt":{"state":"rejected","reason":error}}));}
                     }
                     "open" => {
                         if let Some(u) = m["url"].as_str().filter(|u| u.starts_with("https://") || u.starts_with("http://")) {
@@ -806,7 +1126,7 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
                             settings.save(&install);
                             notes(&install, &mut settings, &Value::Null, &mut asked, &mut bursts);
                         }
-                        push(&ui, &state(&install, &settings, dark, None, &adding));
+                        push(&mut web,&ui, &state(&install, &settings, dark, None, &adding));
                     }
                     "notify-test" if snapshot.is_none() => {
                         if let Some(k) = m["kind"].as_str().filter(|k| notify::KINDS.contains(k)) {
@@ -819,67 +1139,79 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
                         settings.save(&install);
                         let st = state(&install, &settings, dark, None, &adding);
                         refresh_icon(&tray, &st, &settings, dark, &mut icon_sig);
-                        push(&ui, &st);
+                        push(&mut web,&ui, &st);
                     }
                     // `Edit limits` after the page's confirm: the same write as `service capacity` (§ 5), this host only
-                    "capacity" => {
+                    "capacity" | "restart" | "stop" | "uninstall" => {
                         let root = m["root"].as_str().unwrap_or("");
-                        if roots(&install).iter().any(|r| r == root) {
-                            let msg = capacity(Path::new(root), &m);
-                            push(&ui, &json!({"capmsg": {"root": root, "id": m["id"], "text": msg}}));
+                        if let Err(error)=capacity_actions.submit(&m) {
+                            push(&mut web,&ui, &json!({"capmsg": {"root": root, "id": m["id"], "state":"rejected","reason":error}}));
                         }
                     }
                     // Add project (§ 4): the folder comes only from the OS picker, never from the page
-                    "add" => {
-                        adding = json!({"state": "picking"});
-                        push(&ui, &state(&install, &settings, dark, None, &adding));
-                        let p = proxy.clone();
-                        std::thread::spawn(move || {
-                            let v = pick().map_or(Value::Null, |d| classify(&d, selftest));
-                            let _ = p.send_event(Ev::Added(v));
-                        });
+                    "add" if adding.is_null() => {
+                        add_generation=add_generation.wrapping_add(1);
+                        let generation=add_generation;
+                        adding = json!({"state": "picking", "generation":generation});
+                        push(&mut web,&ui, &state(&install, &settings, dark, None, &adding));
+                        if let Err(error)=add_actions.submit(generation,None) {adding=json!({"state":"add failed","reason":error});push(&mut web,&ui,&state(&install,&settings,dark,None,&adding));}
                     }
-                    "add-cancel" => {
-                        adding = Value::Null;
-                        push(&ui, &state(&install, &settings, dark, None, &adding));
+                    "add-cancel" if adding["state"]=="picking" => {
+                        add_generation=add_generation.wrapping_add(1);
+                        adding = json!({"state":"picking dismissed","generation":add_generation});
+                        push(&mut web,&ui, &state(&install, &settings, dark, None, &adding));
                     }
+                    "add-cancel" if adding["state"]=="installing" => {
+                        add_generation=add_generation.wrapping_add(1);
+                        adding = json!({"state":"installing dismissed","generation":add_generation});
+                        push(&mut web,&ui, &state(&install, &settings, dark, None, &adding));
+                    }
+                    "add-cancel" => {adding=Value::Null;push(&mut web,&ui,&state(&install,&settings,dark,None,&adding));}
                     "add-install" if adding["kind"] == "taskq" && adding["state"] == "picked" => {
                         adding["state"] = json!("installing");
-                        push(&ui, &state(&install, &settings, dark, None, &adding));
-                        let (p, a, inst) = (proxy.clone(), adding.clone(), install.clone());
-                        std::thread::spawn(move || {
-                            let _ = p.send_event(Ev::Added(install_service(&inst, a)));
-                        });
+                        push(&mut web,&ui, &state(&install, &settings, dark, None, &adding));
+                        let generation=adding["generation"].as_u64().unwrap_or(0);
+                        if let Err(error)=add_actions.submit(generation,Some(adding.clone())) {adding["state"]=json!("install failed");adding["reason"]=json!(error);push(&mut web,&ui,&state(&install,&settings,dark,None,&adding));}
                     }
                     "add-setup" if matches!(adding["kind"].as_str(), Some("new" | "plain")) => {
                         let text = format!("Set up {} as a taskq project", adding["name"].as_str().unwrap_or("this folder"));
                         ai(&install, "ai-send", &json!({"text": text, "onboard": adding["path"]}));
                         adding = Value::Null;
-                        push(&ui, &state(&install, &settings, dark, None, &adding));
+                        push(&mut web,&ui, &state(&install, &settings, dark, None, &adding));
                     }
                     a if a.starts_with("ai-") => {
                         let mut m = m.clone();
                         m["onboard"] = Value::Null;
                         ai(&install, a, &m);
-                        push(&ui, &state(&install, &settings, dark, None, &adding));
+                        push(&mut web,&ui, &state(&install, &settings, dark, None, &adding));
                     }
                     a => {
                         // only a registered project (§ 4): the page never names a path of its own
                         let root = m["root"].as_str().unwrap_or("");
                         if roots(&install).iter().any(|r| r == root) {
-                            act(a, Path::new(root), m["label"].as_str());
+                            let result=if matches!(a,"pause"|"resume"|"focus") {
+                                focus_actions.submit(&m)
+                            } else {act(a,Path::new(root),m["label"].as_str()).map(|_|())};
+                            if let Err(error) = result {
+                                let key=if matches!(a,"pause"|"resume"|"focus") {"focus_receipt"} else {"action_error"};
+                                push(&mut web,&ui, &json!({key:{"root":root,"id":m["id"],"text":error}}));
+                            }
+                        } else if matches!(a,"pause"|"resume"|"focus") {
+                            push(&mut web,&ui,&json!({"focus_receipt":{"root":root,"id":m["id"],"text":"Project is no longer registered; command not submitted"}}));
                         }
                     }
                 }
             }
-            Event::UserEvent(Ev::Added(v)) => {
-                adding = v;
-                push(&ui, &state(&install, &settings, dark, None, &adding));
+            Event::UserEvent(Ev::Added(generation,v)) => {
+                if matches!(adding["state"].as_str(),Some("picking dismissed"|"installing dismissed"))&&add_generation==generation.wrapping_add(1) {adding=Value::Null;push(&mut web,&ui,&state(&install,&settings,dark,None,&adding));return;}
+                if !apply_added(&mut adding,add_generation,generation,v) {return;}
+                push(&mut web,&ui, &state(&install, &settings, dark, None, &adding));
                 if let (Some((w, _)), false) = (&ui, adding.is_null()) {
                     w.set_visible(true);
                     w.set_focus();
                 }
             }
+            Event::UserEvent(Ev::Shot | Ev::Shot2) if web.failed => {}
             // snapshot mode: per step push a state, wait for layout, capture, next
             Event::UserEvent(Ev::Shot) => {
                 let dir = snapshot.clone().unwrap_or_default();
@@ -908,6 +1240,9 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
                     }
                 }
                 let Some((theme, page, font, script)) = steps.get(step).cloned() else {
+                    if !web.pending.is_empty() {
+                        shot_wait=Some(Ev::Shot);return;
+                    }
                     println!("snapshots in {}", dir.display());
                     if !overflow.is_empty() {
                         eprintln!("horizontal overflow: {}", overflow.join(", "));
@@ -918,9 +1253,9 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
                 };
                 let mut s = settings.clone();
                 s.font = font;
-                push(&ui, &state(&install, &s, theme == "dark", Some((theme, &page)), &Value::Null));
+                push(&mut web,&ui, &state(&install, &s, theme == "dark", Some((theme, &page)), &Value::Null));
                 if let (Some((_, wv)), false) = (&ui, script.is_empty()) {
-                    let _ = wv.evaluate_script(script);
+                    web_eval(wv,script,"tray.web.fixture",&proxy,&mut web);
                 }
                 let p = proxy.clone();
                 std::thread::spawn(move || {
@@ -933,7 +1268,10 @@ pub fn run(install: PathBuf, snapshot: Option<PathBuf>, routes: Vec<String>) -> 
                 let dir = snapshot.clone().unwrap_or_default();
                 let p = proxy.clone();
                 let name = format!("popover-{}.png", shot_name(&install, &routes, step));
-                let _ = wv.evaluate_script(&OVERFLOW.replace("NAME", &name));
+                if !web.pending.is_empty() {
+                    shot_wait=Some(Ev::Shot2);return;
+                }
+                web_eval(wv,&format!("taskq.measure({})",json!(&name)),"tray.web.measure",&proxy,&mut web);
                 step += 1;
                 capture(wv, dir.join(name), move || {
                     let _ = p.send_event(Ev::Shot);
@@ -957,10 +1295,6 @@ fn popover_size(m: &Value, max: f64, scale: f64) -> (u32, u32) {
 
 /// Reports a snapshot page that scrolls horizontally or clips content inside the menu (#1073), and a button whose label
 /// is wider than the button, so the text crosses its border (#1049).
-const OVERFLOW: &str = "(()=>{const e=document.documentElement,m=document.querySelector('.menu'),x=Math.max(e.scrollWidth-e.clientWidth,m.scrollWidth-m.clientWidth);
-if(x>0)window.ipc.postMessage(JSON.stringify({a:'overflow',shot:'NAME',x}));
-const seen=new Set();for(const b of m.querySelectorAll('button')){const t=b.textContent.trim().slice(0,24);
-if(b.offsetParent&&b.scrollWidth>b.clientWidth+1&&!seen.has(t)){seen.add(t);window.ipc.postMessage(JSON.stringify({a:'overflow',shot:'NAME button '+t,x:b.scrollWidth-b.clientWidth}));}}})()";
 
 /// The `actions` snapshot: a refused custom range (menu.md M6), without applying a setting.
 const ACTIONS: &str = "(()=>{const q=s=>document.querySelector(s),put=(s,v)=>{const i=q(s);i.value=v;i.dispatchEvent(new Event('input',{bubbles:true}));};
@@ -1012,7 +1346,7 @@ fn state(install: &Path, s: &Settings, dark: bool, snap: Option<(&str, &str)>, a
     let url = |rgba: &Rgba| format!("data:image/png;base64,{}", base64(&rgba.png()));
     let mut st = json!({"platform": if cfg!(windows) { "windows" } else { "macos" }, "version": crate::platform::VERSION,
         "host": ps.iter().find_map(|p| p["host"].as_str()).unwrap_or("?"), "view": s.view, "font": s.font, "period": s.period, "pinned": s.pin.pinned, "top": s.pin.top, "size": s.pin.size,
-        "now": now(), "projects": ps, "notify": notify_state(&s.notify, &ps), "agents": agents(&ps), "ai": {"target": target(install), "request": newest(install), "draft": requests_file(install)["draft"], "history": requests_file(install)["history"]}, "add": add, "history": {"start": start, "end": end, "tz": s.tz, "bins": sum.bins, "since": sum.since},
+        "now": now(), "service":crate::host::service_status(install),"lifecycle":crate::lifecycle::status(install,None),"restart_review":crate::lifecycle::review(install,"review").unwrap_or_else(|reason|json!({"state":"unknown","reason":reason})),"stop_review":crate::lifecycle::stop_review(install,"review").unwrap_or_else(|reason|json!({"state":"unknown","reason":reason})),"projects": ps, "notify": notify_state(&s.notify, &ps), "agents": agents(&ps), "ai": {"target": target(install), "request": newest(install), "draft": requests_file(install)["draft"], "history": requests_file(install)["history"]}, "add": add, "history": {"start": start, "end": end, "tz": s.tz, "bins": sum.bins, "since": sum.since},
         // § 4 Data: a corrupt tray.json names its reason while the defaults show
         "settings_error": crate::data::json(&install.join("tray.json")).err()});
     if cfg!(target_os = "macos") {
@@ -1181,27 +1515,30 @@ fn work_area(m: &tao::monitor::MonitorHandle) -> (i32, i32, i32, i32) {
     }
 }
 
-fn act(action: &str, root: &Path, label: Option<&str>) {
+#[tracing::instrument(name="tray.act",skip_all,fields(coreq_operation=match action {
+    "pause"|"resume"|"focus"|"update"|"restart"|"log"|"folder"|"incident-report"|"incident-manual"|"stop"|"uninstall"=>action,
+    _=>"invalid",
+}))]
+fn act(action: &str, root: &Path, label: Option<&str>) -> crate::Res<Option<String>> {
     let d = crate::dot(root);
     match action {
-        "pause" => { let _ = crate::pause(root); }
+        "pause" => return crate::pause(root,false).map(Some),
         "resume" => {
-            let _ = crate::resume(root);
+            return crate::resume(root).map(|(_,receipt)|Some(receipt));
         }
         // a label of the project's open tasks, never `all` (§ 4)
         "focus" => {
             if let Some(l) = label.filter(|l| crate::status_labels(root).iter().any(|x| x == l)) {
-                let _ = crate::set_focus(root, l, None);
-            }
+                return crate::set_focus(root, l, None).map(Some);
+            } else { return Err("Label is no longer available; refresh and choose again".into()); }
         }
         // `Update now` (menu.md M9): the service checks at once (§ 4 step 7); the page waits for the version in status.json
         "update" => {
-            let _ = fs::write(d.join("update"), "");
-            crate::poke(root);
+            fs::write(d.join("update"), "").map_err(|e| e.to_string())?;
+            crate::poke(root)?;
         }
-        "restart" => {
-            let _ = fs::write(d.join("restart"), "");
-            crate::poke(root);
+        "restart" | "stop" | "uninstall" => {
+            return Err("Host lifecycle action needs a reviewed request; refresh the Services panel".into());
         }
         "log" => {
             let s: Value = fs::read_to_string(d.join("status.json")).ok().and_then(|x| serde_json::from_str(&x).ok()).unwrap_or_default();
@@ -1217,23 +1554,9 @@ fn act(action: &str, root: &Path, label: Option<&str>) {
             }
         }
         "incident-manual" => open(&format!("https://github.com/{}/issues/new", crate::platform::RELEASE_REPO)),
-        // a separate process: on macOS `launchctl bootout` kills the service's process group, this tray included
-        "stop" | "uninstall" => {
-            let Ok(me) = std::env::current_exe() else {
-                return;
-            };
-            let mut c = std::process::Command::new(me);
-            c.args(["service", action])
-                .current_dir(root)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null());
-            #[cfg(unix)]
-            std::os::unix::process::CommandExt::process_group(&mut c, 0);
-            let _ = crate::platform::quiet(&mut c).spawn();
-        }
         _ => {}
     }
+    Ok(None)
 }
 
 fn incident_path(root: &Path, incident: &Value) -> Option<PathBuf> {
@@ -1266,41 +1589,55 @@ if (-not (Get-Command btop -ErrorAction SilentlyContinue)) {
 btop
 "#;
 
-fn resources() {
+fn resources() -> crate::Res<Value> {
     let file = std::env::temp_dir().join(if cfg!(windows) { "taskq-resources.ps1" } else { "taskq-resources.command" });
-    if fs::write(&file, if cfg!(windows) { BTOP_PS1 } else { BTOP_SH }).is_err() {
-        return;
-    }
-    // not `quiet`: the terminal window is the point; waited on its own thread, no zombie
-    let _ = if cfg!(windows) {
-        std::process::Command::new("conhost.exe").args(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]).arg(&file).status()
+    fs::write(&file, if cfg!(windows) { BTOP_PS1 } else { BTOP_SH }).map_err(|e|e.to_string())?;
+    // The terminal owns its human-driven lifetime. Submission does not claim that btop installed or appeared.
+    let mut command=if cfg!(windows) {
+        let path=file.display().to_string().replace('\'',"''");let mut c=std::process::Command::new("powershell");
+        c.args(["-NoProfile","-Command",&format!("$args=@('powershell','-NoProfile','-ExecutionPolicy','Bypass','-File','\"{path}\"'); Start-Process -FilePath 'conhost.exe' -ArgumentList $args -ErrorAction Stop")]);c
     } else {
         #[cfg(unix)]
-        let _ = fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o755));
-        std::process::Command::new("open").args(["-a", "Terminal"]).arg(&file).status()
+        fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o755)).map_err(|e|e.to_string())?;
+        let mut c=std::process::Command::new("open");c.args(["-a", "Terminal"]).arg(&file);c
     };
+    let output=crate::platform::output("tray.resources.submit",&mut command,Duration::from_secs(30))?;
+    if !output.status.success() {return Err(String::from_utf8_lossy(&output.stderr).lines().find(|line|!line.trim().is_empty()).unwrap_or("resource terminal submission failed").chars().take(160).collect());}
+    Ok(json!({"state":"submitted"}))
 }
 
 /// The OS folder picker; None on cancel.
-fn pick() -> Option<PathBuf> {
+fn pick() -> Result<Option<PathBuf>,String> {
     let mut c = if cfg!(windows) {
         let mut c = std::process::Command::new("powershell");
-        c.args(["-NoProfile", "-STA", "-Command", "Add-Type -AssemblyName System.Windows.Forms; $d = New-Object System.Windows.Forms.FolderBrowserDialog; $d.Description = 'Add project'; if ($d.ShowDialog() -eq 'OK') { $d.SelectedPath }"]);
+        c.args(["-NoProfile", "-STA", "-Command", "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); Add-Type -AssemblyName System.Windows.Forms; $d = New-Object System.Windows.Forms.FolderBrowserDialog; $d.Description = 'Add project'; if ($d.ShowDialog() -eq 'OK') { [Console]::Out.Write($d.SelectedPath) }"]);
         c
     } else {
         let mut c = std::process::Command::new("osascript");
         c.args(["-e", "activate", "-e", "POSIX path of (choose folder with prompt \"Add project\")"]);
         c
     };
-    let o = crate::platform::quiet(&mut c).output().ok().filter(|o| o.status.success())?;
-    let p = String::from_utf8_lossy(&o.stdout).trim().trim_end_matches(['/', '\\']).to_string();
-    (!p.is_empty()).then(|| PathBuf::from(p))
+    coreq::telemetry::capture::operation("tray.picker",|| {
+    let o = crate::platform::quiet(&mut c).output().map_err(|e|format!("folder picker did not start: {e}"))?;
+    pick_result(o)
+    },|_|"picker-error")
+}
+fn pick_result(o:std::process::Output)->Result<Option<PathBuf>,String> {
+    if !o.status.success() {
+        let error=String::from_utf8_lossy(&o.stderr);
+        if !cfg!(windows)&&error.trim_end().ends_with("(-128)") {return Ok(None);}
+        return Err(error.lines().find(|line|!line.trim().is_empty()).unwrap_or("folder picker failed").chars().take(160).collect());
+    }
+    let p=std::str::from_utf8(&o.stdout).map_err(|_|"folder picker returned a non-UTF-8 path; selection not applied")?;
+    let p=p.strip_suffix("\r\n").or_else(||p.strip_suffix('\n')).unwrap_or(p);
+    let p=p.to_string();
+    Ok((!p.is_empty()).then(|| PathBuf::from(p)))
 }
 
 /// `taskq selftest` in `dir`: its first error line on failure.
 fn selftest(dir: &Path) -> Result<(), String> {
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
-    let o = crate::platform::quiet(std::process::Command::new(me).arg("selftest").current_dir(dir).env("TASKQ_ROOT", dir)).output().map_err(|e| e.to_string())?;
+    let o = crate::platform::output("tray.selftest",std::process::Command::new(me).arg("selftest").current_dir(dir).env("TASKQ_ROOT", dir),Duration::from_secs(30))?;
     let text = String::from_utf8_lossy(&o.stderr).to_string() + &String::from_utf8_lossy(&o.stdout);
     if o.status.success() { Ok(()) } else { Err(text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("selftest failed").chars().take(160).collect()) }
 }
@@ -1328,7 +1665,7 @@ fn install_service(install: &Path, mut a: Value) -> Value {
         // a separate process group: launchctl must not take the tray with it
         #[cfg(unix)]
         std::os::unix::process::CommandExt::process_group(&mut c, 0);
-        let o = crate::platform::quiet(&mut c).output().map_err(|e| e.to_string())?;
+        let o = crate::platform::output("tray.install", &mut c, Duration::from_secs(60))?;
         let text = String::from_utf8_lossy(&o.stderr).to_string() + &String::from_utf8_lossy(&o.stdout);
         if !o.status.success() {
             return Err(text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("service install failed").to_string());
@@ -1340,39 +1677,36 @@ fn install_service(install: &Path, mut a: Value) -> Value {
     a
 }
 
+/// A picker/install result belongs only to the currently presented operation. Cancel invalidates its generation;
+/// it cannot stop an install that was already submitted.
+fn apply_added(adding:&mut Value,current:u64,generation:u64,value:Value)->bool {
+    if adding.is_null()||current!=generation||value["generation"].as_u64()!=Some(generation) {return false;}
+    if value["state"]=="cancelled" {*adding=Value::Null;return true;}
+    *adding=value;true
+}
+
 /// Write the page's capacity edit for this host; the outcome line for the page.
-fn capacity(root: &Path, m: &Value) -> String {
-    let set = &m["set"];
-    let mut e = crate::CapEdit { gate: set["enabled"].as_bool(), ..Default::default() };
-    let num = |k: &str| set[k].as_u64().map(|n| u32::try_from(n).map_err(|_| format!("{k}: not an integer 0..{}", u32::MAX))).transpose();
-    let r = (|| {
-        e.cpu_max = num("cpu_max")?;
-        e.memory_min = num("memory_min")?;
-        e.mode = match &set["mode"] {
-            Value::Null => None,
-            m if m == "auto" || m == "fixed" => Some(m == "auto"),
-            m => return Err(format!("mode: auto or fixed, not {m}")),
-        };
-        e.max = match set.get("maximum") {
-            None => None,
-            Some(Value::Null) => Some(None),
-            Some(n) => Some(Some(n.as_u64().and_then(|n| u32::try_from(n).ok()).ok_or(format!("maximum: not an integer 0..{}", u32::MAX))?)),
-        };
-        for (rt, n) in set["limits"].as_object().into_iter().flatten() {
-            e.limits.insert(rt.clone(), n.as_u64().and_then(|n| u32::try_from(n).ok()).ok_or(format!("{rt}: not an integer 0..{}", u32::MAX))?);
-        }
-        let me = crate::load(root)?.0.me;
-        crate::write_capacity(root, &me, &e, Some(&m["expect"]))
-    })();
-    match r {
-        Ok((old, new)) => format!("Saved: {}", crate::cap_changes(&old, &new)),
-        Err(e) => format!("Error: {e}"),
+fn capacity(install:&Path,root: &Path,m: &Value) -> crate::Res<Value> {
+    if matches!(m["a"].as_str(),Some("restart"|"stop"|"uninstall")) {
+        let mut request=m.clone();let object=request.as_object_mut().ok_or("invalid restart message")?;
+        for key in ["context","a","root"] {object.remove(key);}
+        if request["action"].as_str().unwrap_or("restart")!=m["a"].as_str().unwrap_or("") {return Err("lifecycle action differs from its reviewed request".into());}
+        if m["a"]=="uninstall"&&request["project"]!=json!(root.canonicalize().map_err(|e|e.to_string())?) {return Err("Uninstall root differs from its reviewed request".into());}
+        return crate::lifecycle::submit(install,&request);
     }
+    let mut input=m.clone();input.as_object_mut().ok_or("invalid capacity message")?.remove("context");
+    if !crate::resources::keys(&input,&["a","root","id","ops","issued_at","expires_at"]) {
+        return Ok(json!({"state":"rejected","reason":"Unsupported host capacity payload; refresh and review current settings"}));
+    }
+    let request=json!({"id":input["id"],"ops":input["ops"],"issued_at":input["issued_at"],"expires_at":input["expires_at"]});
+    if let Err(error)=crate::host::capacity_request(&request) {return Ok(json!({"state":"rejected","reason":error}));}
+    let policy=crate::host::Policy::read(install)?;
+    crate::host::local_capacity(install,&policy.me,&request)
 }
 
 fn open(arg: &str) {
     let opener = if cfg!(windows) { "explorer" } else { "open" };
-    let _ = crate::platform::quiet(std::process::Command::new(opener).arg(arg)).spawn();
+    let _ = coreq::telemetry::capture::operation("tray.open-request",||crate::platform::quiet(std::process::Command::new(opener).arg(arg)).spawn().map(|_|()),|_|"spawn");
 }
 
 /// The menu bar's theme: macOS follows the app appearance; the Windows taskbar has its own setting.
@@ -1381,7 +1715,7 @@ fn is_dark(_w: &Window) -> bool {
     {
         let mut c = std::process::Command::new("reg");
         c.args(["query", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize", "/v", "SystemUsesLightTheme"]);
-        let out = crate::platform::quiet(&mut c).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+        let out = crate::platform::output("tray.theme", &mut c, Duration::from_secs(10)).map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
         !out.contains("0x1")
     }
     #[cfg(not(windows))]
@@ -1466,7 +1800,7 @@ fn fit_status_image(k: f32) {
     });
 }
 
-fn base64(b: &[u8]) -> String {
+pub(crate) fn base64(b: &[u8]) -> String {
     const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut s = String::new();
     for c in b.chunks(3) {
@@ -1529,6 +1863,181 @@ fn capture(wv: &WebView, path: PathBuf, done: impl Fn() + 'static) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Chain: native delivery -> exact JS outcome or unknown -> bounded safe shared observations.
+    #[test]
+    fn web_execution_requires_acknowledgment_and_bounds_error_reports() {
+        crate::with_test_capture(|store,_| {
+            let now=Instant::now();
+            let mut calls=WebCalls::new();calls.finish(0,"ok");
+            for (name,result) in [("tray.web.success","ok"),("tray.web.exception","script-error"),("tray.web.malformed","invalid-ack")] {
+                let id=calls.begin(name,now).unwrap();calls.finish(id,result);calls.finish(id,"ok");
+            }
+            let expired=calls.begin("tray.web.expired",now).unwrap();
+            calls.expire(now+Duration::from_secs(29));assert!(calls.pending.contains_key(&expired));
+            calls.expire(now+Duration::from_secs(30));assert!(calls.pending.is_empty());calls.finish(expired,"ok");
+            for _ in 0..64 {assert!(calls.begin("tray.web.pending",now).is_some());}
+            assert!(calls.begin("tray.web.overflow",now).is_none());assert_eq!(calls.pending.len(),64);
+            for counts in [json!([1,0,0,0]),json!([101,1,1,1]),json!([101,1,1,1])] {
+                calls.errors(&json!({"counts":counts,"saturated":false}));
+            }
+            for counts in [json!([1,1,1,1]),json!([-1,0,0,0]),json!([4294967296_u64,1,1,1]),json!([101]),json!(null)] {
+                calls.errors(&json!({"counts":counts,"saturated":false}));assert_eq!(calls.counts,[101,1,1,1]);
+            }
+            calls.errors(&json!({"counts":[101,1,1,1],"saturated":true}));
+            calls.errors(&json!({"counts":[101,1,1,1],"saturated":true}));
+            assert!(calls.failed && calls.saturated);drop(calls);
+            tracing::dispatcher::get_default(|d|d.downcast_ref::<coreq::telemetry::capture::Capture>().unwrap().flush().unwrap());
+            let page=store.export(0,0,1024).unwrap();
+            let rows:Vec<_>=page["events"].as_array().unwrap().iter().map(|r|&r["observation"]).filter(|r|r["kind"]=="method").collect();
+            for (name,result) in [("success","ok"),("exception","failed"),("malformed","unknown"),("expired","unknown")] {
+                let found:Vec<_>=rows.iter().filter(|r|r["operation"]==format!("taskq.operation.tray.web.{name}")).collect();
+                assert_eq!(found.len(),1,"duplicate/late callback changed {name}");assert_eq!(found[0]["outcome"],result);
+            }
+            assert_eq!(rows.iter().filter(|r|r["operation"]=="taskq.operation.tray.web.pending"&&r["outcome"]=="unknown").count(),64);
+            let errors:Vec<_>=rows.iter().filter(|r|r["operation"]=="taskq.operation.tray.web.error").collect();
+            assert_eq!(rows.iter().filter(|r|r["operation"]=="taskq.operation.tray.web.error-counts"&&r["error"]=="count-saturated").count(),1);
+            assert_eq!(errors.len(),5);assert_eq!(errors.iter().map(|r|r["calls"].as_u64().unwrap()).sum::<u64>(),104);
+            assert!(errors.iter().all(|r|r["outcome"]=="failed"));
+            assert_eq!(web_result("true"),"invalid-ack");assert_eq!(web_result("\"ok\""),"ok");
+        });
+    }
+
+    // Chain: bounded UI submission -> owned worker -> same-trace receipt -> stale registration refusal.
+    #[test]
+    fn queued_focus_actions_keep_context_and_refuse_overflow_without_blocking() {
+        crate::with_test_capture(|store,dir| {
+            let root=dir.join("project");let install=dir.join("install");
+            fs::create_dir_all(crate::dot(&root)).unwrap();fs::create_dir_all(&install).unwrap();
+            fs::write(install.join("projects"),format!("{}\n",root.display())).unwrap();
+            fs::write(crate::dot(&root).join("focus"),"area-maps").unwrap();
+            let (result_tx,result_rx)=std::sync::mpsc::channel();
+            let (release_tx,release_rx)=std::sync::mpsc::channel();
+            let queue=ActionQueue::start(install.clone(),&["pause","resume","focus"],true,queued_focus,move |root,id,result| {
+                result_tx.send((root,id,result)).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            }).unwrap();
+            let message=|action:&str,id:&str|json!({"a":action,"root":root,"id":id});
+            let _click=tracing::info_span!("fixture.click").entered();
+            for invalid in [String::new(),"../outside".into(),"x".repeat(65)] {
+                assert!(queue.submit(&message("pause",&invalid)).unwrap_err().contains("correlation id"));
+                assert_eq!(crate::data::focus(&root).unwrap(),["area-maps"]);
+            }
+            queue.submit(&message("pause","tray.1")).unwrap();
+            let (reported,id,result)=result_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            assert_eq!(reported,root);assert_eq!(id,"tray.1");let applied=result.unwrap()["applied_receipt"].as_str().unwrap().to_string();
+            assert!(queue.submit(&message("pause","tray.1")).is_ok(),"the same pending operation coalesces");
+            assert!(queue.submit(&message("resume","tray.1")).unwrap_err().contains("different request"),"an id cannot be repurposed while pending");
+            let snapshot=crate::control::snapshot(&root,&mut None,&mut None).unwrap();
+            assert_eq!(snapshot.command["applied_receipt"],applied);
+            let status=json!({"focus_command":snapshot.command,"focus":snapshot.focus,"tasks":[],"complete":true});
+            fs::write(crate::dot(&root).join("status.json"),status.to_string()).unwrap();
+            assert_eq!(project(&install,root.to_str().unwrap())["focus_command"],status["focus_command"]);
+            for n in 0..16 {queue.submit(&message("resume",&format!("queued-{n}"))).unwrap();}
+            assert!(queue.submit(&message("resume","overflow")).unwrap_err().contains("queue full"));
+            assert!(crate::data::focus(&root).unwrap().is_empty());
+            // Queued intent cannot act on a project removed after submission.
+            fs::write(install.join("projects"),"").unwrap();
+            for n in 0..16 {
+                release_tx.send(()).unwrap();
+                let (reported,id,result)=result_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+                assert_eq!(reported,root);assert_eq!(id,format!("queued-{n}"));assert!(result.unwrap_err().contains("no longer registered"));
+            }
+            release_tx.send(()).unwrap();
+            let ActionQueue{sender,worker,..}=queue;drop(sender);worker.join().unwrap();
+            assert!(crate::data::focus(&root).unwrap().is_empty());
+            let page=store.export(0,0,1024).unwrap();
+            let rows:Vec<_>=page["events"].as_array().unwrap().iter().map(|r|&r["observation"]).collect();
+            let receipts:Vec<_>=rows.iter().copied().filter(|r|r["source"]=="command").collect();
+            assert_eq!(receipts.len(),3,"refused queued actions mutated the project");
+            let click=rows.iter().find(|r|r["operation"]=="taskq.fixture.click").unwrap();
+            assert_eq!(receipts[0]["trace"],click["trace"]);assert_eq!(receipts[1]["trace"],click["trace"]);
+            assert_eq!(receipts[1]["kind"],"command.applied");
+            assert_eq!(receipts[2]["kind"],"command.observed");
+        });
+    }
+
+    // H-A2: a blocked host-policy write cannot delay the independent restrictive Pause command.
+    #[test]
+    fn blocked_capacity_does_not_block_pause() {
+        crate::with_test_capture(|_store,dir| {
+            let root=dir.join("project");let install=dir.join("install");
+            fs::create_dir_all(crate::dot(&root)).unwrap();fs::create_dir_all(install.join("resources")).unwrap();
+            fs::write(root.join("taskq.json"),"{\"repo\":\"fixture/project\"}").unwrap();
+            fs::write(install.join("projects"),format!("{}\n",root.display())).unwrap();
+            fs::write(install.join("host.json"),json!({"hosts":{crate::hostname():"capacity-host"},"limits":{"codex":2}}).to_string()).unwrap();
+            fs::write(crate::dot(&root).join("focus"),"all").unwrap();
+            let policy=crate::host::Policy::read(&install).unwrap();
+            assert_eq!(project(&install,root.to_str().unwrap())["cap_host"],"capacity-host");
+            let now=SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
+            let message=json!({"a":"capacity","root":root,"id":"blocked","issued_at":now,"expires_at":now+300,"ops":[{
+                "target":{"installation_id":null,"generation":1,"project_id":null,"runtime_id":"codex"},
+                "policy_schema":"taskq.host-capacity/1","expected_revision":policy.revision().unwrap(),"changes":{"runtime_limit":3}}]});
+            let lock=coreq::file_lock::lock(&install.join("resources/lock")).unwrap();
+            let (capacity_tx,capacity_rx)=std::sync::mpsc::channel();
+            let blocked=ActionQueue::start(install.clone(),&["capacity"],true,|install,root,message| {
+                crate::platform::write_atomic(&install.join("capacity-entered"),"")?;
+                capacity(install,root,message)
+            },move |_,_,result|capacity_tx.send(result).unwrap()).unwrap();
+            blocked.submit(&message).unwrap();
+            let until=Instant::now()+Duration::from_secs(3);
+            while !install.join("capacity-entered").exists() && Instant::now()<until {std::thread::yield_now();}
+            assert!(install.join("capacity-entered").exists());assert!(capacity_rx.try_recv().is_err());
+            let (pause_tx,pause_rx)=std::sync::mpsc::channel();
+            let focus=ActionQueue::start(install.clone(),&["pause","resume","focus"],true,queued_focus,move |_,_,result|pause_tx.send(result).unwrap()).unwrap();
+            focus.submit(&json!({"a":"pause","root":root,"id":"pause"})).unwrap();
+            assert!(pause_rx.recv_timeout(Duration::from_secs(3)).unwrap().unwrap()["applied_receipt"].is_string());
+            assert!(crate::data::focus(&root).unwrap().is_empty());assert!(capacity_rx.try_recv().is_err());
+            drop(lock);
+            assert_eq!(capacity_rx.recv_timeout(Duration::from_secs(3)).unwrap().unwrap()["state"],"saved");
+            for queue in [blocked,focus] {let ActionQueue{sender,worker,..}=queue;drop(sender);worker.join().unwrap();}
+        });
+    }
+
+    #[test]
+    fn blocked_answer_does_not_block_pause() {
+        crate::with_test_capture(|_store,dir| {
+            let root=dir.join("project");let install=dir.join("install");
+            fs::create_dir_all(crate::dot(&root)).unwrap();fs::create_dir_all(&install).unwrap();
+            fs::write(install.join("projects"),format!("{}\n",root.display())).unwrap();
+            fs::write(crate::dot(&root).join("focus"),"all").unwrap();
+            let (entered_tx,entered_rx)=std::sync::mpsc::channel();let (release_tx,release_rx)=std::sync::mpsc::channel();
+            let answer=ActionQueue::start(install.clone(),&["answer"],true,move |_,_,_| {entered_tx.send(()).unwrap();release_rx.recv_timeout(Duration::from_secs(3)).unwrap();Ok(json!({"answerReceipt":{"state":"accepted"}}))},|_,_,_|{}).unwrap();
+            answer.submit(&json!({"a":"answer","root":root,"id":"tray.1","op":{"id":"tray.1"}})).unwrap();entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            let (pause_tx,pause_rx)=std::sync::mpsc::channel();let focus=ActionQueue::start(install.clone(),&["pause","resume","focus"],true,queued_focus,move |_,_,result|pause_tx.send(result).unwrap()).unwrap();
+            focus.submit(&json!({"a":"pause","root":root,"id":"pause"})).unwrap();
+            assert!(pause_rx.recv_timeout(Duration::from_secs(3)).unwrap().unwrap()["applied_receipt"].is_string());assert!(crate::data::focus(&root).unwrap().is_empty());
+            release_tx.send(()).unwrap();
+            for queue in [answer,focus] {let ActionQueue{sender,worker,..}=queue;drop(sender);worker.join().unwrap();}
+        });
+    }
+
+    // Chain: native Resume -> shared command -> failure receipt; retries keep the selected focus.
+    #[test]
+    fn action_failures_reach_the_tray_caller() {
+        crate::with_test_capture(|store, _| {
+            let root=std::env::temp_dir().join(format!("taskq-action-receipt-{}",std::process::id()));
+            fs::create_dir_all(crate::dot(&root)).unwrap();
+            fs::write(crate::dot(&root).join("focus"),"off").unwrap();
+            assert!(act("resume",&root,None).unwrap_err().contains("no saved focus"));
+            assert_eq!(fs::read_to_string(crate::dot(&root).join("focus")).unwrap(),"off");
+            fs::write(crate::dot(&root).join("focus.paused"),"telemetry-fixture").unwrap();
+            act("resume",&root,None).unwrap();
+            assert_eq!(fs::read_to_string(crate::dot(&root).join("focus")).unwrap(),"telemetry-fixture");
+            assert!(act("focus",&root,Some("stale-label")).is_err());
+            fs::remove_dir_all(&root).unwrap();
+            assert!(act("pause",&root,None).is_err());
+            let page=store.export(0,0,1024).unwrap();
+            let receipts:Vec<_>=page["events"].as_array().unwrap().iter().map(|r|&r["observation"])
+                .filter(|r|r["source"]=="command").collect();
+            assert_eq!(receipts.len(),6,"native dispatch bypassed the shared receipt boundary");
+            assert_eq!(receipts.iter().map(|r|r["kind"].as_str().unwrap()).collect::<Vec<_>>(),
+                ["command.received","command.failed","command.received","command.applied","command.received","command.failed"]);
+            assert_ne!(receipts[0]["span"],receipts[2]["span"],"separate clicks reused an identity");
+            for pair in receipts.chunks_exact(2) { assert_eq!(pair[0]["span"],pair[1]["span"]); }
+
+        });
+    }
 
     // Chain: R12 tray evidence -> `tray --snapshot --route`. Risk: a filtered run captures the full matrix or drops a route.
     #[test]
@@ -1714,46 +2223,38 @@ mod tests {
         assert!(!blur_refocuses(Duration::from_millis(300)) && !blur_refocuses(Duration::from_secs(5)));
     }
 
-    // Chain: status.json capacity -> tray projection -> shared resource controls. Risk: absent reads as zero, a legacy
-    // guard reads as Auto, saved reads as applied, or an unknown producer reason disappears.
+    // H-A2: host policy/readback cannot be confused with a project's lower ceiling or legacy writable scope.
     #[test]
     fn capacity_projects_to_resource_targets() {
-        let saved = json!({"limits": {"claude": 0}, "load_gate": {"enabled": true, "cpu_max": 85, "memory_min": 10}, "admission": {"mode": "auto", "max": null}});
-        let cap = json!({"limits": {"claude": 0}, "used": {"claude": 1}, "load_gate": {"enabled": true, "cpu_max": 90, "memory_min": 10},
-            "sample_at": 95, "sample_age_seconds": 3, "cpu_percent": 12.5, "memory_available_percent": 40.0, "reasons": [{"code": "hold"}, {"code": "future"}, {"code": "cpu"}]});
-        let g = resource_group(&cap, &saved, Some(100), None, "taskq");
-        let t = g["targets"].as_array().unwrap();
-        assert_eq!(t.len(), 4);
-        assert!(t[0]["target"]["project_id"].is_null() && t[0]["supported"] == json!([]), "no admission in status: legacy guard");
-        let u = &t[1]["runtime_usage"];
-        assert_eq!(u[0], json!({"runtime_id": "claude", "used": 1, "limit": 0, "limit_kind": "disabled"}));
-        assert_eq!(u[1], json!({"runtime_id": "codex", "used": 0, "limit": null, "limit_kind": "disabled"}), "Fixed: absent admits none");
-        assert_ne!(t[1]["current_revision"], t[1]["effective_revision"], "saved gate 85 is not applied 90");
-        assert_eq!(t[2]["current_revision"], t[2]["effective_revision"]);
-        let codes: Vec<_> = t[1]["blockers"].as_array().unwrap().iter().map(|b| b["code"].as_str().unwrap()).collect();
-        assert_eq!(codes, ["host", "unknown", "cpu"]);
-        assert!(t[1]["blockers"][0]["scope"]["project_id"].is_null());
-        assert_eq!(t[1]["sample"]["age_seconds"], 3);
-        let mut auto = cap.clone();
-        auto["admission"] = json!({"mode": "auto", "max": null});
-        let g = resource_group(&auto, &saved, Some(100), None, "taskq");
-        assert_eq!(g["targets"][0]["supported"][0]["policy_schema"], "taskq.admission/1");
-        assert_eq!(g["targets"][0]["supported"][0]["fields"], json!(["mode", "maximum"]), "Work mode writes Auto/maximum");
-        assert_eq!(g["targets"][1]["runtime_usage"][1]["limit_kind"], "unbounded", "Auto: absent has no count cap");
-        let unknown = resource_group(&Value::Null, &json!({"error": "not configured"}), None, None, "taskq");
-        assert_eq!(unknown["targets"][1]["runtime_usage"][0], json!({"runtime_id": "claude", "used": null, "limit": null, "limit_kind": "unknown"}));
-        assert!(unknown["targets"][1]["effective_revision"].is_null() && unknown["targets"][1]["current_revision"].is_null());
+        let saved = json!({"limits":{"claude":0,"codex":3},"load_gate":{"enabled":true,"cpu_max":85,"memory_min":10},"admission":{"mode":"auto","max":null}});
+        let cap = json!({"host_policy":saved,"host_runtime_used":{"claude":1,"codex":2},"project_limits":{"codex":1},
+            "limits":{"codex":1},"used":{"codex":1},"load_gate":{"enabled":true,"cpu_max":85,"memory_min":10},
+            "sample_at":95,"sample_age_seconds":3,"cpu_percent":12.5,"memory_available_percent":40.0,
+            "reasons":[{"code":"hold"},{"code":"future"},{"code":"cpu"}]});
+        let group = resource_group(&cap, &saved,&json!("command-current"), &json!({"codex":1}), Some(100), None, "taskq");
+        let t = group["targets"].as_array().unwrap();
+        assert_eq!(t[0]["runtime_usage"][1],json!({"runtime_id":"codex","used":2,"limit":3,"limit_kind":"ceiling"}));
+        assert_eq!(t[1]["current_policy"]["limits"]["codex"],1);
+        assert!(t[0]["effective_revision"].is_null(),"equal settings without the host's exact receipt cannot look applied");
+        assert_eq!(t[0]["supported"][0]["fields"],json!(["maximum","load_gate"]));
+        assert_eq!(t[1]["supported"][0]["fields"],json!([]),"a project ceiling has no host write authority");
+        assert!(t[3]["target"]["project_id"].is_null(),"runtime ceiling belongs to the host");
+        assert!(t[0]["current_policy"]["mode"].is_null());
+        let codes:Vec<_>=t[0]["blockers"].as_array().unwrap().iter().map(|b|b["code"].as_str().unwrap()).collect();
+        assert_eq!(codes,["host","unknown","cpu"]);
+        assert_eq!(t[0]["sample"]["age_seconds"],3);
+        let mut stale=cap.clone();stale.as_object_mut().unwrap().remove("host_policy");
+        let unknown=resource_group(&stale,&saved,&json!("command-current"),&json!({"codex":1}),Some(100),None,"taskq");
+        assert!(unknown["targets"][0]["effective_revision"].is_null());
+        assert!(unknown["targets"][0]["runtime_usage"][1]["used"].is_null(),"legacy project snapshot cannot prove host use");
     }
 
-    // Chain: Work mode -> tray bridge -> `service capacity --mode/--max`. Risk: an unknown mode reads as Fixed or a
-    // malformed maximum removes the ceiling.
+    // H-A2: a stale page cannot repurpose a legacy project operation as an edit to every project on the host.
     #[test]
-    fn work_mode_bridge_refuses_malformed_mode_and_maximum() {
-        let root = Path::new("/nonexistent-taskq-954");
-        assert!(capacity(root, &json!({"set": {"mode": "fast"}})).starts_with("Error: mode: auto or fixed"));
-        assert!(capacity(root, &json!({"set": {"maximum": "4"}})).starts_with("Error: maximum: not an integer"));
-        assert!(capacity(root, &json!({"set": {"maximum": -1}})).starts_with("Error: maximum: not an integer"));
-        assert!(!capacity(root, &json!({"set": {"mode": "auto", "maximum": null}})).contains("mode:"), "valid fields reach the config read");
+    fn capacity_bridge_refuses_unqualified_host_edits() {
+        for set in [json!({"mode":"auto"}),json!({"limits":{"codex":4}}),json!({"maximum":null})] {
+            assert_eq!(capacity(Path::new("/nonexistent-taskq-954"),Path::new("/nonexistent-taskq-954"),&json!({"set":set})).unwrap()["state"],"rejected");
+        }
     }
 
     // Chain: § 4 tray opens an incident report. Risk: tray opens a file outside .taskq/incidents.
@@ -1793,6 +2294,23 @@ mod tests {
         put("2", "0");
         assert_eq!(newest(&install)["chain"].as_array().unwrap().len(), 2);
         fs::remove_dir_all(install).unwrap();
+    }
+
+    // Risk: page metadata smuggles content or forges a method outside the bundled inventory.
+    #[test]
+    fn web_metadata_is_allowlisted_and_aggregate_identity_is_explicitly_unknown() {
+        let row=json!({"operation":"js.tray.create.mode","kind":"method.aggregate","started_ms":1,"counts":{"calls":2,"finished":2,"failed":0,"unknown":0},"outcome":"ok","error":"none"});
+        let accepted=web_observation(&row).unwrap();
+        tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(),||{
+            let mut calls=WebCalls::new();
+            assert!(calls.metadata(&row),"missing collector must be visible");
+            assert!(calls.metadata_unknown);assert!(!calls.failed,"optional metadata disabled command controls");
+            assert!(!calls.metadata(&row),"same outage repeated its notification");
+        });
+        assert_eq!(accepted["unknown"]["trace"],"aggregate-unlinked");
+        for (key,value) in [("message",json!("private")),("operation",json!("js.private-data")),("trace",json!("/private/path")),("counts",json!({"private":1})),("error",json!("raw-error"))] {
+            let mut invalid=row.clone();invalid[key]=value;assert!(web_observation(&invalid).is_err(),"{key}");
+        }
     }
 
     // Chain: § 4 tray icon save. Risk: an invalid draft replaces the working icon.
@@ -1839,7 +2357,7 @@ mod tests {
         assert_eq!(fs::read_to_string(install.join("tray.json")).unwrap(), "{\"view\": \"fu", "a read never resets it");
         let reason = state(&install, &s, false, None, &Value::Null)["settings_error"].clone();
         assert!(reason.as_str().unwrap().starts_with("tray.json: corrupt"), "the popover names the reason: {reason}");
-        assert!(include_str!("tray.html").contains("Settings unknown: '+esc(S.settings_error)"));
+        assert!(HTML.contains("Settings unknown:"));
         assert!(s.save(&install));
         assert_eq!(state(&install, &s, false, None, &Value::Null)["settings_error"], Value::Null, "a save clears it");
         assert_eq!(fs::read_to_string(install.join("tray.json.corrupt")).unwrap(), "{\"view\": \"fu", "a save keeps a copy");
@@ -1987,6 +2505,79 @@ mod tests {
         assert_eq!(kind(&pass).0, "taskq");
         assert_eq!(kind(&|_: &Path| Err("taskq.json: repo is required".into())), ("old".into(), "taskq.json: repo is required".into()), "the verified reason");
         let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn add_generation_ignores_late_picker_or_install_results_after_cancel() {
+        let mut adding=json!({"state":"picking","generation":4});
+        assert!(apply_added(&mut adding,4,4,json!({"state":"picked","generation":4,"path":"/picked"})));
+        assert_eq!(adding["state"],"picked");
+        adding=Value::Null;
+        assert!(!apply_added(&mut adding,5,4,json!({"state":"picked","generation":4})),"cancelled picker cannot restore a selection");
+        adding=json!({"state":"installing","generation":6});
+        assert!(!apply_added(&mut adding,6,5,json!({"state":"installed","generation":5})),"another generation cannot claim this install");
+        assert!(apply_added(&mut adding,6,6,json!({"state":"installed","generation":6})));assert_eq!(adding["state"],"installed");
+        assert!(apply_added(&mut adding,6,6,json!({"state":"cancelled","generation":6})));assert!(adding.is_null(),"a matching picker cancel clears its presentation");
+    }
+
+    #[test]
+    fn add_owner_keeps_picker_admission_after_cancel_until_its_result() {
+        let (sender,receiver)=std::sync::mpsc::sync_channel(1);let state=std::sync::Arc::new(std::sync::atomic::AtomicU8::new(ADD_IDLE));
+        let job=|generation|AddJob::Pick(QueuedAction {id:format!("add-{generation}"),root:PathBuf::new(),message:json!({"a":"add","generation":generation}),context:None,dispatch:tracing::dispatcher::get_default(Clone::clone)});
+        add_submit(&sender,&state,job(4)).unwrap();
+        let mut adding=json!({"state":"picking dismissed","generation":5});
+        assert!(!apply_added(&mut adding,5,4,json!({"state":"picked","generation":4})),"cancelled presentation cannot take a late picker result");
+        assert!(add_submit(&sender,&state,job(6)).unwrap_err().contains("already in progress"),"cancel did not release the owned picker");
+        assert!(matches!(receiver.recv().unwrap(),AddJob::Pick(_)));state.store(ADD_IDLE,std::sync::atomic::Ordering::Release);
+        add_submit(&sender,&state,job(6)).unwrap();
+    }
+
+    #[test]
+    fn owned_effect_reports_keep_their_observable_outcomes() {
+        let answer=answer_reply(PathBuf::from("registered"),"tray.1".into(),Err("registration changed".into()));
+        assert_eq!(answer["answerReceipt"]["root"],"registered");assert_eq!(answer["answerReceipt"]["id"],"tray.1");assert_eq!(answer["answerReceipt"]["state"],"unknown");
+        assert_eq!(resources_reply(Ok(json!({}))),json!({"resources_receipt":{"state":"submitted","reason":"Resources terminal submitted"}}));
+        assert_eq!(resources_reply(Err("launcher unavailable".into()))["resources_receipt"]["state"],"unknown");
+        assert_eq!(resources_reply(Err("tray.resources.submit: timed out; outcome unknown".into()))["resources_receipt"]["state"],"unknown");
+    }
+
+    // A caught effect panic is visible and cannot silently reopen native admission.
+    #[test]
+    fn add_outcomes_capture_failures_and_hold_unknown_ownership() {
+        crate::with_test_capture(|store,_| {
+            for state in ["picked","cancelled","pick failed","install failed"] {
+                let (value,owner)=add_outcome("tray.add.fixture",||json!({"state":state}));
+                assert_eq!(value["state"],state);assert_eq!(owner,ADD_IDLE);
+            }
+            let (value,owner)=add_outcome("tray.add.fixture",||panic!("owned fixture panic"));
+            assert_eq!(value["state"],"add failed");assert_eq!(owner,ADD_UNAVAILABLE);
+            let (sender,receiver)=std::sync::mpsc::sync_channel(1);
+            let state=std::sync::Arc::new(std::sync::atomic::AtomicU8::new(owner));
+            let job=AddJob::Pick(QueuedAction {id:"after-panic".into(),root:PathBuf::new(),message:json!({"generation":2}),context:None,dispatch:tracing::dispatcher::get_default(Clone::clone)});
+            assert!(add_submit(&sender,&state,job).unwrap_err().contains("unavailable"));assert!(receiver.try_recv().is_err());
+            let worker=std::thread::spawn(||{});let until=Instant::now()+Duration::from_secs(3);
+            while !worker.is_finished() {assert!(Instant::now()<until);std::thread::yield_now();}
+            let owner=AddOwner {sender,state,_worker:worker};
+            assert!(owner.submit(3,None).unwrap_err().contains("worker stopped"));
+            tracing::dispatcher::get_default(|d|d.downcast_ref::<coreq::telemetry::capture::Capture>().unwrap().flush().unwrap());
+            let page=store.export(0,0,1024).unwrap();
+            let terminals:Vec<_>=page["events"].as_array().unwrap().iter().map(|r|&r["observation"]).filter(|r|r["operation"]=="taskq.operation.tray.add.fixture"&&r["kind"]=="method").collect();
+            assert_eq!(terminals.len(),5);assert_eq!(terminals.iter().filter(|r|r["outcome"]=="failed").count(),3);
+            assert_eq!(terminals.last().unwrap()["error"],"add-panic");
+            assert!(page["events"].as_array().unwrap().iter().any(|r|r["observation"]["operation"]=="taskq.operation.tray.add.dispatch"&&r["observation"]["error"]=="add-admission"));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn picker_result_keeps_roots_and_distinguishes_native_cancel_from_error() {
+        use std::os::unix::process::ExitStatusExt;
+        let output=|code,stdout:&[u8],stderr:&[u8]|std::process::Output {status:std::process::ExitStatus::from_raw(code),stdout:stdout.into(),stderr:stderr.into()};
+        assert_eq!(pick_result(output(0,b"/\n",b"")),Ok(Some(PathBuf::from("/"))));
+        assert_eq!(pick_result(output(0,b" /picked \r\n",b"")),Ok(Some(PathBuf::from(" /picked "))),"only the protocol newline is removed");
+        assert!(pick_result(output(0,&[0xff,b'\n'],b"")).unwrap_err().contains("non-UTF-8"));
+        assert_eq!(pick_result(output(1<<8,b"",b"execution error: User canceled. (-128)\n")),Ok(None));
+        assert!(pick_result(output(1<<8,b"",b"execution error: denied. (-10004)\n")).is_err());
     }
     // Chain: canonical session -> native row -> shared task link (#1204). Risk: a Codex thread opens off its host,
     // a remote Claude row loses its account-scoped link, or a starting observation opens anything.

@@ -1,0 +1,236 @@
+//! Product metadata types and historical conversion at import/export boundaries.
+use serde_json::{Value,json};
+
+type Res<T> = Result<T,String>;
+pub(super) const KINDS:&[&str]=&["operation","stage","board","transition","requests"];
+
+#[derive(Clone,serde::Serialize)]
+#[serde(untagged)]
+pub(crate) enum Sample {
+    Operation(crate::profile::Record),
+    Stage(crate::profile::Stage),
+    Board(crate::profile::BoardOp),
+    Transition(crate::profile::Transition),
+    Requests(crate::requests::Usage),
+    #[serde(skip)]
+    Corrupt(&'static str),
+}
+
+impl Sample {
+    pub(crate) fn kind(&self)->&'static str {
+        match self {Self::Operation(_)=>"operation",Self::Stage(_)=>"stage",Self::Board(_)=>"board",Self::Transition(_)=>"transition",Self::Requests(_)=>"requests",Self::Corrupt(kind)=>kind}
+    }
+    fn validate(&self)->Res<()> {
+        let valid=match self {Self::Operation(r)=>r.valid(),Self::Stage(r)=>r.valid(),Self::Board(r)=>r.valid(),Self::Transition(r)=>r.valid(),Self::Requests(r)=>{r.validate()?;true},Self::Corrupt(_)=>false};
+        if !valid {return Err("invalid legacy profile observation".into());}
+        Ok(())
+    }
+    pub(crate) fn canonical(&self)->Res<Value> {
+        self.validate()?;serde_json::to_value(self).map_err(|e|e.to_string())
+    }
+    pub(crate) fn decode(kind:&str,value:Value)->Res<Self> {
+        let sample=match kind {
+            "operation"=>serde_json::from_value(value).map(Self::Operation),"stage"=>serde_json::from_value(value).map(Self::Stage),
+            "board"=>serde_json::from_value(value).map(Self::Board),"transition"=>serde_json::from_value(value).map(Self::Transition),
+            "requests"=>serde_json::from_value(value).map(Self::Requests),_=>return Err("unknown semantic kind".into()),
+        }.map_err(|e|e.to_string())?;
+        sample.validate()?;Ok(sample)
+    }
+    pub(crate) fn legacy(line:&str)->Res<Self> {
+        let (tag,text)=line.split_once(' ').ok_or("unknown legacy kind")?;
+        let sample=match tag {
+            "taskq-profile"=>serde_json::from_str(text).map(Self::Operation),"taskq-stage"=>serde_json::from_str(text).map(Self::Stage),
+            "taskq-board"=>serde_json::from_str(text).map(Self::Board),"taskq-transition"=>serde_json::from_str(text).map(Self::Transition),
+            "taskq-requests"=>serde_json::from_str(text).map(Self::Requests),_=>return Err("unknown legacy kind".into()),
+        }.map_err(|e|e.to_string())?;
+        sample.validate()?;Ok(sample)
+    }
+    fn archive_iter(text:&str)->impl Iterator<Item=Self>+'_ {
+        text.lines().filter_map(|line| {
+            let (tag,_)=line.split_once(' ')?;
+            let kind=KINDS.iter().copied().find(|kind|prefix(kind).is_ok_and(|p|p==tag))?;
+            Some(Self::legacy(line).unwrap_or(Self::Corrupt(kind)))
+        })
+    }
+    #[cfg(test)]
+    pub(crate) fn archive(text:&str)->Vec<Self> {Self::archive_iter(text).collect()}
+    #[cfg(test)]
+    pub(crate) fn line(&self)->Res<String> {Ok(format!("{} {}",prefix(self.kind())?,self.canonical()?))}
+}
+
+fn canonical(line: &str) -> Res<Value> {
+    if line.starts_with("taskq-requests ") {crate::requests::legacy_value(line)} else {crate::profile::legacy_value(line)}
+}
+fn fields(kind: &str) -> Res<&'static [(&'static str,&'static str)]> {
+    Ok(match kind {
+        "operation" => &[("op","operation"),("us","duration_us"),("error","error"),("at_ms","started_ms")],
+        "stage" => &[("host","host"),("open","open"),("project","project"),("stage","operation"),("task","task"),("attempt","attempt"),("rt","runtime"),("us","duration_us"),("outcome","outcome"),("error","error"),("at_ms","started_ms"),("calls","calls"),("tokens","tokens"),("unknown","usage_status")],
+        "board" => &[("op","operation"),("us","duration_us"),("outcome","outcome"),("error","error"),("remaining","remaining"),("at_ms","started_ms")],
+        "transition" => &[("project","project"),("task","task"),("entry","entry"),("from","from"),("to","to"),("prev_s","previous_seconds"),("rt","runtime"),("host","host"),("at_ms","started_ms")],
+        "requests" => &[("at_ms","started_ms")],
+        _ => return Err("unknown semantic kind".into()),
+    })
+}
+fn prefix(kind: &str) -> Res<&'static str> {
+    match kind {"operation"=>Ok("taskq-profile"),"stage"=>Ok("taskq-stage"),"board"=>Ok("taskq-board"),"transition"=>Ok("taskq-transition"),"requests"=>Ok("taskq-requests"),_=>Err("unknown semantic kind".into())}
+}
+
+pub(super) fn observation(line: &str) -> Res<Value> {
+    let original=canonical(line)?;
+    let kind=match line.split_once(' ').map(|(p,_)|p) {Some("taskq-profile")=>"operation",Some("taskq-stage")=>"stage",Some("taskq-board")=>"board",Some("taskq-transition")=>"transition",Some("taskq-requests")=>"requests",_=>return Err("unknown legacy kind".into())};
+    encode(kind,original)
+}
+
+pub(super) fn encode(kind:&str,original:Value)->Res<Value> {
+    let mut value=json!({"product":"taskq","version":null,"kind":kind,"operation":if kind=="requests" {"requests.summary"} else {"queue.transition"},
+        "trace":null,"span":null,"started_ms":null,"outcome":"unknown","error":"unknown",
+        "unknown":{"version":"not-recorded","trace":"not-recorded","span":"not-recorded","started_ms":"not-recorded"}});
+    for (old,new) in fields(kind)? {if let Some(field)=original.get(*old) {value[*new]=field.clone();}}
+    if !value["started_ms"].is_null() {value["unknown"].as_object_mut().unwrap().remove("started_ms");}
+    for name in ["duration_us","remaining","previous_seconds","calls","tokens"] {
+        if value.get(name).is_some_and(Value::is_null) {value["unknown"][name]=original.get("unknown").cloned().unwrap_or(json!("not-recorded"));}
+    }
+    if kind=="operation" {value["outcome"]=json!(if value["error"]=="none" {"ok"} else {"failed"});}
+    if let Some(trace)=original.get("trace") {
+        for (old,new) in [("run","run_id"),("process","process_id"),("span","span_id"),("parent","parent_id")] {
+            value[new]=trace[old].clone();if value[new].is_null() {value["unknown"][new]=json!("not-recorded");}
+        }
+        value["unknown"]["trace"]=json!("numeric-trace-only");value["unknown"]["span"]=json!("numeric-trace-only");
+    }
+    if kind=="requests" {
+        value["source"]=json!(original["source"].as_str().ok_or("missing request source")?.replace(' ',"."));
+        let mut counts=serde_json::Map::new();
+        for (name,count) in original["ops"].as_object().ok_or("missing request counts")? {
+            let (method,path)=name.split_once(' ').ok_or("invalid request operation")?;
+            counts.insert(format!("{method}:{}",path.replace('/',".").replace('*',":")),count.clone());
+        }
+        value["counts"]=Value::Object(counts);
+    }
+    Ok(value)
+}
+
+pub(super) fn encoded_size(kind:&str,original:&Value)->Res<usize> {
+    Ok(prefix(kind)?.len()+2+serde_json::to_vec(original).map_err(|e|e.to_string())?.len())
+}
+
+#[cfg(test)]
+pub(super) fn line(value: &Value) -> Res<String> {
+    decoded(value)?.line()
+}
+
+fn decoded(value:&Value)->Res<Sample> {
+    if value.get("group_id").is_some() {return Err("count summary needs complete assembly".into());}
+    if value["product"]!="taskq" {return Err("foreign semantic product".into());}
+    let kind=value["kind"].as_str().ok_or("missing semantic kind")?;let mut original=serde_json::Map::new();
+    for (old,new) in fields(kind)? {if let Some(field)=value.get(*new) {original.insert((*old).into(),field.clone());}}
+    if kind=="operation"&&value.get("process_id").is_some() {
+        original.insert("trace".into(),json!({"run":value["run_id"],"process":value["process_id"],"span":value["span_id"],"parent":value["parent_id"]}));
+    }
+    if kind=="requests" {
+        original.insert("source".into(),json!(value["source"].as_str().ok_or("missing request source")?.replace('.'," ")));
+        let mut ops=serde_json::Map::new();
+        for (name,count) in value["counts"].as_object().ok_or("missing request counts")? {
+            let (method,path)=name.split_once(':').ok_or("invalid request count code")?;
+            ops.insert(format!("{method} {}",path.replace('.',"/").replace(':',"*")),count.clone());
+        }
+        original.insert("ops".into(),Value::Object(ops));
+    }
+    Sample::decode(kind,Value::Object(original))
+}
+
+/// Consume complete contiguous summary groups from a bounded semantic read; partial groups stay unknown.
+#[cfg(test)]
+pub(super) fn lines(values: &[Value]) -> Res<Vec<String>> {
+    let mut lines=Vec::new();let mut reader=coreq::telemetry::Assembler::default();
+    for value in values {if let Some(value)=reader.push(value.clone())? {lines.push(line(&value)?);}}
+    reader.finish()?;Ok(lines)
+}
+
+/// Compatibility report input from bounded indexed pages, never a scan of generic method payloads.
+pub(super) fn visit_samples(store:Option<&coreq::telemetry::Reader>,kinds:&[&str],archive:&str,mut accept:impl FnMut(usize,Sample))->Res<()> {
+    let mut reader=coreq::telemetry::Assembler::default();let mut after=0;
+    if let Some(store)=store {
+    loop {
+        let page=store.export_kinds(kinds,0,after,1024)?;
+        for row in page["events"].as_array().ok_or("invalid semantic page")? {if let Some(value)=reader.push(row["observation"].clone())? {accept(if value["version"].is_null() {0}else{2},decoded(&value)?);}}
+        after=page["next"].as_i64().ok_or("missing semantic cursor")?;if page["more"]==false {break;}
+    }
+    reader.finish()?;
+    }
+    for sample in Sample::archive_iter(archive).filter(|s|kinds.contains(&s.kind())) {accept(1,sample);}
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn read(store:&coreq::telemetry::Reader,kinds:&[&str],archive:&str)->Res<String> {
+    let mut lanes:[Vec<Sample>;3]=Default::default();visit_samples(Some(store),kinds,archive,|lane,sample|lanes[lane].push(sample))?;
+    let mut text=String::new();for sample in lanes.into_iter().flatten() {text.push_str(&sample.line()?);text.push('\n');}Ok(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn all_semantic_kinds_roundtrip_through_the_shared_store() {
+        let source=[
+            r#"taskq-profile {"op":"spawn","us":18446744073709551615,"error":"none","at_ms":null,"trace":{"run":null,"process":42,"span":0,"parent":0}}"#,
+            r#"taskq-stage {"host":"win","open":true,"project":"group/nested/repo","stage":"build","task":1230,"attempt":6185426441,"rt":"codex","us":null,"outcome":"unknown","error":"none","at_ms":null,"unknown":"open-stage"}"#,
+            r#"taskq-stage {"stage":"claim","task":1230,"attempt":9,"rt":"other","us":20,"outcome":"ok","error":"none","at_ms":1000,"unknown":"no-model"}"#,
+            r#"taskq-stage {"stage":"build","task":1230,"attempt":9,"rt":"codex","us":30,"outcome":"ask","error":"none","at_ms":1001,"calls":0,"tokens":null,"unknown":"no-usage"}"#,
+            r#"taskq-board {"op":"close","us":12,"outcome":"failed","error":"http4xx","remaining":null,"at_ms":1002}"#,
+            r#"taskq-transition {"project":"other","task":1230,"entry":18446744073709551615,"from":"doing","to":"ask","prev_s":null,"rt":null,"host":null,"at_ms":null}"#,
+            r#"taskq-requests {"at_ms":1003,"source":"worker service status","ops":{"GET issues/N/comments":18446744073709551615,"POST graphql":0,"GET repos/*/issues":2}}"#,
+        ];
+        let dir=std::env::temp_dir().join(format!("taskq-semantic-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));std::fs::create_dir(&dir).unwrap();
+        let store=coreq::telemetry::Store::open(&dir.join("db")).unwrap();
+        for (index,text) in source.iter().enumerate() {
+            let value=observation(text).unwrap();let event=coreq::telemetry::Event::identified("test.archive",&index.to_string(),value).unwrap();store.append(&[event]).unwrap();
+        }
+        let rows=store.export(0,0,1024).unwrap();assert_eq!(rows["events"].as_array().unwrap().len(),source.len());
+        for (row,text) in rows["events"].as_array().unwrap().iter().zip(source) {assert_eq!(canonical(&line(&row["observation"]).unwrap()).unwrap(),canonical(text).unwrap());}
+        drop(store);std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    #[ignore="read-only archive qualification; requires TASKQ_SEMANTIC_SOURCE snapshot"]
+    fn retained_archive_roundtrips_through_shared_storage() {
+        let source=std::env::var_os("TASKQ_SEMANTIC_SOURCE").expect("explicit snapshot path");
+        let archive=rusqlite::Connection::open_with_flags(source,rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        assert_eq!(archive.pragma_query_value(None,"application_id",|r|r.get::<_,i64>(0)).unwrap(),0x5451544d);
+        assert_eq!(archive.pragma_query_value(None,"user_version",|r|r.get::<_,i64>(0)).unwrap(),1);
+        let dir=std::env::temp_dir().join(format!("taskq-semantic-real-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));std::fs::create_dir(&dir).unwrap();
+        let store=coreq::telemetry::Store::open(&dir.join("db")).unwrap();
+        let mut statement=archive.prepare("SELECT seq,retained_ms,line FROM records ORDER BY seq").unwrap();
+        let rows=statement.query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?))).unwrap();
+        let mut expected=ring::digest::Context::new(&ring::digest::SHA256);let mut events=Vec::new();let mut clocks=Vec::new();let mut cursor=None::<String>;let mut count=0;
+        for row in rows {
+            let (seq,received,text)=row.unwrap();let value=observation(&text).unwrap();
+            expected.update(format!("{received} {} {}\n",text.split_once(' ').unwrap().0,canonical(&text).unwrap()).as_bytes());
+            events.push(coreq::telemetry::Event::identified("qualification.archive",&seq.to_string(),value).unwrap());clocks.push(received);count+=1;
+            if events.len()==1024 {let next=format!("position.{seq}");store.import_history("archive",cursor.as_deref(),&next,&events,&clocks).unwrap();cursor=Some(next);events.clear();clocks.clear();}
+        }
+        if !events.is_empty() {store.import_history("archive",cursor.as_deref(),"done",&events,&clocks).unwrap();}
+        let mut actual=ring::digest::Context::new(&ring::digest::SHA256);let mut after=0;let mut retained=0;
+        loop {let page=store.export(0,after,1024).unwrap();for row in page["events"].as_array().unwrap() {
+            let text=line(&row["observation"]).unwrap();let received=row["received_ms"].as_i64().unwrap();actual.update(format!("{received} {} {}\n",text.split_once(' ').unwrap().0,canonical(&text).unwrap()).as_bytes());retained+=1;
+        }after=page["next"].as_i64().unwrap();if page["more"]==false {break;}}
+        let digest=|value:ring::digest::Digest|value.as_ref().iter().map(|byte|format!("{byte:02x}")).collect::<String>();
+        let expected=digest(expected.finish());let actual=digest(actual.finish());assert_eq!(retained,count);assert_eq!(actual,expected);assert_eq!(store.storage().unwrap()["pruned_count"],0);
+        println!("semantic archive: {count} rows; canonical+receipt SHA256 {actual}; original receipt clocks preserved; pruning 0");
+        drop(store);std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn indexed_report_reader_selects_stages_without_exposing_generic_calls() {
+        let dir=std::env::temp_dir().join(format!("taskq-indexed-read-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));std::fs::create_dir(&dir).unwrap();let path=dir.join("db");let store=coreq::telemetry::Store::open(&path).unwrap();
+        let generic=coreq::telemetry::Event::new(json!({"product":"taskq","version":"1","operation":"generic.method","kind":"method","trace":"trace","span":"span","started_ms":1,"outcome":"ok","error":"none"})).unwrap();store.append(&[generic]).unwrap();
+        let stage=r#"taskq-stage {"stage":"claim","task":1,"attempt":2,"rt":"other","us":1,"outcome":"ok","error":"none","at_ms":1,"unknown":"no-model"}"#;store.append(&[coreq::telemetry::Event::new(observation(stage).unwrap()).unwrap()]).unwrap();
+        let reader=coreq::telemetry::Reader::open(&path).unwrap();let text=read(&reader,&["stage"],"").unwrap();assert_eq!(text.lines().count(),1);assert_eq!(canonical(text.trim()).unwrap(),canonical(stage).unwrap());assert!(read(&reader,&["board"],"").unwrap().is_empty());
+        drop(reader);drop(store);std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn unsupported_or_unsafe_source_metadata_is_refused() {
+        for text in [r#"taskq-profile {"op":"unknown","us":1,"error":"none","at_ms":1}"#,
+            r#"taskq-stage {"stage":"build","task":1,"attempt":1,"rt":"codex","us":1,"outcome":"ok","error":"none","at_ms":1,"prompt":"secret"}"#,
+            r#"taskq-requests {"at_ms":1,"source":"cli private content","ops":{"GET issues":1}}"#,
+            r#"taskq-requests {"at_ms":1,"source":"cli status","ops":{"GET issues/123/private?token=secret":1}}"#] {assert!(observation(text).is_err(),"{text}");}
+    }
+}

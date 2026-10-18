@@ -11,7 +11,7 @@ Accepted target: describe → review → start → answer → inspect result. Th
 | Remote PM | Existing agent chat, explicit project context, opt-in observation, numbered replies, media and reconnect | [remote-manager.md](remote-manager.md), [remote-manager-audit.md](remote-manager-audit.md) |
 | Conversations | Existing main owner, explicit detach/raise, files/drafts/history, interrupted requests | ai-workspace.md |
 | Work sessions | Same live local session, agent identity; remote capability explained | agent-entry.md, ai-workspace.md |
-| Work mode | Exact rule or snapshot plus named-host Auto/Fixed and optional caps; review effective changes | dynamic-resources.md, menu-product.md |
+| Work mode | Exact rule or snapshot plus the local host admission policy and optional caps; review effective changes | dynamic-resources.md, menu-product.md |
 | Plans | Four editable recipes; held creation, explicit start, dependencies, owner gates, retry, environment finalization | plans-and-decisions.md |
 | Agents | Access and Delivery separately; source, requested/saved/applied and capabilities | worker-permissions.md, agent-behavior.md |
 | Settings/services | Appearance/history, hosts, logs, folder, Resources, incidents, lifecycle and setup | current-menu-audit.md, ui-acceptance.md |
@@ -48,7 +48,7 @@ Calibration remains: load thresholds/windows/pacing, native icon overflow, runti
 
 ## Prototype coverage and limits
 
-The candidate offers Auto/Fixed with optional host/project/runtime caps, workload-pressure states, effective-policy review, recipe drafts, held-plan reminder, explicit start, questions, failed builds and cleanup projection. Fixed requires an explicit host ceiling; Auto allows no count ceiling. Editing settings or selecting a recipe applies nothing until review. Existing conversations and Access/Delivery controls remain available.
+The browser candidate still demonstrates legacy Auto/Fixed controls alongside optional caps, workload-pressure states, policy review, recipe drafts, held-plan reminder, explicit start, questions, failed builds and cleanup projection. Fixed is a prototype compatibility gap against the host-service target, not an accepted current host policy. The host target permits optional ceilings without a required count ceiling. Editing settings or selecting a recipe applies nothing until review. Existing conversations and Access/Delivery controls remain available.
 
 No prototype can certify scheduling, security, remote session access, atomic board effects or real cleanup. Report each slice as Specified / Prototyped / Implemented / Qualified; never replace these with one Done flag.
 

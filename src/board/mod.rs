@@ -4,8 +4,7 @@
 use crate::core::Entry;
 use serde_json::{Value, json};
 use std::cell::RefCell;
-use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 pub type Result<T> = std::result::Result<T, String>;
 
@@ -92,6 +91,7 @@ pub fn entries(board: &dyn Board, n: u64) -> Result<Vec<Entry>> {
 struct Profiled(Box<dyn Board>);
 
 impl Profiled {
+    #[tracing::instrument(name="board.request",skip_all,fields(coreq_operation=kind))]
     fn op<T>(&self, kind: &'static str, f: impl FnOnce(&dyn Board) -> Result<T>) -> Result<T> {
         let began = std::time::Instant::now();
         let r = f(&*self.0);
@@ -212,15 +212,10 @@ fn curl(method: &str, url: &str, auth: &str, body: Option<&Value>) -> Result<Rep
     if let Some(b) = body {
         cfg += &format!("header = \"Content-Type: application/json\"\ndata-binary = {}\n", quote(&b.to_string()));
     }
-    let mut child = Command::new("curl")
-        .args(["-K", "-"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("curl: {e}"))?;
-    child.stdin.take().unwrap().write_all(cfg.as_bytes()).map_err(|e| format!("curl: {e}"))?;
-    let out = child.wait_with_output().map_err(|e| format!("curl: {e}"))?;
+    let out = match coreq::process::exchange("board.http", Command::new("curl").args(["-K", "-"]), cfg.as_bytes(), std::time::Duration::from_secs(65)) {
+        Ok(out) | Err(coreq::process::Failure::Exit(out)) => out,
+        Err(e) => return Err(format!("curl: {e}")),
+    };
     if !out.status.success() {
         return Err(format!("curl {method} {url}: {}", String::from_utf8_lossy(&out.stderr).trim()));
     }
@@ -378,27 +373,29 @@ impl Api {
         }
         self.budget.borrow_mut().count(op.into());
         crate::requests::tally(op);
-        crate::profile::measure("forge.call", || {
+        crate::profile::measure_classified("forge.call", || {
             #[cfg(test)]
-            let r = match &self.transport { Some(transport) => transport(method, &url, body)?, None => curl(method, &url, &self.auth, body.as_ref())? };
+            let r = match &self.transport { Some(transport) => transport(method, &url, body), None => curl(method, &url, &self.auth, body.as_ref()) };
             #[cfg(not(test))]
-            let r = curl(method, &url, &self.auth, body.as_ref())?;
+            let r = curl(method, &url, &self.auth, body.as_ref());
+            let r=r.map_err(|message|(crate::profile::class(&message),message))?;
             if let Some(t) = r.header("date").and_then(http_date) {
                 *self.clock.borrow_mut() = t;
             }
             // GitHub GraphQL refuses an exhausted budget with HTTP 200 and a RATE_LIMITED error
             let status = if url.ends_with("/graphql") && r.status == 200 && r.body.contains("\"RATE_LIMITED\"") { 403 } else { r.status };
+            let class=match status {400..=499=>"http4xx",500..=599=>"http5xx",_=>"other"};
             let paused = self.budget.borrow_mut().observe(status, |n| r.header(n).map(String::from), *self.clock.borrow(), std::time::Instant::now());
             if let Some(reset) = paused {
-                return Err(format!("{method} {url}: HTTP {status} {}", crate::requests::paused_text(reset)));
+                return Err((class,format!("{method} {url}: HTTP {status} {}", crate::requests::paused_text(reset))));
             }
             if !(200..300).contains(&r.status) {
                 // one log line: a multi-line error body folds into it (§ 4)
                 let body = r.body.split_whitespace().collect::<Vec<_>>().join(" ");
-                return Err(format!("{method} {url}: HTTP {} {}", r.status, body.chars().take(300).collect::<String>()));
+                return Err((class,format!("{method} {url}: HTTP {} {}", r.status, body.chars().take(300).collect::<String>())));
             }
             Ok(r)
-        })
+        },|error|error.0).map_err(|(_,message)|message)
     }
 
     /// The full path of `repo` in a `Depends on <repo>#N` (§ 1); a bare name is under this board's owner. `sep` ends the
@@ -418,7 +415,7 @@ impl Api {
         while let Some(u) = next {
             // later pages count under their first page's operation
             let r = self.send("GET", &u, None, &op)?;
-            out.extend(r.json()?.as_array().cloned().unwrap_or_default());
+            out.extend(r.json()?.as_array().ok_or("invalid board list: expected array")?.iter().cloned());
             next = r.next();
         }
         Ok(out)
@@ -539,6 +536,8 @@ pub struct FakeState {
     pub fail_labels: bool,
     /// The next this many `comment` calls fail like a board rate-limit pause.
     pub fail_comments: usize,
+    /// The write commits, but its response is lost.
+    pub lose_comment_response: bool,
     /// The next this many `comments` reads fail.
     pub fail_comment_reads: usize,
     /// A concurrent writer: this body lands just before the next `comment`.
@@ -625,7 +624,9 @@ impl Board for Fake {
         if let Some(other) = race {
             self.raw(n, &other, true, false);
         }
-        Ok(self.raw(n, body, true, false))
+        let id = self.raw(n, body, true, false);
+        if std::mem::take(&mut self.state.borrow_mut().lose_comment_response) { return Err("comment response lost".into()); }
+        Ok(id)
     }
     fn edit_comment(&self, n: u64, id: u64, body: &str) -> Result<()> {
         let mut st = self.state.borrow_mut();
@@ -699,6 +700,88 @@ impl Board for Fake {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Chain: real curl/config stdin -> local HTTP refusal -> request accounting and secret-free execution trace.
+    #[test]
+    fn native_http_preserves_refusal_without_exporting_request_data() {
+        let dir = std::env::temp_dir().join(format!("taskq-native-http-{}-{}", std::process::id(),crate::runtime::uuid()));
+        std::fs::create_dir(&dir).unwrap();
+        let out = coreq::process::output("test.http", Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "board::tests::native_http_child", "--ignored", "--nocapture"])
+            .env("TASKQ_NATIVE_HTTP_TEST_ROOT", &dir), std::time::Duration::from_secs(15));
+        assert!(out.is_ok(), "native HTTP chain failed: {out:?}; phases: {}",std::fs::read_to_string(dir.join("phases.log")).unwrap_or_else(|_|"child entry not observed".into()));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[ignore = "native curl and collector fixture; local loopback only"]
+    fn native_http_child() {
+        use std::{io::{Read, Write}, net::TcpListener, time::{Duration, Instant}};
+        let dir = std::path::PathBuf::from(std::env::var_os("TASKQ_NATIVE_HTTP_TEST_ROOT").unwrap());
+        let began = Instant::now();
+        let phase=|name:&str|writeln!(std::fs::OpenOptions::new().create(true).append(true).open(dir.join("phases.log")).unwrap(),"{name} {}ms",began.elapsed().as_millis()).unwrap();
+        phase("capture.start");
+        let _runtime = coreq::telemetry::capture::Runtime::install(&dir.join("db"), "fixtureq", "1").unwrap();
+        phase("capture.ready");
+        let installed = began.elapsed();
+        crate::profile::take_report();
+        // The HTTP deadline starts after collector setup, which has its own outer bound.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let body = json!({"text": "private-body".repeat(4000)});
+        let expected = body.clone();
+        let server = std::thread::spawn(move || {
+            let until = Instant::now() + Duration::from_secs(5);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < until, "native curl did not reach the local fixture");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("fixture accept: {e}"),
+                }
+            };
+            socket.set_nonblocking(false).unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut bytes = Vec::new();
+            loop {
+                let mut part = [0; 4096];
+                let n = socket.read(&mut part).unwrap();
+                assert_ne!(n, 0, "incomplete request"); bytes.extend_from_slice(&part[..n]);
+                assert!(bytes.len() <= 1024 * 1024);
+                if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
+                    let length: usize = head.lines().find_map(|l| l.strip_prefix("content-length:")).unwrap().trim().parse().unwrap();
+                    if bytes.len() < end + 4 + length { continue; }
+                    assert!(head.contains("authorization: bearer private-token"));
+                    assert_eq!(serde_json::from_slice::<Value>(&bytes[end + 4..end + 4 + length]).unwrap(), expected);
+                    break;
+                }
+            }
+            let reply = "private-response";
+            write!(socket, "HTTP/1.1 503 Unavailable\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).unwrap();
+        });
+        phase("http.start");
+        let result = Api::new(base.clone(), base, "private-token").call("POST", "/request", Some(body));
+        phase("http.returned");
+        let joined = server.join();
+        phase("http.joined");
+        assert!(joined.is_ok(), "HTTP fixture failed; runtime install={installed:?}, through request={:?}, client error={:?}", began.elapsed(), result.as_ref().err());
+        assert!(result.err().unwrap().contains("HTTP 503"));
+        assert!(crate::profile::take_report().contains("http5xx:1"));
+        phase("capture.qualify");
+        let health = coreq::telemetry::capture::qualify().unwrap();
+        phase("capture.qualified");
+        let store = coreq::telemetry::Reader::open(&dir.join("db")).unwrap();
+        let exported = store.export(0, 0, 1024).unwrap();
+        assert!(exported["events"].as_array().unwrap().iter().any(|r| r["observation"]["operation"] == "fixtureq.operation.board.http"
+            && r["observation"]["kind"] == "method" && r["observation"]["outcome"] == "ok"));
+        assert!(!exported.to_string().contains("private-"));
+        assert_eq!(health["lost"], 0);
+        phase("capture.drop");drop(_runtime);phase("complete");
+    }
 
 
     fn http(kind: &Kind, schema: Option<bool>, transport: Transport) -> Box<dyn Board> {
@@ -949,7 +1032,7 @@ mod tests {
     fn forge_outcomes_reach_profile_report() {
         crate::profile::take_report();
         for (status, body, limited) in [(200, "{}", false), (204, "", false), (404, "private response", false),
-            (503, "private response", false), (200, "{\"errors\":[{\"type\":\"RATE_LIMITED\"}]}", true)] {
+            (503, "private response HTTP 404", false), (200, "{\"errors\":[{\"type\":\"RATE_LIMITED\"}]}", true)] {
             let mut api = (github::KIND.api)("github.com", "o/r", "private token");
             api.transport = Some(Box::new(move |_, _, _| Ok(Reply { status, body: body.into(), operation: "read",
                 headers: if limited { vec![("retry-after".into(), "60".into())] } else { vec![] } })));
@@ -964,6 +1047,22 @@ mod tests {
         assert!(report.contains("| 2/3 | 60.00 |"), "{report}");
         assert!(report.contains("http4xx:2, http5xx:1"), "{report}");
         assert!(!report.contains("private"));
+    }
+
+    // Chain: board list/readback -> malformed successful HTTP page -> explicit failure, never an empty queue/catalog.
+    #[test]
+    fn malformed_list_is_not_an_empty_board() {
+        for kind in [&github::KIND, &gitlab::KIND] {
+            for body in ["{}", "null", "\"private-error\""] {
+                let board = http(kind, None, Box::new(move |_, _, _| Ok(Reply {
+                    status: 200, headers: vec![], body: body.into(), operation: "read",
+                })));
+                let expected = Some("invalid board list: expected array");
+                assert_eq!(board.issues(Some(0)).err().as_deref(), expected, "{} issue list: {body}", kind.name);
+                assert_eq!(board.comments(1).err().as_deref(), expected, "{} comments: {body}", kind.name);
+                assert_eq!(board.canonical_labels().err().as_deref(), expected, "{} catalog: {body}", kind.name);
+            }
+        }
     }
 
     fn label_board(kind: &'static Kind, fail: bool, mismatch: bool) -> (Box<dyn Board>, std::rc::Rc<RefCell<Vec<Value>>>, std::rc::Rc<RefCell<usize>>) {

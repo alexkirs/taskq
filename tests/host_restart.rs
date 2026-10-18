@@ -73,6 +73,11 @@ fn real_host_restart_preserves_request_after_the_caller_exits() {
         assert!(owner.0.as_mut().unwrap().try_wait().unwrap().is_none(),"fixture host exited: {}",fs::read_to_string(&log).unwrap());
         assert!(Instant::now()<until,"host publication deadline: {}",fs::read_to_string(&log).unwrap());std::thread::sleep(Duration::from_millis(10));
     };
+    while proxy.hits.load(Ordering::Acquire)==0 {
+        assert!(owner.0.as_mut().unwrap().try_wait().unwrap().is_none(),"original fixture host exited");
+        assert!(Instant::now()<until,"original generation release transport deadline: hits {}; {}",proxy.hits.load(Ordering::Acquire),fs::read_to_string(&log).unwrap());std::thread::sleep(Duration::from_millis(10));
+    }
+    let first_hits=proxy.hits.load(Ordering::Acquire);
     let saved=install.join("service.fixture-original");fs::rename(install.join("service"),&saved).unwrap();fs::create_dir(install.join("service")).unwrap();
     loop {
         if fs::read_to_string(&log).unwrap().contains("host publication unknown:") {break;}
@@ -106,6 +111,11 @@ fn real_host_restart_preserves_request_after_the_caller_exits() {
     };
     let current=json(&install.join("service")).unwrap();
     assert_ne!(current["instance"],original["instance"]);assert_eq!(final_receipt["service_instance"],current["instance"]);
+    // Observe the new generation's update before a later fixture-cleanup restart may preempt it.
+    while proxy.hits.load(Ordering::Acquire)<=first_hits {
+        assert!(owner.0.as_mut().unwrap().try_wait().unwrap().is_none(),"replacement fixture host exited");
+        assert!(Instant::now()<until,"replacement release transport deadline: first {first_hits}, current {}; {}",proxy.hits.load(Ordering::Acquire),fs::read_to_string(&log).unwrap());std::thread::sleep(Duration::from_millis(10));
+    }
     #[cfg(unix)] assert_eq!(current["pid"],original["pid"],"Unix changes images while retaining the native PID");
     let pid=current["pid"].as_u64().unwrap() as u32;let native=coreq::process::identity(pid).unwrap().unwrap();assert_eq!(current["started"],native.started);
     let replay=run(&install,&proxy,&outside,&["service","restart","--request",id,"--json"]);
@@ -132,10 +142,6 @@ fn real_host_restart_preserves_request_after_the_caller_exits() {
             if let Some(status)=owner.0.as_mut().unwrap().try_wait().unwrap() {assert_eq!(status.code(),Some(75));break;}
             assert!(Instant::now()<until,"fixture manager did not observe orderly exit75");std::thread::sleep(Duration::from_millis(10));
         }
-    }
-    let until=Instant::now()+Duration::from_secs(20);
-    while proxy.hits.load(Ordering::Acquire)<2 {
-        assert!(Instant::now()<until,"both service generations must reach the owned rejecting proxy");std::thread::sleep(Duration::from_millis(10));
     }
     #[cfg(unix)] {
         let name=if cfg!(target_os="macos") {"launchctl.calls"}else{"systemctl.calls"};
